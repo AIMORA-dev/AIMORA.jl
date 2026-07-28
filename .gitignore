@@ -1,0 +1,34 @@
+# Build and run outputs
+/build/
+/runs/
+/examples/*/outputs/
+
+# EMTP generated files
+*.PL4
+*.pl4
+fort.*
+
+# Compiler outputs
+*.o
+*.obj
+*.mod
+*.smod
+*.a
+*.so
+*.so.*
+*.dll
+*.dylib
+*.exe
+*.out
+
+# Julia local state
+Manifest.toml
+LocalPreferences.toml
+
+# Editor and temporary files
+*.log
+*.tmp
+*.bak
+*.swp
+.DS_Store
+/.vscode/

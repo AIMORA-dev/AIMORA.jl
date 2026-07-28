@@ -1,0 +1,36 @@
+name: Public package CI
+
+on:
+  push:
+    branches: [main]
+  pull_request:
+
+permissions:
+  contents: read
+
+jobs:
+  test-open-core:
+    runs-on: ubuntu-latest
+    strategy:
+      matrix:
+        julia-version: ["1.10", "1"]
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          submodules: false
+      - uses: julia-actions/setup-julia@v2
+        with:
+          version: ${{ matrix.julia-version }}
+      - uses: julia-actions/cache@v2
+      - name: Prove solver content is absent
+        run: |
+          test ! -f src/julia/solvers/nodal.jl
+          test ! -f src/julia/solvers/timestep.jl
+      - uses: julia-actions/julia-buildpkg@v1
+      - uses: julia-actions/julia-runtest@v1
+      - name: Check tracked solver boundary
+        run: |
+          if git ls-files src/julia/solvers | grep -v '^src/julia/solvers$'; then
+            echo "Public history contains files below the private solver gitlink."
+            exit 1
+          fi

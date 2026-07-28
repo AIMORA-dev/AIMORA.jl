@@ -1,0 +1,3 @@
+[submodule "src/julia/solvers"]
+	path = src/julia/solvers
+	url = git@github.com:AIMORA-dev/AIMORASolvers.jl.git

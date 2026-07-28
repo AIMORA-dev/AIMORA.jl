@@ -1,0 +1,51 @@
+# Generated IEEE 13-node parser fixture for the accepted AIMORA deck subset.
+# This is not a full BPA EMTP deck. It exercises the Phase 2 branch/source/switch
+# parser boundary with IEEE 13-style node names.
+
+begin buses
+bus 650
+bus 632
+bus 633
+bus 634
+bus 645
+bus 646
+bus 671
+bus 684
+bus 611
+bus 652
+bus 692
+bus 675
+bus 680
+end buses
+
+begin sources
+source src_650 650 1.0e12 0.0 60.0 0.0 1.0
+current inj_675 675 0.05 60.0 0.0 0.02
+end sources
+
+begin branches
+resistor line_650_632 650 632 0.05
+inductor line_650_632_l 650 632 1.0e-5
+resistor line_632_633 632 633 0.08
+resistor xfmr_633_634 633 634 0.04
+resistor line_632_645 632 645 0.09
+resistor line_645_646 645 646 0.07
+resistor line_632_671 632 671 0.06
+resistor line_671_684 671 684 0.05
+resistor line_684_611 684 611 0.04
+resistor line_684_652 684 652 0.06
+resistor line_692_675 692 675 0.05
+resistor line_671_680 671 680 0.05
+capacitor cap_675 675 0 1.0e-6
+resistor load_634 634 0 3.0
+resistor load_646 646 0 4.0
+resistor load_611 611 0 5.0
+resistor load_652 652 0 4.5
+resistor load_675 675 0 3.5
+resistor load_680 680 0 6.0
+end branches
+
+begin switches
+switch sw_671_692 671 692 closed 1.0e9 0.0
+time_switch sw_632_645 632 645 0.00004 1.0 false 1.0e9 0.0
+end switches
