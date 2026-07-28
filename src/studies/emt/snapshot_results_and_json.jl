@@ -114,7 +114,7 @@ function reduced_feeder_result(rows, cfg::UnifiedEMTConfig; elapsed_s::Float64 =
         ],
         metadata = Dict{Symbol,Any}(
             :engine => "Julia unified EMT timestep engine",
-            :source => "src/julia/studies/emt.jl",
+            :source => "src/studies/emt.jl",
         ),
     )
 end

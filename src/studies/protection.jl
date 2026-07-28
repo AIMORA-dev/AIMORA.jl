@@ -10,7 +10,7 @@ const PROTECTION_STUDY = StudyDescriptor(
     "Protection coordination",
     :protection,
     :planned,
-    "src/julia/studies/protection.jl",
+    "src/studies/protection.jl",
 )
 
 protection_input_profile() = input_profile(:protection)

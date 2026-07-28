@@ -9,7 +9,7 @@ const ARC_FLASH_STUDY = StudyDescriptor(
     "Arc flash",
     :safety,
     :planned,
-    "src/julia/studies/arc_flash.jl",
+    "src/studies/arc_flash.jl",
 )
 
 run_arc_flash(args...; kwargs...) = study_not_implemented(ARC_FLASH_STUDY)

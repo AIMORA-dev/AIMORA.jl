@@ -15,22 +15,22 @@ jobs:
       matrix:
         julia-version: ["1.10", "1"]
     steps:
-      - uses: actions/checkout@v4
+      - uses: actions/checkout@v6
         with:
           submodules: false
-      - uses: julia-actions/setup-julia@v2
+      - uses: julia-actions/setup-julia@v3
         with:
           version: ${{ matrix.julia-version }}
-      - uses: julia-actions/cache@v2
+      - uses: julia-actions/cache@v3
       - name: Prove solver content is absent
         run: |
-          test ! -f src/julia/solvers/nodal.jl
-          test ! -f src/julia/solvers/timestep.jl
-      - uses: julia-actions/julia-buildpkg@v1
-      - uses: julia-actions/julia-runtest@v1
+          test ! -f src/solvers/nodal.jl
+          test ! -f src/solvers/timestep.jl
+      - name: Check and test the open core
+        run: make check test
       - name: Check tracked solver boundary
         run: |
-          if git ls-files src/julia/solvers | grep -v '^src/julia/solvers$'; then
+          if git ls-files src/solvers | grep -v '^src/solvers$'; then
             echo "Public history contains files below the private solver gitlink."
             exit 1
           fi
