@@ -154,6 +154,25 @@ function _terminal_punch_rows(state::EMTTerminalState)
             value(branch),
         ))
     end
+    series_rlc_parameter_fields = (
+        (:resistance, "ohm", row -> row.resistance_ohm),
+        (:inductance, "H", row -> row.inductance_h),
+        (:capacitance, "F", row -> row.capacitance_f),
+    )
+    for branch in state.branches
+        branch.kind == :series_rlc || continue
+        for (field, unit, value) in series_rlc_parameter_fields
+            push!(rows, _terminal_punch_row(
+                :branch,
+                branch.name,
+                branch.from_node,
+                branch.to_node,
+                field,
+                unit,
+                value(branch),
+            ))
+        end
+    end
     for branch in state.branches
         isfinite(branch.energy_j) || continue
         push!(rows, _terminal_punch_row(

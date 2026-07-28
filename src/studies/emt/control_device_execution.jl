@@ -1913,6 +1913,8 @@ function run_deck_emt(
     coupled_lumped_sequence_history_enabled::Bool = false,
     distributed_transposed_line_runtime_enabled::Bool = true,
     recorded_step_indices = nothing,
+    series_rlc_alterations::AbstractVector{<:SeriesRLCAlteration} =
+        SeriesRLCAlteration[],
     time_horizon::Symbol = :arguments,
     output_schedule::Symbol = :all_steps,
     synchronous_machine_output_runtime_enabled::Bool = false,
@@ -2060,6 +2062,9 @@ function _deck_emt_execution_result(
             context,
             nonlinear_run,
         ),
+        context === nothing ?
+            SeriesRLCAlterationRecord[] :
+            copy(context.series_rlc_alteration_records),
     )
 end
 
@@ -2073,6 +2078,8 @@ function _run_deck_emt(
     coupled_lumped_sequence_history_enabled::Bool = false,
     distributed_transposed_line_runtime_enabled::Bool = true,
     recorded_step_indices = nothing,
+    series_rlc_alterations::AbstractVector{<:SeriesRLCAlteration} =
+        SeriesRLCAlteration[],
     time_horizon::Symbol = :arguments,
     output_schedule::Symbol = :all_steps,
     synchronous_machine_output_runtime_enabled::Bool = false,
@@ -2113,6 +2120,7 @@ function _run_deck_emt(
        only(universal_machine_outputs).machine_count == 1 &&
        initial_voltage_source == :none &&
        !synchronous_machine_output_runtime_enabled &&
+       isempty(series_rlc_alterations) &&
        source_signal_provider isa IdentitySourceSignalProvider
         machine_horizon = run_deck_universal_machine_horizon(
             parsed;
@@ -2135,6 +2143,7 @@ function _run_deck_emt(
     if synchronous_machine_output_runtime_enabled &&
        length(synchronous_machine_indices) == 1 &&
        initial_voltage_source in (:none, :synchronous_machine_terminals) &&
+       isempty(series_rlc_alterations) &&
        source_signal_provider isa IdentitySourceSignalProvider
         synchronous_step_count = fixed_step_count(runtime_dt_s, runtime_t_end_s)
         synchronous_step_count > 0 || throw(ArgumentError(
@@ -2224,6 +2233,7 @@ function _run_deck_emt(
                 time_horizon == :deck &&
                 _deck_uses_current_zero_switching(parsed),
             recorded_step_indices = runtime_recorded_step_indices,
+            series_rlc_alterations = series_rlc_alterations,
             store_step_updates = switched_nonlinear_dynamic_runtime,
             source_signal_provider = source_signal_provider,
         )
@@ -2353,6 +2363,7 @@ function _run_deck_emt(
             current_zero_switching = current_zero_switching,
             source_signal_provider = source_signal_provider,
         )
+    configure_series_rlc_alterations!(context, series_rlc_alterations)
     initial_sample = _initial_voltage_sample_for_context(
         initial_sample,
         context.system.node_count,
@@ -2407,6 +2418,8 @@ function prepare_emt_study(
     coupled_lumped_sequence_history_enabled::Bool = false,
     distributed_transposed_line_runtime_enabled::Bool = true,
     recorded_step_indices = nothing,
+    series_rlc_alterations::AbstractVector{<:SeriesRLCAlteration} =
+        SeriesRLCAlteration[],
     time_horizon::Symbol = :arguments,
     output_schedule::Symbol = :all_steps,
     source_signal_provider::AbstractSourceSignalProvider = IdentitySourceSignalProvider(),
@@ -2457,7 +2470,8 @@ function prepare_emt_study(
         saturated_transformer_dynamic_runtime ||
         ideal_transformer_source_runtime ||
         _deck_uses_dynamic_nonlinear_runtime(parsed) ||
-        _deck_uses_control_system_feedback_runtime(parsed)
+        _deck_uses_control_system_feedback_runtime(parsed) ||
+        !isempty(series_rlc_alterations)
     dynamic_network_runtime || throw(ArgumentError(
         "prepared EMT execution currently requires the production dynamic network runtime",
     ))
@@ -2494,6 +2508,7 @@ function prepare_emt_study(
             time_horizon == :deck &&
             _deck_uses_current_zero_switching(parsed),
         recorded_step_indices = runtime_recorded_step_indices,
+        series_rlc_alterations = series_rlc_alterations,
         store_step_updates = _deck_uses_dynamic_nonlinear_runtime(parsed),
         source_signal_provider = source_signal_provider,
     )
@@ -3110,6 +3125,7 @@ function run_deck_emt(
         context.system.node_count,
         context.step_count + 1,
     )
+    _apply_due_series_rlc_alterations!(context)
     if initial_voltage_sample !== nothing
         _seed_steady_state_network_state!(context, initial_voltage_sample)
         initial_output_values = _steady_state_initial_output_values(context)

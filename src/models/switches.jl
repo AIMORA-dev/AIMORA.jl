@@ -4336,9 +4336,6 @@ function over16_switch_alteration_rebuild_intent(
         should_call_switch ? ktrlsw5 + ktrlsw1 : ktrlsw5
 
     deferred_calls = Symbol[]
-    if m4plot
-        push!(deferred_calls, :yserlc)
-    end
     if should_call_switch
         push!(deferred_calls, :switch)
     end
@@ -4351,6 +4348,7 @@ function over16_switch_alteration_rebuild_intent(
 
     return (
         should_call_yserlc = m4plot,
+        series_rlc_parameter_mutated = m4plot && yserlc_altered,
         ialter = ialter,
         effective_ialter = effective_ialter,
         ialter_after_last14 = effective_ialter != 0 && kanal == 2 ? 1 : effective_ialter,
@@ -4372,7 +4370,7 @@ function over16_switch_alteration_rebuild_intent(
         kill_next_nchain = 51,
         deferred_calls = deferred_calls,
         topology_mutated = false,
-        admittance_mutated = false,
+        admittance_mutated = m4plot && yserlc_altered,
         sparse_factor_mutated = false,
         tacs_executed = false,
         solvum_executed = false,

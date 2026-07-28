@@ -1393,6 +1393,8 @@ function run_deck_emt_with_over16_boundary(
     time_switch_event_delay_s::Float64 = 0.0,
     current_zero_switching::Bool = false,
     recorded_step_indices = nothing,
+    series_rlc_alterations::AbstractVector{<:SeriesRLCAlteration} =
+        SeriesRLCAlteration[],
     source_signal_provider::AbstractSourceSignalProvider = IdentitySourceSignalProvider(),
 )
     parsed = DeckParser.parse_deck_lines(lines; source = source)
@@ -1418,6 +1420,7 @@ function run_deck_emt_with_over16_boundary(
         time_switch_event_delay_s = time_switch_event_delay_s,
         current_zero_switching = current_zero_switching,
         recorded_step_indices = recorded_step_indices,
+        series_rlc_alterations = series_rlc_alterations,
         source_signal_provider = source_signal_provider,
     )
 end
@@ -1577,6 +1580,8 @@ function _prepare_dynamic_deck_runtime(
     time_switch_event_delay_s::Float64 = 0.0,
     current_zero_switching::Bool = false,
     recorded_step_indices = nothing,
+    series_rlc_alterations::AbstractVector{<:SeriesRLCAlteration} =
+        SeriesRLCAlteration[],
     store_step_updates::Bool = true,
     source_signal_provider::AbstractSourceSignalProvider = IdentitySourceSignalProvider(),
 )
@@ -1715,6 +1720,7 @@ function _prepare_dynamic_deck_runtime(
             current_zero_switching = current_zero_switching,
             source_signal_provider = source_signal_provider,
         )
+    configure_series_rlc_alterations!(context, series_rlc_alterations)
     if distributed_transposed_line_config !== nothing &&
        haskey(distributed_transposed_line_config, :current_injection_values)
         resize!(
@@ -1841,6 +1847,8 @@ function run_deck_emt_with_over16_boundary(
     time_switch_event_delay_s::Float64 = 0.0,
     current_zero_switching::Bool = false,
     recorded_step_indices = nothing,
+    series_rlc_alterations::AbstractVector{<:SeriesRLCAlteration} =
+        SeriesRLCAlteration[],
     store_step_updates::Bool = true,
     source_signal_provider::AbstractSourceSignalProvider = IdentitySourceSignalProvider(),
 )
@@ -1867,6 +1875,7 @@ function run_deck_emt_with_over16_boundary(
         time_switch_event_delay_s = time_switch_event_delay_s,
         current_zero_switching = current_zero_switching,
         recorded_step_indices = recorded_step_indices,
+        series_rlc_alterations = series_rlc_alterations,
         store_step_updates = store_step_updates,
         source_signal_provider = source_signal_provider,
     )
@@ -1889,6 +1898,7 @@ function run_deck_emt_with_over16_boundary(
     collect_run_diagnostics::Bool = true,
 )
     updates = collect_run_diagnostics ? Any[] : nothing
+    _apply_due_series_rlc_alterations!(context)
     if steady_state_initial_sample !== nothing
         _apply_steady_state_initial_sample!(
             context,
@@ -1899,6 +1909,7 @@ function run_deck_emt_with_over16_boundary(
         context.t_s = min(context.step_index, context.step_count) * context.dt_s
     end
     while context.step_index <= context.step_count
+        _apply_due_series_rlc_alterations!(context)
         over16_kwargs = _over16_step_kwargs(over16_step_configs, context)
         update = _step_with_over16_config!(
             context,

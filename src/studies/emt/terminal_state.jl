@@ -16,6 +16,9 @@ function _terminal_branch_states(context::EMTStepContext)
             context.element_names[index] : Symbol("branch_", index)
         energy = index in context.branch_power_output_branch_indices ?
             context.branch_energy_values[index] : NaN
+        resistance_ohm = element isa SeriesRLCBranch ? element.r : NaN
+        inductance_h = element isa SeriesRLCBranch ? element.l : NaN
+        capacitance_f = element isa SeriesRLCBranch ? element.c : NaN
         push!(
             rows,
             EMTTerminalBranchState(
@@ -30,6 +33,9 @@ function _terminal_branch_states(context::EMTStepContext)
                 snapshot.previous_current,
                 snapshot.previous_voltage,
                 energy,
+                resistance_ohm,
+                inductance_h,
+                capacitance_f,
             ),
         )
     end
@@ -234,6 +240,22 @@ function _terminal_state_checks(state::EMTTerminalState)
                 row.previous_voltage_v,
             )) &&
             (isfinite(row.energy_j) || isnan(row.energy_j)) &&
+            (
+                row.kind == :series_rlc ?
+                (
+                    isfinite(row.resistance_ohm) &&
+                    row.resistance_ohm >= 0.0 &&
+                    isfinite(row.inductance_h) &&
+                    row.inductance_h >= 0.0 &&
+                    isfinite(row.capacitance_f) &&
+                    row.capacitance_f > 0.0
+                ) :
+                (
+                    isnan(row.resistance_ohm) &&
+                    isnan(row.inductance_h) &&
+                    isnan(row.capacitance_f)
+                )
+            ) &&
             isapprox(
                 row.current_a,
                 row.conductance_s * row.voltage_v + row.history_current_a;

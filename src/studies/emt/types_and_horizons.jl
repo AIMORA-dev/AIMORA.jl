@@ -95,7 +95,8 @@ using ..OVER16TimestepIntegration: OVER16AcceptedTimestepState,
                                   _over16_sparse_switch_state_flow_update_lean!,
                                   over16_accepted_timestep_update!,
                                   over16_sparse_switch_state_flow_update!
-using ..Companion: past_machine_history_update!
+using ..Companion: past_machine_history_update!,
+                   series_rlc_companion
 using ..Switches: OVER16FortranSparseFactorWorkspaceState,
                  CurrentZeroSwitch,
                  configure_current_extinction!,
@@ -190,6 +191,8 @@ export UnifiedEMTConfig,
        EMTTerminalNonlinearState,
        EMTTerminalSwitchState,
        EMTTerminalState,
+       SeriesRLCAlteration,
+       SeriesRLCAlterationRecord,
        DeckEMTExecution,
        PreparedEMTStudy,
        EMTStudyWorkspace,
@@ -375,6 +378,9 @@ struct EMTTerminalBranchState
     previous_current_a::Float64
     previous_voltage_v::Float64
     energy_j::Float64
+    resistance_ohm::Float64
+    inductance_h::Float64
+    capacitance_f::Float64
 end
 
 struct EMTTerminalNonlinearState
@@ -413,9 +419,62 @@ struct EMTTerminalState
     physical_checks_passed::Bool
 end
 
+struct SeriesRLCAlteration
+    branch_name::Symbol
+    activation_time_s::Float64
+    resistance_ohm::Float64
+    inductance_h::Float64
+    capacitance_f::Float64
+
+    function SeriesRLCAlteration(
+        branch_name,
+        activation_time_s::Real,
+        resistance_ohm::Real,
+        inductance_h::Real,
+        capacitance_f::Real,
+    )
+        name = Symbol(branch_name)
+        isempty(String(name)) &&
+            throw(ArgumentError("series-RLC alteration branch name must not be empty"))
+        activation_time = Float64(activation_time_s)
+        resistance = Float64(resistance_ohm)
+        inductance = Float64(inductance_h)
+        capacitance = Float64(capacitance_f)
+        isfinite(activation_time) && activation_time >= 0.0 ||
+            throw(ArgumentError("series-RLC alteration time must be finite and nonnegative"))
+        isfinite(resistance) && resistance >= 0.0 ||
+            throw(ArgumentError("series-RLC alteration resistance must be finite and nonnegative"))
+        isfinite(inductance) && inductance >= 0.0 ||
+            throw(ArgumentError("series-RLC alteration inductance must be finite and nonnegative"))
+        isfinite(capacitance) && capacitance > 0.0 ||
+            throw(ArgumentError("series-RLC alteration capacitance must be finite and positive"))
+        return new(name, activation_time, resistance, inductance, capacitance)
+    end
+end
+
+struct SeriesRLCAlterationRecord
+    branch_name::Symbol
+    branch_index::Int
+    requested_time_s::Float64
+    applied_time_s::Float64
+    applied_step_index::Int
+    previous_resistance_ohm::Float64
+    previous_inductance_h::Float64
+    previous_capacitance_f::Float64
+    resistance_ohm::Float64
+    inductance_h::Float64
+    capacitance_f::Float64
+    previous_conductance_s::Float64
+    conductance_s::Float64
+    conductance_delta_s::Float64
+    history_state_preserved::Bool
+    network_refactor_count::Int
+end
+
 struct DeckEMTExecution{T}
     trace::T
     terminal_state::EMTTerminalState
+    series_rlc_alteration_records::Vector{SeriesRLCAlterationRecord}
 end
 
 struct DeckUniversalMachineHorizon
@@ -935,6 +994,11 @@ mutable struct EMTStepContext{S<:NodalSystem}
     output_minimum_times_s::Vector{Float64}
     recorded_step_indices::Vector{Int}
     trace_write_index::Int
+    series_rlc_alterations::Vector{SeriesRLCAlteration}
+    series_rlc_alteration_branch_indices::Vector{Int}
+    next_series_rlc_alteration_index::Int
+    series_rlc_alteration_records::Vector{SeriesRLCAlterationRecord}
+    series_rlc_network_refactor_count::Int
 end
 
 struct PreparedEMTStudy{R,P}

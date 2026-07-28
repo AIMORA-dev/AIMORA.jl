@@ -82,6 +82,136 @@ function _electromagnetic_history_execution_plan(system::NodalSystem)
     )
 end
 
+function configure_series_rlc_alterations!(
+    context::EMTStepContext,
+    alterations::AbstractVector{<:SeriesRLCAlteration},
+)
+    isempty(context.series_rlc_alteration_records) ||
+        throw(ArgumentError("series-RLC alterations cannot be reconfigured after execution"))
+    context.next_series_rlc_alteration_index == 1 ||
+        throw(ArgumentError("series-RLC alterations cannot be reconfigured after execution"))
+
+    events = SeriesRLCAlteration[event for event in alterations]
+    order = sortperm(
+        eachindex(events);
+        by = index -> (events[index].activation_time_s, index),
+        alg = Base.Sort.MergeSort,
+    )
+    ordered_events = events[order]
+    branch_indices = Vector{Int}(undef, length(ordered_events))
+    horizon_tolerance = 8eps(max(abs(context.t_end_s), abs(context.dt_s)))
+    for (event_index, event) in enumerate(ordered_events)
+        event.activation_time_s <= context.t_end_s + horizon_tolerance ||
+            throw(ArgumentError(
+                "series-RLC alteration $(event.branch_name) at " *
+                "$(event.activation_time_s) s is outside the EMT horizon",
+            ))
+        matching_indices = Int[]
+        for (element_index, element) in enumerate(context.system.elements)
+            element_index <= length(context.element_names) || continue
+            context.element_names[element_index] == event.branch_name || continue
+            element isa SeriesRLCBranch || continue
+            push!(matching_indices, element_index)
+        end
+        length(matching_indices) == 1 ||
+            throw(ArgumentError(
+                "series-RLC alteration branch $(event.branch_name) must resolve " *
+                "to exactly one SeriesRLCBranch",
+            ))
+        branch_indices[event_index] = only(matching_indices)
+    end
+    context.series_rlc_alterations = ordered_events
+    context.series_rlc_alteration_branch_indices = branch_indices
+    context.next_series_rlc_alteration_index = 1
+    context.series_rlc_network_refactor_count = 0
+    empty!(context.series_rlc_alteration_records)
+    return context
+end
+
+function _apply_due_series_rlc_alterations!(context::EMTStepContext)
+    next_index = context.next_series_rlc_alteration_index
+    event_count = length(context.series_rlc_alterations)
+    next_index > event_count && return 0
+    tolerance = 8eps(max(abs(context.t_s), abs(context.dt_s)))
+    context.series_rlc_alterations[next_index].activation_time_s <=
+        context.t_s + tolerance || return 0
+
+    refactor_count = context.series_rlc_network_refactor_count + 1
+    applied_count = 0
+    while next_index <= event_count
+        event = context.series_rlc_alterations[next_index]
+        event.activation_time_s <= context.t_s + tolerance || break
+        branch_index = context.series_rlc_alteration_branch_indices[next_index]
+        branch = context.system.elements[branch_index]
+        branch isa SeriesRLCBranch ||
+            throw(ArgumentError("resolved series-RLC alteration owner changed type"))
+
+        previous_parameters = (branch.r, branch.l, branch.c)
+        history_before = (
+            branch.i_prev,
+            branch.inductor_voltage_prev,
+            branch.capacitor_voltage_prev,
+            branch.v_prev,
+            branch.i_last,
+        )
+        previous_conductance, _ = series_rlc_companion(
+            branch.r,
+            branch.l,
+            branch.c,
+            branch.i_prev,
+            branch.inductor_voltage_prev,
+            branch.capacitor_voltage_prev,
+            context.dt_s,
+        )
+        branch.r = event.resistance_ohm
+        branch.l = event.inductance_h
+        branch.c = event.capacitance_f
+        conductance, _ = series_rlc_companion(
+            branch.r,
+            branch.l,
+            branch.c,
+            branch.i_prev,
+            branch.inductor_voltage_prev,
+            branch.capacitor_voltage_prev,
+            context.dt_s,
+        )
+        history_after = (
+            branch.i_prev,
+            branch.inductor_voltage_prev,
+            branch.capacitor_voltage_prev,
+            branch.v_prev,
+            branch.i_last,
+        )
+        push!(
+            context.series_rlc_alteration_records,
+            SeriesRLCAlterationRecord(
+                event.branch_name,
+                branch_index,
+                event.activation_time_s,
+                context.t_s,
+                context.step_index,
+                previous_parameters[1],
+                previous_parameters[2],
+                previous_parameters[3],
+                branch.r,
+                branch.l,
+                branch.c,
+                previous_conductance,
+                conductance,
+                conductance - previous_conductance,
+                history_before == history_after,
+                refactor_count,
+            ),
+        )
+        applied_count += 1
+        next_index += 1
+    end
+    context.next_series_rlc_alteration_index = next_index
+    context.series_rlc_network_refactor_count = refactor_count
+    context.sparse_node_group_workspace.factor_valid = false
+    return applied_count
+end
+
 function initialize_step_context(
     system::S;
     node_map::AbstractDict{Symbol,<:Integer},
@@ -108,6 +238,8 @@ function initialize_step_context(
     t_end_s::Float64 = 0.0,
     source::AbstractString = "system",
     recorded_step_indices = nothing,
+    series_rlc_alterations::AbstractVector{<:SeriesRLCAlteration} =
+        SeriesRLCAlteration[],
 ) where {S<:NodalSystem}
     steps = fixed_step_count(dt_s, t_end_s)
     normalized_map = normalized_node_map(node_map, system.node_count)
@@ -188,7 +320,7 @@ function initialize_step_context(
     sample_count = length(recorded_steps)
     analytic_source_signals, analytic_source_names =
         _analytic_source_signal_batch(system, normalized_element_names)
-    return EMTStepContext(
+    context = EMTStepContext(
         system,
         analytic_source_signals,
         analytic_source_names,
@@ -252,7 +384,13 @@ function initialize_step_context(
         zeros(Float64, length(output_channel_names)),
         recorded_steps,
         1,
+        SeriesRLCAlteration[],
+        Int[],
+        1,
+        SeriesRLCAlterationRecord[],
+        0,
     )
+    return configure_series_rlc_alterations!(context, series_rlc_alterations)
 end
 
 function _recorded_trace_step_indices(step_count::Integer, recorded_step_indices)
@@ -342,6 +480,7 @@ function record_step!(context::EMTStepContext, voltage::AbstractVector{Float64})
 end
 
 function step!(context::EMTStepContext)
+    _apply_due_series_rlc_alterations!(context)
     _advance_source_function_network!(context)
     voltage = current_extinction_enabled(context.system.elements) ?
         solve_step_with_switch_state!(
@@ -358,6 +497,7 @@ function step!(
     context::EMTStepContext,
     current_injections::AbstractVector{<:Real},
 )
+    _apply_due_series_rlc_alterations!(context)
     _advance_source_function_network!(context)
     voltage = current_extinction_enabled(context.system.elements) ?
         solve_step_with_switch_state!(
