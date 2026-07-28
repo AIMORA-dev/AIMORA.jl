@@ -29,6 +29,10 @@ solver source component.
 """
 solver_available() = _SOLVER_LOADED
 
+"""
+Report whether this installation is the public `:open_core` or an authorized
+`:full_engine`, and identify how the solver source was supplied.
+"""
 function solver_status()
     available = solver_available()
     return (
@@ -38,6 +42,10 @@ function solver_status()
     )
 end
 
+"""
+Return `nothing` when the proprietary solver is available; otherwise throw an
+error explaining how an authorized developer can initialize it.
+"""
 function require_solver()
     solver_available() && return nothing
     error(
