@@ -1,7 +1,6 @@
 # AIMORA.jl
 
-**Advanced Integrated Modeling, Optimization, Reliability, and Analysis for
-Power and Energy Systems**
+**Analytical Integration for Multiphysics Operations and Response Analysis**
 
 AIMORA is a Julia-native power-system engineering platform. The public package
 owns study contracts, project and asset schemas, validation, model metadata,
@@ -73,7 +72,7 @@ test/                      public-core and private-integration package tests
 - `AIMORASolvers.jl`: private solver source component
 - `AIMORAValidation`: private cross-package qualification workspace
 - [AIMORADocs](https://github.com/AIMORA-dev/AIMORADocs): unified documentation
-- [AIMORACases](https://github.com/AIMORA-dev/AIMORACases): example and benchmark
+- [AIMORACases.jl](https://github.com/AIMORA-dev/AIMORACases.jl): example and benchmark
   cases
 - [AIMORACatalogs.jl](https://github.com/AIMORA-dev/AIMORACatalogs.jl): open
   catalog schemas and distributable model data
