@@ -38,9 +38,12 @@ using ..Lines:
     SampledFrequencyDependentLineGroup,
     SemlyenModeParameters,
     SemlyenFrequencyDependentLine,
+    ComplexModalBergeronLine,
+    LineModalTransform,
     PoleResidueTransfer,
     PoleResidueReductionResult,
     RationalLineModeConversion,
+    coupled_lumped_matrix_impedance,
     coupled_lumped_sequence_impedance,
     coupled_lumped_phase_pi_section,
     cascaded_phase_pi_equivalent,
@@ -380,6 +383,9 @@ export DeckParseResult,
        deck_over5a_source_tstop_values,
        deck_over5a_source_update_inputs,
        deck_over5_switch_closed_markers,
+       deck_over5_switch_critical_current_values,
+       deck_over5_switch_random_opening_standard_deviation_s_values,
+       deck_over5_switch_type_values,
        deck_over5_switch_close_time_s_values,
        deck_over5_switch_from_node_indices,
        deck_over5_switch_from_node_names,
@@ -597,6 +603,8 @@ struct DeckCoupledLineRow
     phase_index::Int
     sequence_resistance::Union{Missing,Float64}
     sequence_inductance::Union{Missing,Float64}
+    triangular_resistance_values::Vector{Float64}
+    triangular_inductance_values::Vector{Float64}
     raw_resistance::Union{Missing,Float64}
     raw_inductance::Union{Missing,Float64}
     raw_capacitance::Union{Missing,Float64}
@@ -840,6 +848,15 @@ struct DeckCableConstantsCase
     admittance_output_flag::Int
     pipe_count::Int
     grounding_selector::Int
+    pipe_radii_m::Vector{Float64}
+    pipe_resistivity_ohm_m::Float64
+    pipe_relative_permeability::Float64
+    pipe_inner_insulator_relative_permittivity::Float64
+    pipe_outer_insulator_relative_permittivity::Float64
+    cable_to_pipe_center_distances_m::Vector{Float64}
+    cable_to_pipe_angles_rad::Vector{Float64}
+    pipe_depths_m::Vector{Float64}
+    pipe_horizontal_positions_m::Vector{Float64}
     layer_counts::Vector{Int}
     boundary_radii_m::Matrix{Float64}
     resistivity_ohm_m::Matrix{Float64}
@@ -1603,6 +1620,8 @@ struct DeckOVER5SwitchRow
     measuring::Bool
     closed_marker::String
     marker_text::String
+    critical_current_a::Float64
+    random_opening_standard_deviation_s::Float64
     on_conductance::Float64
     off_conductance::Float64
 end
@@ -2129,6 +2148,15 @@ function deck_cable_constants_cases(result::DeckParseResult)
             row.admittance_output_flag,
             row.pipe_count,
             row.grounding_selector,
+            copy(row.pipe_radii_m),
+            row.pipe_resistivity_ohm_m,
+            row.pipe_relative_permeability,
+            row.pipe_inner_insulator_relative_permittivity,
+            row.pipe_outer_insulator_relative_permittivity,
+            copy(row.cable_to_pipe_center_distances_m),
+            copy(row.cable_to_pipe_angles_rad),
+            copy(row.pipe_depths_m),
+            copy(row.pipe_horizontal_positions_m),
             copy(row.layer_counts),
             copy(row.boundary_radii_m),
             copy(row.resistivity_ohm_m),

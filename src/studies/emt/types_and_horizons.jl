@@ -5,6 +5,7 @@ using TOML
 
 using ..Branches: BranchCompanionSnapshot,
                   BreqivHistoryInjection,
+                  GeneratorEquivalentModalBranch,
                   IdealTransformerVoltageConstraint,
                   TheveninSource,
                   CurrentInjection,
@@ -12,11 +13,13 @@ using ..Branches: BranchCompanionSnapshot,
                   SeriesRLBranch,
                   SeriesRLCBranch,
                   CoupledInductiveBranch,
+                  CoupledSeriesRLBranch,
                   CapacitorBranch,
                   advance_breqiv_history_current!,
                   branch_companion_snapshot,
                   branch_current_value,
                   companion,
+                  generator_equivalent_history_injection,
                   initialize_breqiv_history_injection!,
                   seed_breqiv_frequency_histories!,
                   stamp_history_current!,
@@ -28,9 +31,11 @@ using ..Branches: BranchCompanionSnapshot,
 using ..DeckParser
 using ..Inverter
 using ..Lines: distributed_transposed_line_modal_timestep_update!,
+               ComplexModalBergeronLine,
                DistributedTransposedLineHistoryState,
                NestedCableTransientLineState,
                SemlyenFrequencyDependentLine,
+               distributed_transposed_line_steady_state_pi_equivalent,
                distributed_transposed_line_history_state,
                distributed_transposed_line_initial_history_phase_matrix,
                distributed_transposed_line_initial_history_phase_terms,
@@ -41,7 +46,10 @@ using ..Lines: distributed_transposed_line_modal_timestep_update!,
                distributed_transposed_line_norton_coefficients,
                distributed_transposed_line_phase_current_injection!,
                frequency_dependent_line_recursive_convolution_update!,
+               initialize_complex_modal_bergeron_steady_state!,
                initialize_semlyen_line_steady_state!,
+               cascaded_phase_pi_equivalent,
+               complex_modal_bergeron_steady_state_terminal_admittance,
                semlyen_line_steady_state_terminal_admittance,
                LineStepResponseExponentialFitResult,
                line_step_response_exponential_fit,
@@ -80,6 +88,7 @@ using ..Machines: MachineNetworkCouplingState,
                   single_phase_induction_steady_state_initialization
 using ..Nonlinear: SaturatedTransformerNonlinearArrays,
                    SaturatedTransformerNonlinearSlopeBranch,
+                   HysteresisLoopPreprocessResult,
                    SATURATED_TRANSFORMER_NONLINEAR_TYPE,
                    HYSTERETIC_INDUCTOR_NONLINEAR_TYPE,
                    SWITCHING_NONLINEAR_RESISTOR_TYPE,
@@ -254,6 +263,7 @@ export UnifiedEMTConfig,
        deck_direct_current_machine_parameters,
        deck_direct_current_machine_state,
        deck_direct_current_machine_initial_state,
+       deck_direct_current_machine_automatic_initialization,
        deck_separately_excited_dc_initialization,
        deck_universal_machine_type4_parameters,
        deck_universal_machine_type4_state,
@@ -263,6 +273,8 @@ export UnifiedEMTConfig,
        deck_output_step_indices,
        DeckOutputChannelMetadata,
        DeckFrequencyScanSchedule,
+       DeckNetworkFrequencyScanPoint,
+       DeckNetworkFrequencyScanStudy,
        DeckImpulseResponseFitControl,
        DeckLineFrequencyScanStudy,
        DeckLineImpulseResponseStudy,
@@ -782,6 +794,9 @@ struct DeckOVER16BoundaryPlan
     over5_switch_measuring_flags::Vector{Bool}
     over5_switch_closed_markers::Vector{String}
     over5_switch_marker_texts::Vector{String}
+    over5_switch_type_values::Vector{Int}
+    over5_switch_critical_current_values::Vector{Float64}
+    over5_switch_random_opening_standard_deviation_s_values::Vector{Float64}
     over5_switch_on_conductance_values::Vector{Float64}
     over5_switch_off_conductance_values::Vector{Float64}
     over5_switch_output_codes::Vector{Int}
@@ -916,7 +931,8 @@ end
     SERIES_RLC_HISTORY = 2
     CAPACITOR_HISTORY = 3
     COUPLED_INDUCTIVE_HISTORY = 4
-    BREQIV_HISTORY = 5
+    COUPLED_SERIES_RL_HISTORY = 5
+    BREQIV_HISTORY = 6
 end
 
 struct ElectromagneticHistoryExecutionPlan
@@ -927,6 +943,7 @@ struct ElectromagneticHistoryExecutionPlan
     series_rlc_branches::Vector{SeriesRLCBranch}
     capacitor_branches::Vector{CapacitorBranch}
     coupled_inductive_branches::Vector{CoupledInductiveBranch}
+    coupled_series_rl_branches::Vector{CoupledSeriesRLBranch}
     breqiv_injections::Vector{BreqivHistoryInjection}
 end
 
@@ -1457,9 +1474,12 @@ function deck_coupled_dq_machine_initial_state(
     d_axis_coil_count, q_axis_coil_count =
         _deck_coupled_dq_axis_coil_counts(card1)
     coil_count = _deck_coupled_dq_coil_count(card1)
-    if card1.machine_type == 8 &&
+    if card1.machine_type in (8, 9, 10, 11, 12) &&
        _deck_universal_machine_initialization_mode(parsed) == :automatic
-        return _deck_type8_automatic_initialization(parsed, machine_index).state
+        return _deck_direct_machine_automatic_initialization(
+            parsed,
+            machine_index,
+        ).state
     end
     if card1.machine_type in (8, 9, 10, 11, 12)
         coils = sort!(
@@ -1758,11 +1778,790 @@ function _deck_type8_automatic_initialization(
     )
 end
 
+function _direct_machine_steady_state_step(
+    parameters::InductionMachineParameters,
+    current_values::Vector{Float64},
+    power_terminal_open_circuit_voltage::Float64,
+    mechanical_speed_rad_s::Float64,
+    mechanical_angle_rad::Float64,
+    power_terminal_thevenin_impedance::Float64,
+)
+    histories = vcat(current_values[1:3], -current_values[4:end])
+    state = InductionMachineState(
+        current_values,
+        histories;
+        mechanical_speed_rad_s,
+        previous_mechanical_speed_rad_s = mechanical_speed_rad_s,
+        mechanical_angle_rad,
+    )
+    state.d_axis_flux, state.q_axis_flux =
+        induction_machine_axis_fluxes(parameters, current_values)
+    power_terminal_voltages =
+        [0.0, 0.0, power_terminal_open_circuit_voltage]
+    rotor_thevenin_matrix = zeros(3, 3)
+    rotor_thevenin_matrix[3, 3] =
+        power_terminal_thevenin_impedance
+    stator_count = length(current_values) - 3
+    stator_terminal_voltages = zeros(stator_count)
+    stator_thevenin_matrix = zeros(stator_count, stator_count)
+    coupled_dq_machine_step!(
+        state,
+        parameters;
+        power_terminal_voltages,
+        rotor_thevenin_matrix,
+        mechanical_speed_thevenin_rad_s = mechanical_speed_rad_s,
+        generated_torque_impedance = 0.0,
+        stator_terminal_voltages,
+        stator_thevenin_matrix,
+        initial_step = true,
+    )
+    result = coupled_dq_machine_step!(
+        state,
+        parameters;
+        power_terminal_voltages,
+        rotor_thevenin_matrix,
+        mechanical_speed_thevenin_rad_s = mechanical_speed_rad_s,
+        generated_torque_impedance = 0.0,
+        stator_terminal_voltages,
+        stator_thevenin_matrix,
+        initial_step = false,
+    )
+    return result
+end
+
+function _direct_machine_steady_state_current_seed(
+    parameters::InductionMachineParameters,
+    armature_voltage::Float64,
+)
+    machine_type = parameters.machine_type
+    machine_type in (9, 10, 11, 12) ||
+        throw(ArgumentError("direct-machine fixed-point seed requires type 9 through 12"))
+    currents = zeros(5)
+    armature_resistance = parameters.coil_conductances[3] == 0.0 ?
+        0.0 : inv(parameters.coil_conductances[3])
+    series_resistance = parameters.coil_conductances[5] == 0.0 ?
+        0.0 : inv(parameters.coil_conductances[5])
+    resistance_scale = max(armature_resistance + series_resistance, eps(Float64))
+    currents[3] = armature_voltage / resistance_scale
+    currents[4] = parameters.coil_conductances[4] == 0.0 ?
+        0.0 : armature_voltage * parameters.coil_conductances[4]
+    currents[5] = machine_type == 12 ? 0.0 :
+        machine_type == 11 ? currents[3] - currents[4] : currents[3]
+    return currents
+end
+
+function _direct_machine_runtime_fixed_point(
+    parameters::InductionMachineParameters,
+    power_terminal_open_circuit_voltage::Float64,
+    mechanical_speed_rad_s::Float64;
+    power_terminal_thevenin_impedance::Real = 0.0,
+    initial_current_values::Union{Nothing,AbstractVector{<:Real}} = nothing,
+    maximum_iterations::Int = 24,
+    maximum_history_iterations::Int = 200,
+    absolute_tolerance::Float64 = 1.0e-10,
+    relative_tolerance::Float64 = 1.0e-10,
+)
+    parameters.machine_type in (9, 10, 11, 12) ||
+        throw(ArgumentError("direct-machine runtime fixed point requires type 9 through 12"))
+    maximum_iterations > 0 ||
+        throw(ArgumentError("direct-machine fixed-point iteration count must be positive"))
+    maximum_history_iterations > 0 ||
+        throw(ArgumentError("direct-machine history-settling iteration count must be positive"))
+    all(
+        value -> isfinite(value) && value >= 0.0,
+        (absolute_tolerance, relative_tolerance),
+    ) || throw(ArgumentError("direct-machine fixed-point tolerances must be finite and nonnegative"))
+    thevenin_impedance = Float64(power_terminal_thevenin_impedance)
+    isfinite(power_terminal_open_circuit_voltage) &&
+        isfinite(thevenin_impedance) && thevenin_impedance >= 0.0 ||
+        throw(ArgumentError("direct-machine fixed-point electrical boundary must be finite with nonnegative impedance"))
+    mechanical_angle = pi / (2.0 * parameters.pole_pair_count)
+    currents = initial_current_values === nothing ?
+        _direct_machine_steady_state_current_seed(
+            parameters,
+            power_terminal_open_circuit_voltage,
+        ) :
+        Float64.(initial_current_values)
+    length(currents) == length(parameters.coil_conductances) ||
+        throw(ArgumentError("direct-machine fixed-point current seed has the wrong coil count"))
+    all(isfinite, currents) ||
+        throw(ArgumentError("direct-machine fixed-point current seed must be finite"))
+    active = 3:5
+    residual = zeros(3)
+    completed_iterations = 0
+    converged = false
+    final_result = nothing
+    for iteration in 1:maximum_iterations
+        completed_iterations = iteration
+        result = _direct_machine_steady_state_step(
+            parameters,
+            currents,
+            power_terminal_open_circuit_voltage,
+            mechanical_speed_rad_s,
+            mechanical_angle,
+            thevenin_impedance,
+        )
+        final_result = result
+        residual .= result.current_values[active] .- currents[active]
+        residual_norm = maximum(abs, residual; init = 0.0)
+        current_scale = maximum(abs, result.current_values[active]; init = 0.0)
+        allowance = absolute_tolerance + relative_tolerance * max(current_scale, 1.0)
+        if residual_norm <= allowance
+            currents .= result.current_values
+            converged = true
+            break
+        end
+
+        jacobian = zeros(3, 3)
+        for column in eachindex(residual)
+            current_index = first(active) + column - 1
+            perturbation =
+                1.0e-4 * max(abs(currents[current_index]), 1.0)
+            upper = copy(currents)
+            lower = copy(currents)
+            upper[current_index] += perturbation
+            lower[current_index] -= perturbation
+            upper_result = _direct_machine_steady_state_step(
+                parameters,
+                upper,
+                power_terminal_open_circuit_voltage,
+                mechanical_speed_rad_s,
+                mechanical_angle,
+                thevenin_impedance,
+            )
+            lower_result = _direct_machine_steady_state_step(
+                parameters,
+                lower,
+                power_terminal_open_circuit_voltage,
+                mechanical_speed_rad_s,
+                mechanical_angle,
+                thevenin_impedance,
+            )
+            upper_residual =
+                upper_result.current_values[active] .- upper[active]
+            lower_residual =
+                lower_result.current_values[active] .- lower[active]
+            jacobian[:, column] .=
+                (upper_residual .- lower_residual) ./ (2.0 * perturbation)
+        end
+        correction = try
+            -(jacobian \ residual)
+        catch error
+            error isa SingularException || rethrow()
+            -(pinv(jacobian) * residual)
+        end
+        all(isfinite, correction) ||
+            throw(ArgumentError("direct-machine fixed-point correction is nonfinite"))
+        accepted = false
+        best_currents = currents
+        best_residual_norm = residual_norm
+        for direction in (correction, copy(residual))
+            for damping in (
+                1.0,
+                0.5,
+                0.25,
+                0.125,
+                0.0625,
+                0.03125,
+                0.015625,
+                0.0078125,
+                0.00390625,
+            )
+                candidate = copy(currents)
+                candidate[active] .+= damping .* direction
+                candidate_result = _direct_machine_steady_state_step(
+                    parameters,
+                    candidate,
+                    power_terminal_open_circuit_voltage,
+                    mechanical_speed_rad_s,
+                    mechanical_angle,
+                    thevenin_impedance,
+                )
+                candidate_residual =
+                    candidate_result.current_values[active] .- candidate[active]
+                candidate_residual_norm =
+                    maximum(abs, candidate_residual; init = 0.0)
+                if candidate_residual_norm < best_residual_norm
+                    best_currents = candidate
+                    best_residual_norm = candidate_residual_norm
+                    accepted = true
+                end
+            end
+        end
+        if accepted
+            currents = best_currents
+        elseif residual_norm <= 10.0 * allowance
+            currents .= result.current_values
+            converged = true
+            break
+        else
+            throw(ArgumentError(
+                "direct-machine fixed-point correction did not reduce runtime residual $residual_norm",
+            ))
+        end
+    end
+    converged || throw(ArgumentError(
+        "direct-machine fixed-point initialization did not converge after $maximum_iterations iterations",
+    ))
+    state = InductionMachineState(
+        currents,
+        vcat(currents[1:3], -currents[4:end]);
+        mechanical_speed_rad_s,
+        previous_mechanical_speed_rad_s = mechanical_speed_rad_s,
+        mechanical_angle_rad = mechanical_angle,
+    )
+    power_terminal_voltages =
+        [0.0, 0.0, power_terminal_open_circuit_voltage]
+    rotor_thevenin_matrix = zeros(Float64, 3, 3)
+    rotor_thevenin_matrix[3, 3] = thevenin_impedance
+    stator_count = length(currents) - 3
+    stator_terminal_voltages = zeros(Float64, stator_count)
+    stator_thevenin_matrix = zeros(Float64, stator_count, stator_count)
+    coupled_dq_machine_step!(
+        state,
+        parameters;
+        power_terminal_voltages,
+        rotor_thevenin_matrix,
+        mechanical_speed_thevenin_rad_s = mechanical_speed_rad_s,
+        generated_torque_impedance = 0.0,
+        stator_terminal_voltages,
+        stator_thevenin_matrix,
+        initial_step = true,
+    )
+    fixed_current_prefix = copy(state.current_values[1:2])
+    fixed_history_prefix = copy(state.history_currents[1:2])
+    variables = vcat(
+        state.current_values[active],
+        state.history_currents[active],
+    )
+
+    function evaluate_runtime_state(candidate_variables::Vector{Float64})
+        candidate_currents = vcat(
+            fixed_current_prefix,
+            candidate_variables[1:3],
+        )
+        candidate_histories = vcat(
+            fixed_history_prefix,
+            candidate_variables[4:6],
+        )
+        candidate_state = InductionMachineState(
+            candidate_currents,
+            candidate_histories;
+            mechanical_speed_rad_s,
+            previous_mechanical_speed_rad_s =
+                mechanical_speed_rad_s,
+            mechanical_angle_rad = mechanical_angle,
+        )
+        candidate_state.d_axis_flux, candidate_state.q_axis_flux =
+            induction_machine_axis_fluxes(
+                parameters,
+                candidate_currents,
+            )
+        candidate_result = coupled_dq_machine_step!(
+            candidate_state,
+            parameters;
+            power_terminal_voltages,
+            rotor_thevenin_matrix,
+            mechanical_speed_thevenin_rad_s =
+                mechanical_speed_rad_s,
+            generated_torque_impedance = 0.0,
+            stator_terminal_voltages,
+            stator_thevenin_matrix,
+            initial_step = false,
+        )
+        mapped_variables = vcat(
+            candidate_result.current_values[active],
+            candidate_result.history_currents[active],
+        )
+        return (
+            residual = mapped_variables - candidate_variables,
+            state = candidate_state,
+            result = candidate_result,
+        )
+    end
+
+    history_iterations = 0
+    history_converged = false
+    final_result = nothing
+    final_current_residual = zeros(Float64, length(currents))
+    final_history_residual = zeros(Float64, length(currents))
+    for iteration in 1:maximum_history_iterations
+        history_iterations = iteration
+        evaluated = evaluate_runtime_state(variables)
+        residual = evaluated.residual
+        residual_norm = maximum(abs, residual; init = 0.0)
+        current_residual_norm =
+            maximum(abs, residual[1:3]; init = 0.0)
+        history_residual_norm =
+            maximum(abs, residual[4:6]; init = 0.0)
+        current_allowance = absolute_tolerance + relative_tolerance *
+            max(maximum(abs, variables[1:3]; init = 0.0), 1.0)
+        history_allowance = absolute_tolerance + relative_tolerance *
+            max(maximum(abs, variables[4:6]; init = 0.0), 1.0)
+        if current_residual_norm <= current_allowance &&
+           history_residual_norm <= history_allowance
+            state = evaluated.state
+            final_result = evaluated.result
+            final_current_residual[active] .= residual[1:3]
+            final_history_residual[active] .= residual[4:6]
+            history_converged = true
+            break
+        end
+        jacobian = zeros(Float64, 6, 6)
+        for column in 1:6
+            perturbation =
+                1.0e-5 * max(abs(variables[column]), 1.0)
+            upper = copy(variables)
+            lower = copy(variables)
+            upper[column] += perturbation
+            lower[column] -= perturbation
+            upper_residual =
+                evaluate_runtime_state(upper).residual
+            lower_residual =
+                evaluate_runtime_state(lower).residual
+            jacobian[:, column] .= (
+                upper_residual - lower_residual
+            ) ./ (2.0 * perturbation)
+        end
+        correction = try
+            -(jacobian \ residual)
+        catch error
+            error isa SingularException || rethrow()
+            -(pinv(jacobian) * residual)
+        end
+        all(isfinite, correction) ||
+            throw(ArgumentError("direct-machine history fixed-point correction is nonfinite"))
+        accepted = false
+        best_variables = variables
+        best_residual_norm = residual_norm
+        for direction in (correction, copy(residual))
+            for damping in (
+                1.0,
+                0.5,
+                0.25,
+                0.125,
+                0.0625,
+                0.03125,
+                0.015625,
+                0.0078125,
+            )
+                candidate = variables + damping * direction
+                candidate_residual =
+                    evaluate_runtime_state(candidate).residual
+                candidate_norm =
+                    maximum(abs, candidate_residual; init = 0.0)
+                if candidate_norm < best_residual_norm
+                    best_variables = candidate
+                    best_residual_norm = candidate_norm
+                    accepted = true
+                end
+            end
+        end
+        if accepted
+            variables = best_variables
+        elseif current_residual_norm <= 20.0 * current_allowance &&
+               history_residual_norm <= 20.0 * history_allowance
+            state = evaluated.state
+            final_result = evaluated.result
+            final_current_residual[active] .= residual[1:3]
+            final_history_residual[active] .= residual[4:6]
+            history_converged = true
+            break
+        else
+            throw(ArgumentError(
+                "direct-machine current/history fixed-point correction did not reduce residual $residual_norm",
+            ))
+        end
+    end
+    history_converged || throw(ArgumentError(
+        "direct-machine runtime current/history fixed point did not converge after $maximum_history_iterations iterations",
+    ))
+    state.mechanical_speed_rad_s = mechanical_speed_rad_s
+    state.previous_mechanical_speed_rad_s = mechanical_speed_rad_s
+    state.mechanical_angle_rad = mechanical_angle
+    state.call_count = 0
+    return (
+        state,
+        runtime_result = final_result,
+        current_residual = collect(final_current_residual),
+        maximum_current_residual =
+            maximum(abs, final_current_residual; init = 0.0),
+        history_residual = collect(final_history_residual),
+        maximum_history_residual =
+            maximum(abs, final_history_residual; init = 0.0),
+        iteration_count = completed_iterations,
+        history_iteration_count = history_iterations,
+        converged = converged && history_converged,
+    )
+end
+
+function _deck_type9_through_12_automatic_electrical_state(
+    parsed::DeckParser.DeckParseResult,
+    machine_index::Int,
+)
+    card1 = _deck_universal_machine_definition(parsed, machine_index, 1)
+    card1.machine_type in (9, 10, 11, 12) ||
+        throw(ArgumentError("automatic coupled-field DC initialization requires type 9 through 12"))
+    _deck_universal_machine_initialization_mode(parsed) == :automatic ||
+        throw(ArgumentError("automatic coupled-field DC initialization requires INITUM=1"))
+    card2 = _deck_universal_machine_definition(parsed, machine_index, 2)
+    card4 = _deck_universal_machine_definition(parsed, machine_index, 4)
+    card2.value1 === missing &&
+        throw(ArgumentError("automatic type-$(card1.machine_type) initialization requires mechanical speed on machine card 2"))
+    card4.value1 === missing &&
+        throw(ArgumentError("automatic type-$(card1.machine_type) initialization requires requested armature voltage on machine card 4"))
+    mechanical_speed = Float64(card2.value1)
+    requested_armature_voltage = Float64(card4.value1)
+    mechanical_speed != 0.0 ||
+        throw(ArgumentError("automatic type-$(card1.machine_type) initialization requires nonzero mechanical speed"))
+    requested_armature_voltage > 0.0 ||
+        throw(ArgumentError("automatic type-$(card1.machine_type) initialization requires positive armature voltage"))
+    parameters = deck_coupled_dq_machine_parameters(parsed; machine_index)
+    fixed_point = _direct_machine_runtime_fixed_point(
+        parameters,
+        requested_armature_voltage,
+        mechanical_speed,
+    )
+    network_nodes = _deck_universal_machine_network_nodes(parsed, machine_index)
+    power_node = Int(network_nodes.power[only(network_nodes.active_power_positions)])
+    power_current = Float64(fixed_point.runtime_result.power_terminal_currents[3])
+    return (
+        source = :automatic_coupled_field_dc_machine_electrical_state,
+        machine_index,
+        machine_type = card1.machine_type,
+        state = fixed_point.state,
+        armature_node = power_node,
+        requested_armature_voltage,
+        armature_current_injection = power_current,
+        current_injections = Dict(power_node => complex(power_current, 0.0)),
+        fixed_point_iteration_count = fixed_point.iteration_count,
+        fixed_point_current_residual = fixed_point.current_residual,
+        fixed_point_maximum_current_residual =
+            fixed_point.maximum_current_residual,
+        fixed_point_history_iteration_count =
+            fixed_point.history_iteration_count,
+        fixed_point_history_residual =
+            fixed_point.history_residual,
+        fixed_point_maximum_history_residual =
+            fixed_point.maximum_history_residual,
+        fixed_point_converged = fixed_point.converged,
+        compiled_defect_isolation =
+            :compiled_direct_machine_label8800_uninitialized_state_excluded,
+    )
+end
+
+function _deck_type9_through_12_automatic_initialization(
+    parsed::DeckParser.DeckParseResult,
+    machine_index::Int,
+)
+    group = _deck_type9_through_12_automatic_initialization_group(
+        parsed,
+        [machine_index],
+    )
+    electrical = only(group.electrical_states)
+    solved_voltage = only(group.solved_armature_voltages)
+    voltage_residual = only(group.armature_voltage_residuals)
+    return merge(
+        electrical,
+        (
+            source = :automatic_coupled_field_dc_machine_initialization,
+            steady_state = group.steady_state,
+            solved_armature_voltage = solved_voltage,
+            armature_voltage_residual = voltage_residual,
+        ),
+    )
+end
+
+function _deck_direct_machine_group_runtime_fixed_points(
+    parsed::DeckParser.DeckParseResult,
+    electrical_states::AbstractVector;
+    maximum_iterations::Int = 12,
+    absolute_tolerance::Float64 = 1.0e-9,
+    relative_tolerance::Float64 = 1.0e-9,
+)
+    machine_count = length(electrical_states)
+    machine_count > 0 ||
+        throw(ArgumentError("automatic direct-machine runtime group must not be empty"))
+    dt_s = DeckParser.deck_fixed_time_horizon_options(parsed).dt_s
+    power_nodes = Int[
+        electrical.armature_node for electrical in electrical_states
+    ]
+    length(unique(power_nodes)) == machine_count ||
+        throw(ArgumentError("automatic direct machines must own distinct armature nodes"))
+    probe = initialize_step_context(
+        parsed;
+        dt_s,
+        t_end_s = dt_s,
+        recorded_step_indices = [0, 1],
+    )
+    calibration = solve_step_with_compensated_current_injections!(
+        probe.system,
+        dt_s,
+        dt_s,
+        zeros(Float64, probe.system.node_count),
+        power_nodes,
+        (_voltage, _impedance) -> zeros(Float64, machine_count),
+    )
+    thevenin_impedance =
+        Matrix{Float64}(calibration.compensation_impedance)
+    maximum(abs, thevenin_impedance - transpose(thevenin_impedance); init = 0.0) <=
+        1.0e-10 * max(maximum(abs, thevenin_impedance; init = 0.0), 1.0) ||
+        throw(ArgumentError("automatic direct-machine runtime Thévenin matrix is not reciprocal"))
+    all(diag(thevenin_impedance) .>= 0.0) ||
+        throw(ArgumentError("automatic direct-machine runtime Thévenin matrix has negative driving impedance"))
+    parameters = [
+        deck_coupled_dq_machine_parameters(
+            parsed;
+            machine_index = electrical.machine_index,
+            time_step_s = dt_s,
+        ) for electrical in electrical_states
+    ]
+    requested_voltages = Float64[
+        electrical.requested_armature_voltage
+        for electrical in electrical_states
+    ]
+    mechanical_speeds = Float64[
+        electrical.state.mechanical_speed_rad_s
+        for electrical in electrical_states
+    ]
+    initial_current_values = [
+        copy(electrical.state.current_values)
+        for electrical in electrical_states
+    ]
+
+    function evaluate(guesses::Vector{Float64})
+        open_circuit_voltages =
+            requested_voltages - thevenin_impedance * guesses
+        fixed_points = [
+            _direct_machine_runtime_fixed_point(
+                parameters[index],
+                open_circuit_voltages[index],
+                mechanical_speeds[index];
+                power_terminal_thevenin_impedance =
+                    thevenin_impedance[index, index],
+                initial_current_values = initial_current_values[index],
+                absolute_tolerance,
+                relative_tolerance,
+            ) for index in 1:machine_count
+        ]
+        mapped_currents = Float64[
+            fixed_point.runtime_result.power_terminal_currents[3]
+            for fixed_point in fixed_points
+        ]
+        return mapped_currents, fixed_points, open_circuit_voltages
+    end
+
+    currents = Float64[
+        electrical.armature_current_injection
+        for electrical in electrical_states
+    ]
+    converged = false
+    completed_iterations = 0
+    fixed_points = Any[]
+    open_circuit_voltages = zeros(Float64, machine_count)
+    residual = zeros(Float64, machine_count)
+    for iteration in 1:maximum_iterations
+        completed_iterations = iteration
+        mapped, trial_fixed_points, trial_open_circuit =
+            evaluate(currents)
+        residual .= mapped .- currents
+        residual_norm = maximum(abs, residual; init = 0.0)
+        allowance = absolute_tolerance + relative_tolerance *
+            max(maximum(abs, mapped; init = 0.0), 1.0)
+        if residual_norm <= allowance
+            currents .= mapped
+            fixed_points = trial_fixed_points
+            open_circuit_voltages .= trial_open_circuit
+            converged = true
+            break
+        end
+        jacobian = zeros(Float64, machine_count, machine_count)
+        for column in 1:machine_count
+            perturbation =
+                1.0e-6 * max(abs(currents[column]), 1.0)
+            perturbed = copy(currents)
+            perturbed[column] += perturbation
+            perturbed_mapped, _, _ = evaluate(perturbed)
+            jacobian[:, column] .= (
+                perturbed_mapped .-
+                perturbed .-
+                residual
+            ) ./ perturbation
+        end
+        correction = try
+            -(jacobian \ residual)
+        catch error
+            error isa SingularException || rethrow()
+            -(pinv(jacobian) * residual)
+        end
+        all(isfinite, correction) ||
+            throw(ArgumentError("automatic direct-machine group correction is nonfinite"))
+        accepted = false
+        for damping in (1.0, 0.5, 0.25, 0.125, 0.0625, 0.03125)
+            candidate = currents + damping * correction
+            candidate_mapped, _, _ = evaluate(candidate)
+            candidate_residual = candidate_mapped - candidate
+            if maximum(abs, candidate_residual; init = 0.0) < residual_norm
+                currents = candidate
+                accepted = true
+                break
+            end
+        end
+        accepted || throw(ArgumentError(
+            "automatic direct-machine group correction did not reduce the runtime residual",
+        ))
+    end
+    converged || throw(ArgumentError(
+        "automatic direct-machine runtime group did not converge after $maximum_iterations iterations",
+    ))
+    mapped, fixed_points, open_circuit_voltages = evaluate(currents)
+    residual = mapped - currents
+    currents .= mapped
+    updated_electrical_states = [
+        merge(
+            electrical_states[index],
+            (
+                state = fixed_points[index].state,
+                armature_current_injection = currents[index],
+                current_injections = Dict(
+                    power_nodes[index] => complex(currents[index], 0.0),
+                ),
+                fixed_point_iteration_count =
+                    fixed_points[index].iteration_count,
+                fixed_point_current_residual =
+                    fixed_points[index].current_residual,
+                fixed_point_maximum_current_residual =
+                    fixed_points[index].maximum_current_residual,
+                fixed_point_history_iteration_count =
+                    fixed_points[index].history_iteration_count,
+                fixed_point_history_residual =
+                    fixed_points[index].history_residual,
+                fixed_point_maximum_history_residual =
+                    fixed_points[index].maximum_history_residual,
+                runtime_power_terminal_open_circuit_voltage =
+                    open_circuit_voltages[index],
+                runtime_power_terminal_thevenin_impedance =
+                    thevenin_impedance[index, index],
+            ),
+        ) for index in 1:machine_count
+    ]
+    return (
+        source = :automatic_direct_machine_group_runtime_fixed_points,
+        electrical_states = updated_electrical_states,
+        power_terminal_thevenin_impedance = thevenin_impedance,
+        power_terminal_open_circuit_voltages = open_circuit_voltages,
+        power_terminal_currents = currents,
+        current_residual = residual,
+        maximum_current_residual =
+            maximum(abs, residual; init = 0.0),
+        iteration_count = completed_iterations,
+        converged,
+    )
+end
+
+function _deck_type9_through_12_automatic_initialization_group(
+    parsed::DeckParser.DeckParseResult,
+    machine_indices::AbstractVector{<:Integer},
+)
+    indices = Int.(machine_indices)
+    !isempty(indices) && length(unique(indices)) == length(indices) ||
+        throw(ArgumentError("automatic direct-machine group indices must be nonempty and unique"))
+    preliminary_electrical_states = [
+        _deck_type9_through_12_automatic_electrical_state(
+            parsed,
+            machine_index,
+        ) for machine_index in indices
+    ]
+    runtime_fixed_points =
+        _deck_direct_machine_group_runtime_fixed_points(
+            parsed,
+            preliminary_electrical_states,
+        )
+    electrical_states = runtime_fixed_points.electrical_states
+    current_injections = Dict{Int,ComplexF64}()
+    for electrical in electrical_states
+        for (node, injection) in electrical.current_injections
+            current_injections[Int(node)] =
+                get(current_injections, Int(node), 0.0 + 0.0im) +
+                ComplexF64(injection)
+        end
+    end
+    steady_state = _deck_external_steady_state_voltage_phasors(
+        parsed,
+        current_injections,
+        excluded_universal_machine_indices = indices,
+    )
+    solved_armature_voltages = ComplexF64[
+        steady_state.node_voltage_phasors[electrical.armature_node]
+        for electrical in electrical_states
+    ]
+    armature_voltage_residuals = ComplexF64[
+        solved_armature_voltages[index] -
+        electrical_states[index].requested_armature_voltage
+        for index in eachindex(electrical_states)
+    ]
+    for index in eachindex(electrical_states)
+        electrical = electrical_states[index]
+        residual = armature_voltage_residuals[index]
+        tolerance =
+            1.0e-8 + 1.0e-8 * abs(electrical.requested_armature_voltage)
+        abs(residual) <= tolerance || throw(ArgumentError(
+            "automatic type-$(electrical.machine_type) machine $(electrical.machine_index) armature/network steady state is inconsistent by $residual V",
+        ))
+    end
+    return (
+        source = :automatic_coupled_field_dc_machine_group_initialization,
+        machine_indices = indices,
+        electrical_states,
+        current_injections,
+        steady_state,
+        solved_armature_voltages,
+        armature_voltage_residuals,
+        maximum_armature_voltage_residual =
+            maximum(abs, armature_voltage_residuals; init = 0.0),
+        runtime_power_terminal_thevenin_impedance =
+            runtime_fixed_points.power_terminal_thevenin_impedance,
+        runtime_power_terminal_open_circuit_voltages =
+            runtime_fixed_points.power_terminal_open_circuit_voltages,
+        runtime_group_fixed_point_iteration_count =
+            runtime_fixed_points.iteration_count,
+        runtime_group_current_residual =
+            runtime_fixed_points.current_residual,
+        runtime_group_maximum_current_residual =
+            runtime_fixed_points.maximum_current_residual,
+    )
+end
+
+function _deck_direct_machine_automatic_initialization(
+    parsed::DeckParser.DeckParseResult,
+    machine_index::Int,
+)
+    card1 = _deck_universal_machine_definition(parsed, machine_index, 1)
+    card1.machine_type == 8 &&
+        return _deck_type8_automatic_initialization(parsed, machine_index)
+    card1.machine_type in (9, 10, 11, 12) &&
+        return _deck_type9_through_12_automatic_initialization(
+            parsed,
+            machine_index,
+        )
+    throw(ArgumentError("automatic direct-machine initialization requires type 8 through 12"))
+end
+
 function deck_separately_excited_dc_initialization(
     parsed::DeckParser.DeckParseResult;
     machine_index::Int=1,
 )
     return _deck_type8_automatic_initialization(parsed, machine_index)
+end
+
+function deck_direct_current_machine_automatic_initialization(
+    parsed::DeckParser.DeckParseResult;
+    machine_index::Int = 1,
+)
+    return _deck_direct_machine_automatic_initialization(
+        parsed,
+        machine_index,
+    )
 end
 
 function _deck_coupled_dq_axis_coil_counts(card1)

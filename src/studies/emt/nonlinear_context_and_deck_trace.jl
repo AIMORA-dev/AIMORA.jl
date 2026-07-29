@@ -2434,6 +2434,15 @@ function run_deck_emt_with_over16_boundary(
     over5_switch_marker_texts =
         deck_over16_boundary_plan === nothing ? String[] :
         copy(deck_over16_boundary_plan.over5_switch_marker_texts)
+    over5_switch_type_values =
+        deck_over16_boundary_plan === nothing ? Int[] :
+        copy(deck_over16_boundary_plan.over5_switch_type_values)
+    over5_switch_critical_current_values =
+        deck_over16_boundary_plan === nothing ? Float64[] :
+        copy(deck_over16_boundary_plan.over5_switch_critical_current_values)
+    over5_switch_random_opening_standard_deviation_s_values =
+        deck_over16_boundary_plan === nothing ? Float64[] :
+        copy(deck_over16_boundary_plan.over5_switch_random_opening_standard_deviation_s_values)
     over5_switch_on_conductance_values =
         deck_over16_boundary_plan === nothing ? Float64[] :
         copy(deck_over16_boundary_plan.over5_switch_on_conductance_values)
@@ -2741,6 +2750,11 @@ function run_deck_emt_with_over16_boundary(
         deck_over5_switch_measuring_flags = over5_switch_measuring_flags,
         deck_over5_switch_closed_markers = over5_switch_closed_markers,
         deck_over5_switch_marker_texts = over5_switch_marker_texts,
+        deck_over5_switch_type_values = over5_switch_type_values,
+        deck_over5_switch_critical_current_values =
+            over5_switch_critical_current_values,
+        deck_over5_switch_random_opening_standard_deviation_s_values =
+            over5_switch_random_opening_standard_deviation_s_values,
         deck_over5_switch_on_conductance_values = over5_switch_on_conductance_values,
         deck_over5_switch_off_conductance_values = over5_switch_off_conductance_values,
         deck_over5_switch_output_codes = over5_switch_output_codes,

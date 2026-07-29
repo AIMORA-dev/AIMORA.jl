@@ -80,16 +80,119 @@ function _steady_state_frequency_edges(result::DeckParseResult)
         (from_node == 0 || to_node == 0) && continue
         push!(edges, _DeckSteadyStateFrequencyEdge(:switch, index, from_node, to_node))
     end
+    coupled_group_index = 0
+    coupled_group_nodes = Int[]
+    for row in result.coupled_line_rows
+        if row.phase_index == 1 && !isempty(coupled_group_nodes)
+            coupled_group_index += 1
+            _append_steady_state_frequency_clique_edges!(
+                edges,
+                :coupled_line,
+                coupled_group_index,
+                coupled_group_nodes,
+            )
+            empty!(coupled_group_nodes)
+        end
+        append!(
+            coupled_group_nodes,
+            (
+                abs(Int(row.from_node_value)),
+                abs(Int(row.to_node_value)),
+                ismissing(row.reference_from_node_value) ?
+                    0 : abs(Int(row.reference_from_node_value)),
+                ismissing(row.reference_to_node_value) ?
+                    0 : abs(Int(row.reference_to_node_value)),
+            ),
+        )
+    end
+    if !isempty(coupled_group_nodes)
+        coupled_group_index += 1
+        _append_steady_state_frequency_clique_edges!(
+            edges,
+            :coupled_line,
+            coupled_group_index,
+            coupled_group_nodes,
+        )
+    end
+    phase_pi_group_index = 0
+    phase_pi_group_nodes = Int[]
+    for row in result.coupled_phase_pi_section_rows
+        if row.phase_index == 1 && !isempty(phase_pi_group_nodes)
+            phase_pi_group_index += 1
+            _append_steady_state_frequency_clique_edges!(
+                edges,
+                :coupled_phase_pi,
+                phase_pi_group_index,
+                phase_pi_group_nodes,
+            )
+            empty!(phase_pi_group_nodes)
+        end
+        append!(
+            phase_pi_group_nodes,
+            (
+                abs(Int(row.from_node_value)),
+                abs(Int(row.to_node_value)),
+                ismissing(row.reference_from_node_value) ?
+                    0 : abs(Int(row.reference_from_node_value)),
+                ismissing(row.reference_to_node_value) ?
+                    0 : abs(Int(row.reference_to_node_value)),
+            ),
+        )
+    end
+    if !isempty(phase_pi_group_nodes)
+        phase_pi_group_index += 1
+        _append_steady_state_frequency_clique_edges!(
+            edges,
+            :coupled_phase_pi,
+            phase_pi_group_index,
+            phase_pi_group_nodes,
+        )
+    end
+    for (index, row) in enumerate(result.bergeron_line_rows)
+        from_node = abs(Int(row.from_node_value))
+        to_node = abs(Int(row.to_node_value))
+        (from_node == 0 || to_node == 0) && continue
+        push!(edges, _DeckSteadyStateFrequencyEdge(
+            :bergeron_line,
+            index,
+            from_node,
+            to_node,
+        ))
+    end
+    for (index, row) in enumerate(result.generator_equivalent_rows)
+        _append_steady_state_frequency_clique_edges!(
+            edges,
+            :generator_equivalent,
+            index,
+            vcat(row.from_node_indices, row.to_node_indices),
+        )
+    end
+    for (index, element) in enumerate(result.elements)
+        hasproperty(element, :from_nodes) && hasproperty(element, :to_nodes) ||
+            continue
+        _append_steady_state_frequency_clique_edges!(
+            edges,
+            :multiphase_element,
+            index,
+            vcat(getproperty(element, :from_nodes), getproperty(element, :to_nodes)),
+        )
+    end
     return edges
 end
 
-function _mixed_frequency_unsupported_topology_kinds(result::DeckParseResult)
-    kinds = Symbol[]
-    isempty(result.bergeron_line_rows) || push!(kinds, :bergeron_line)
-    isempty(result.coupled_line_rows) || push!(kinds, :coupled_line)
-    isempty(result.coupled_phase_pi_section_rows) || push!(kinds, :coupled_phase_pi)
-    isempty(result.generator_equivalent_rows) || push!(kinds, :generator_equivalent)
-    return kinds
+function _append_steady_state_frequency_clique_edges!(
+    edges::Vector{_DeckSteadyStateFrequencyEdge},
+    kind::Symbol,
+    index::Int,
+    node_values,
+)
+    nodes = sort!(unique(Int[abs(Int(node)) for node in node_values if Int(node) != 0]))
+    isempty(nodes) && return edges
+    anchor = first(nodes)
+    for node in Iterators.drop(nodes, 1)
+        push!(edges, _DeckSteadyStateFrequencyEdge(kind, index, anchor, node))
+    end
+    return edges
 end
 
 function _frequency_conflict(
@@ -266,16 +369,25 @@ function deck_steady_state_frequency_partition(result::DeckParseResult)
 
     source_groups, source_successors =
         _source_groups_and_successors!(parents, active_sources)
-    positive_sources = sort(unique(filter(>(0), node_sources)))
+    positive_source_roots = sort!(unique(Int[
+        _source_group_find!(parents, source_index)
+        for source_index in node_sources
+        if source_index > 0
+    ]))
     subnetwork_frequencies_hz = Float64[]
     subnetwork_node_indices = Vector{Int}[]
-    for source_index in positive_sources
-        frequency_hz = source_frequencies_hz[source_index]
+    for source_root in positive_source_roots
+        frequency_hz = source_frequencies_hz[source_root]
         frequency_hz === nothing && error("subnetwork frequency source is missing")
         push!(subnetwork_frequencies_hz, frequency_hz)
         push!(
             subnetwork_node_indices,
-            findall(==(source_index), node_sources),
+            findall(
+                source_index ->
+                    source_index > 0 &&
+                    _source_group_find!(parents, source_index) == source_root,
+                node_sources,
+            ),
         )
     end
 
@@ -291,8 +403,7 @@ function deck_steady_state_frequency_partition(result::DeckParseResult)
         inactive_nodes,
         length(result.over2_branch_rows),
         count(row -> row.initially_closed, result.over5_switch_rows),
-        length(active_frequencies) > 1 ?
-            _mixed_frequency_unsupported_topology_kinds(result) : Symbol[],
+        Symbol[],
     )
 end
 

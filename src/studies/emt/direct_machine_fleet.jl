@@ -1,6 +1,16 @@
 struct DeckDirectMachineFleetHorizon
     source::String
     machine_types::Vector{Int}
+    initialization_mode::Symbol
+    initialization_fixed_point_iteration_counts::Vector{Int}
+    initialization_current_residuals::Vector{Float64}
+    initialization_history_iteration_counts::Vector{Int}
+    initialization_history_residuals::Vector{Float64}
+    initialization_armature_voltage_residuals::Vector{ComplexF64}
+    initialization_defect_isolations::Vector{Symbol}
+    initialization_group_iteration_count::Int
+    initialization_group_current_residual::Float64
+    initialization_power_thevenin_impedance::Matrix{Float64}
     time_s::Vector{Float64}
     output_values::Array{Float64,3}
     current_values::Array{Float64,3}
@@ -86,8 +96,8 @@ function run_deck_direct_machine_fleet_horizon(
     length(sections) == 1 ||
         throw(ArgumentError("direct-machine fleet requires one universal-machine section"))
     section = only(sections)
-    section.initialization_mode == :manual ||
-        throw(ArgumentError("direct-machine fleet requires manual initialization"))
+    section.initialization_mode in (:manual, :automatic) ||
+        throw(ArgumentError("direct-machine fleet requires manual or automatic initialization"))
     machine_count = section.machine_count
     machine_count > 1 ||
         throw(ArgumentError("direct-machine fleet requires at least two machines"))
@@ -115,25 +125,77 @@ function run_deck_direct_machine_fleet_horizon(
         ) for machine_index in 1:machine_count
     ]
     machine_types = [parameter.machine_type for parameter in parameters]
-    all(machine_type -> machine_type in (9, 10), machine_types) ||
-        throw(ArgumentError("direct-machine fleet currently owns machine types 9 and 10"))
+    all(machine_type -> machine_type in (9, 10, 11, 12), machine_types) ||
+        throw(ArgumentError("direct-machine fleet owns machine types 9 through 12"))
     all(parameter -> length(parameter.coil_conductances) == 5, parameters) ||
         throw(ArgumentError("direct-machine fleet requires five-coil owners"))
 
-    steady_state = deck_steady_state_voltage_phasors(parsed)
-    states = [
-        deck_direct_current_machine_initial_state(
-            parsed;
-            machine_index,
-            steady_state,
-        ) for machine_index in 1:machine_count
-    ]
     network_nodes = [
         _deck_universal_machine_network_nodes(parsed, machine_index)
         for machine_index in 1:machine_count
     ]
     all(nodes -> length(nodes.active_power_positions) == 1, network_nodes) ||
         throw(ArgumentError("direct-machine fleet requires one active armature terminal per machine"))
+    automatic_initialization =
+        section.initialization_mode == :automatic ?
+        _deck_type9_through_12_automatic_initialization_group(
+            parsed,
+            collect(1:machine_count),
+        ) : nothing
+    steady_state = automatic_initialization === nothing ?
+        deck_steady_state_voltage_phasors(parsed) :
+        automatic_initialization.steady_state
+    states = automatic_initialization === nothing ?
+        [
+            deck_direct_current_machine_initial_state(
+                parsed;
+                machine_index,
+                steady_state,
+            ) for machine_index in 1:machine_count
+        ] :
+        [
+            electrical.state
+            for electrical in automatic_initialization.electrical_states
+        ]
+    initialization_fixed_point_iteration_counts =
+        automatic_initialization === nothing ?
+        zeros(Int, machine_count) :
+        Int[
+            electrical.fixed_point_iteration_count
+            for electrical in automatic_initialization.electrical_states
+        ]
+    initialization_current_residuals =
+        automatic_initialization === nothing ?
+        zeros(Float64, machine_count) :
+        Float64[
+            electrical.fixed_point_maximum_current_residual
+            for electrical in automatic_initialization.electrical_states
+        ]
+    initialization_history_iteration_counts =
+        automatic_initialization === nothing ?
+        zeros(Int, machine_count) :
+        Int[
+            electrical.fixed_point_history_iteration_count
+            for electrical in automatic_initialization.electrical_states
+        ]
+    initialization_history_residuals =
+        automatic_initialization === nothing ?
+        zeros(Float64, machine_count) :
+        Float64[
+            electrical.fixed_point_maximum_history_residual
+            for electrical in automatic_initialization.electrical_states
+        ]
+    initialization_armature_voltage_residuals =
+        automatic_initialization === nothing ?
+        zeros(ComplexF64, machine_count) :
+        copy(automatic_initialization.armature_voltage_residuals)
+    initialization_defect_isolations =
+        automatic_initialization === nothing ?
+        Symbol[] :
+        Symbol[
+            electrical.compiled_defect_isolation
+            for electrical in automatic_initialization.electrical_states
+        ]
 
     context = initialize_step_context(
         parsed;
@@ -142,6 +204,17 @@ function run_deck_direct_machine_fleet_horizon(
         recorded_step_indices = [0, horizon.step_count],
     )
     _seed_steady_state_network_state!(context, steady_state)
+    if automatic_initialization !== nothing
+        _seed_direct_machine_power_leakage_currents!(
+            context,
+            parsed,
+            collect(1:machine_count),
+            Float64[
+                electrical.armature_current_injection
+                for electrical in automatic_initialization.electrical_states
+            ],
+        )
+    end
     for machine_index in 1:machine_count
         _seed_machine_mechanical_inertia!(
             context.system,
@@ -248,12 +321,38 @@ function run_deck_direct_machine_fleet_horizon(
 
     execute_controls!(1)
     initial_results = Vector{Any}(undef, machine_count)
+    if automatic_initialization !== nothing
+        compensated_voltages[:, 1] .= steady_state.node_voltage_values
+    end
     for machine_index in 1:machine_count
+        retained_automatic_histories =
+            automatic_initialization === nothing ?
+            Float64[] :
+            copy(states[machine_index].history_currents)
+        initial_power_terminal_voltages = zeros(Float64, 3)
+        initial_rotor_thevenin_matrix = zeros(Float64, 3, 3)
+        if automatic_initialization !== nothing
+            active_position =
+                only(network_nodes[machine_index].active_power_positions)
+            initial_power_terminal_voltages[active_position] =
+                automatic_initialization.runtime_power_terminal_open_circuit_voltages[
+                    machine_index
+                ]
+            initial_rotor_thevenin_matrix[
+                active_position,
+                active_position,
+            ] = automatic_initialization.runtime_power_terminal_thevenin_impedance[
+                machine_index,
+                machine_index,
+            ]
+        end
         result = coupled_dq_machine_step!(
             states[machine_index],
             parameters[machine_index];
-            power_terminal_voltages = zeros(3),
-            rotor_thevenin_matrix = zeros(3, 3),
+            power_terminal_voltages =
+                initial_power_terminal_voltages,
+            rotor_thevenin_matrix =
+                initial_rotor_thevenin_matrix,
             mechanical_speed_thevenin_rad_s =
                 states[machine_index].mechanical_speed_rad_s,
             generated_torque_impedance = 0.0,
@@ -262,13 +361,26 @@ function run_deck_direct_machine_fleet_horizon(
             coil_control_voltages = coil_control_voltages[:, machine_index, 1],
             initial_step = true,
         )
+        isempty(retained_automatic_histories) ||
+            (states[machine_index].history_currents .=
+                retained_automatic_histories)
         initial_results[machine_index] = result
         record_result!(machine_index, 1, result)
+        if automatic_initialization !== nothing
+            nodes = network_nodes[machine_index]
+            terminal_voltages[:, machine_index, 1] .= Float64[
+                node > 0 ? steady_state.node_voltage_values[node] : 0.0
+                for node in nodes.power
+            ]
+        end
         mechanical_node = network_nodes[machine_index].mechanical
-        compensated_voltages[mechanical_node, 1] =
-            steady_state.node_voltage_values[mechanical_node]
+        initial_mechanical_speed =
+            automatic_initialization === nothing ?
+            steady_state.node_voltage_values[mechanical_node] :
+            states[machine_index].mechanical_speed_rad_s
+        compensated_voltages[mechanical_node, 1] = initial_mechanical_speed
         mechanical_speed_thevenin[machine_index, 1] =
-            steady_state.node_voltage_values[mechanical_node]
+            initial_mechanical_speed
     end
 
     power_nodes = Int[
@@ -289,9 +401,16 @@ function run_deck_direct_machine_fleet_horizon(
     mechanical_positions = (machine_count + 1):(2 * machine_count)
     drive_positions = (2 * machine_count + 1):(3 * machine_count)
     torque_currents = -Float64[result.generated_torque for result in initial_results]
-    desired_speeds = Float64[
-        steady_state.node_voltage_values[node] for node in mechanical_nodes
-    ]
+    desired_speeds =
+        automatic_initialization === nothing ?
+        Float64[
+            steady_state.node_voltage_values[node]
+            for node in mechanical_nodes
+        ] :
+        Float64[
+            state.mechanical_speed_rad_s
+            for state in states
+        ]
     drive_transfer = calibration.compensation_impedance[
         mechanical_positions,
         drive_positions,
@@ -468,6 +587,22 @@ function run_deck_direct_machine_fleet_horizon(
     return DeckDirectMachineFleetHorizon(
         parsed.source,
         machine_types,
+        section.initialization_mode,
+        initialization_fixed_point_iteration_counts,
+        initialization_current_residuals,
+        initialization_history_iteration_counts,
+        initialization_history_residuals,
+        initialization_armature_voltage_residuals,
+        initialization_defect_isolations,
+        automatic_initialization === nothing ?
+            0 :
+            automatic_initialization.runtime_group_fixed_point_iteration_count,
+        automatic_initialization === nothing ?
+            0.0 :
+            automatic_initialization.runtime_group_maximum_current_residual,
+        automatic_initialization === nothing ?
+            zeros(Float64, machine_count, machine_count) :
+            automatic_initialization.runtime_power_terminal_thevenin_impedance,
         times,
         outputs,
         currents,

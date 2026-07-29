@@ -79,6 +79,7 @@ export BergeronLine,
        line_modal_solution_scan,
        line_modal_solution_scan!,
        coupled_lumped_sequence_impedance,
+       coupled_lumped_matrix_impedance,
        coupled_lumped_phase_pi_section,
        distributed_transposed_line_constants,
        distributed_transposed_line_modal_branch_state,
@@ -293,6 +294,7 @@ struct CoupledLumpedSequenceImpedance
     stored_resistance_values::Vector{Float64}
     stored_inductance_values::Vector{Float64}
     stored_capacitance_values::Vector{Float64}
+    input_kind::Symbol
     phase_count::Int
 end
 
@@ -697,7 +699,71 @@ function coupled_lumped_sequence_impedance(
         _stored_symmetric_phase_values(resistance_matrix),
         _stored_symmetric_phase_values(inductance_matrix),
         zeros(Float64, 6),
+        :sequence_shorthand,
         3,
+    )
+end
+
+function coupled_lumped_matrix_impedance(
+    name::Symbol,
+    phase_indices::AbstractVector{<:Integer},
+    from_nodes::AbstractVector{Symbol},
+    to_nodes::AbstractVector{Symbol},
+    from_node_indices::AbstractVector{<:Integer},
+    to_node_indices::AbstractVector{<:Integer},
+    resistance_matrix::AbstractMatrix{<:Real},
+    inductance_matrix::AbstractMatrix{<:Real};
+    line_numbers::AbstractVector{<:Integer}=Int[],
+)
+    phase_count = length(phase_indices)
+    phases = _phase_index_vector(phase_indices)
+    from_symbols = _symbol_phase_vector("from_nodes", from_nodes, phase_count)
+    to_symbols = _symbol_phase_vector("to_nodes", to_nodes, phase_count)
+    from_indices = _index_phase_vector("from_node_indices", from_node_indices, phase_count)
+    to_indices = _index_phase_vector("to_node_indices", to_node_indices, phase_count)
+    source_lines = _line_number_vector(line_numbers, phase_count)
+    resistance =
+        _finite_square_phase_matrix(resistance_matrix, phase_count, "phase_resistance")
+    inductance =
+        _finite_square_phase_matrix(inductance_matrix, phase_count, "phase_inductance")
+    tolerance = 64.0 * eps(Float64) * max(
+        maximum(abs, resistance; init=0.0),
+        maximum(abs, inductance; init=0.0),
+        1.0,
+    )
+    maximum(abs, resistance - transpose(resistance); init=0.0) <= tolerance ||
+        throw(ArgumentError("phase resistance matrix must be symmetric"))
+    maximum(abs, inductance - transpose(inductance); init=0.0) <= tolerance ||
+        throw(ArgumentError("phase inductance matrix must be symmetric"))
+    resistance = 0.5 .* (resistance .+ transpose(resistance))
+    inductance = 0.5 .* (inductance .+ transpose(inductance))
+    zero_resistance = sum(resistance) / phase_count
+    positive_resistance = phase_count == 1 ? zero_resistance :
+        (tr(resistance) - zero_resistance) / (phase_count - 1)
+    zero_inductance = sum(inductance) / phase_count
+    positive_inductance = phase_count == 1 ? zero_inductance :
+        (tr(inductance) - zero_inductance) / (phase_count - 1)
+    stored_count = phase_count * (phase_count + 1) ÷ 2
+    return CoupledLumpedSequenceImpedance(
+        name,
+        phases,
+        from_symbols,
+        to_symbols,
+        from_indices,
+        to_indices,
+        source_lines,
+        zero_resistance,
+        positive_resistance,
+        zero_inductance,
+        positive_inductance,
+        resistance,
+        inductance,
+        zeros(Float64, phase_count, phase_count),
+        _stored_symmetric_phase_values(resistance),
+        _stored_symmetric_phase_values(inductance),
+        zeros(Float64, stored_count),
+        :triangular_matrix,
+        phase_count,
     )
 end
 

@@ -57,8 +57,10 @@ function push_bpa_fixed_switch_time_row!(
     switch_layout_kind::Symbol=:fixed_field,
     marker_text::AbstractString="",
     output_code::Int=0,
+    critical_current_a::Real=0.0,
+    random_opening_standard_deviation_s::Real=0.0,
 )::Bool
-    if switch_type != 0
+    if switch_type ∉ (0, 76)
         blocker = switch_type in (11, 12, 13) ?
                   :bpa_fixed_switch_blocked_tacs_controlled :
                   :bpa_fixed_switch_blocked_other
@@ -68,6 +70,30 @@ function push_bpa_fixed_switch_time_row!(
                                  switch_type in (11, 12, 13) ?
                                  "Unsupported OVER5 switch type $switch_type: switch types 11-13 require TACS/controlled-switch state ownership" :
                                  "Unsupported OVER5 switch type $switch_type"))
+        return true
+    end
+    critical_current = Float64(critical_current_a)
+    isfinite(critical_current) && critical_current >= 0.0 || begin
+        add_issue!(
+            result.validation,
+            invalid_value(
+                "line $line_no",
+                "switch critical current must be finite and nonnegative",
+            ),
+        )
+        return true
+    end
+    random_opening_standard_deviation =
+        Float64(random_opening_standard_deviation_s)
+    isfinite(random_opening_standard_deviation) &&
+        random_opening_standard_deviation >= 0.0 || begin
+        add_issue!(
+            result.validation,
+            invalid_value(
+                "line $line_no",
+                "switch random-opening standard deviation must be finite and nonnegative",
+            ),
+        )
         return true
     end
     closed_marker = uppercase(strip(String(closed_text)))
@@ -121,6 +147,8 @@ function push_bpa_fixed_switch_time_row!(
                     measuring_marker,
                     closed_marker,
                     normalized_marker_text,
+                    critical_current,
+                    random_opening_standard_deviation,
                     switch.on_conductance,
                     switch.off_conductance,
                 ),
@@ -160,7 +188,8 @@ function parse_bpa_fixed_switch_free_field_card!(result::DeckParseResult,
     end
     switch_type = free_field_int_or_default!(result, fields, 1, line_no, "switch_type", 0)
     switch_type === nothing && return true
-    maximum_field_count = switch_type in (11, 12, 13) ? 13 : 7
+    maximum_field_count = switch_type in (11, 12, 13) ? 13 :
+        switch_type == 76 ? 9 : 7
     if length(fields) > maximum_field_count
         add_issue!(
             result.validation,
@@ -245,8 +274,34 @@ function parse_bpa_fixed_switch_free_field_card!(result::DeckParseResult,
     if close_time === nothing || open_time === nothing
         return true
     end
-    closed_text = length(fields) >= 6 ? fields[6] : ""
-    marker_text = length(fields) >= 7 ? fields[7] : ""
+    critical_current = if switch_type == 76 && length(fields) >= 6
+        value = tryparse_deck_float(fields[6])
+        value === nothing && add_issue!(
+            result.validation,
+            invalid_value("line $line_no", "switch type 76 critical current must be numeric"),
+        )
+        value === nothing ? 0.0 : Float64(value)
+    else
+        0.0
+    end
+    random_opening_standard_deviation =
+        if switch_type == 76 && length(fields) >= 7
+            value = tryparse_deck_float(fields[7])
+            value === nothing && add_issue!(
+                result.validation,
+                invalid_value(
+                    "line $line_no",
+                    "switch type 76 random-opening standard deviation must be numeric",
+                ),
+            )
+            value === nothing ? 0.0 : Float64(value)
+        else
+            0.0
+        end
+    closed_field = switch_type == 76 ? 8 : 6
+    marker_field = switch_type == 76 ? 9 : 7
+    closed_text = length(fields) >= closed_field ? fields[closed_field] : ""
+    marker_text = length(fields) >= marker_field ? fields[marker_field] : ""
     return push_bpa_fixed_switch_time_row!(
         result,
         switch_type,
@@ -260,6 +315,9 @@ function parse_bpa_fixed_switch_free_field_card!(result::DeckParseResult,
         switch_layout_count = :bpa_fixed_switch_free_field,
         switch_layout_kind = :free_field,
         marker_text = marker_text,
+        critical_current_a = critical_current,
+        random_opening_standard_deviation_s =
+            random_opening_standard_deviation,
     )
 end
 
@@ -608,10 +666,32 @@ function parse_bpa_fixed_switch_card!(result::DeckParseResult, line::AbstractStr
     close_time = fixed_float_field!(result, image, line_no, 15, 24, "switch_close_time")
     open_time =
         fixed_float_or_default!(result, image, line_no, 25, 34, "switch_open_time", Inf)
+    critical_current = switch_type == 76 ?
+        fixed_float_or_default!(
+            result,
+            image,
+            line_no,
+            35,
+            44,
+            "switch_critical_current",
+            0.0,
+        ) : 0.0
+    random_opening_standard_deviation = switch_type == 76 ?
+        fixed_float_or_default!(
+            result,
+            image,
+            line_no,
+            45,
+            54,
+            "switch_random_opening_standard_deviation",
+            0.0,
+        ) : 0.0
     closed_text = fixed_field(image, 55, 60)
     marker_text = fixed_field(image, 61, 64)
     if switch_type === nothing || output_code === nothing ||
-       close_time === nothing || open_time === nothing
+       close_time === nothing || open_time === nothing ||
+       critical_current === nothing ||
+       random_opening_standard_deviation === nothing
         return true
     end
     if isempty(from_node) || isempty(to_node)
@@ -631,6 +711,9 @@ function parse_bpa_fixed_switch_card!(result::DeckParseResult, line::AbstractStr
         initial_issues,
         marker_text = marker_text,
         output_code = output_code,
+        critical_current_a = critical_current,
+        random_opening_standard_deviation_s =
+            random_opening_standard_deviation,
     )
 end
 

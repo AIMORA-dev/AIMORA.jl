@@ -658,10 +658,42 @@ function _coupled_lumped_sequence_impedance_from_rows(
     group_index::Int,
 )
     length(rows) == 3 || throw(ArgumentError("coupled lumped sequence group must contain three rows"))
-    third_row_resistance = _sequence_numeric_value(rows[3].sequence_resistance)
-    third_row_inductance = _sequence_numeric_value(rows[3].sequence_inductance)
-    if third_row_resistance != 0.0 || third_row_inductance != 0.0
-        throw(ArgumentError("explicit third-row coupled R-L matrix input is not translated yet"))
+    explicit_matrix = any(
+        row -> any(!=(0.0), row.triangular_resistance_values[2:end]) ||
+               any(!=(0.0), row.triangular_inductance_values[2:end]),
+        rows,
+    ) || _sequence_numeric_value(rows[3].sequence_resistance) != 0.0 ||
+         _sequence_numeric_value(rows[3].sequence_inductance) != 0.0
+    if explicit_matrix
+        resistance = zeros(Float64, 3, 3)
+        inductance = zeros(Float64, 3, 3)
+        for row in rows
+            length(row.triangular_resistance_values) == row.phase_index ||
+                throw(ArgumentError("coupled R-L row is missing triangular resistance values"))
+            length(row.triangular_inductance_values) == row.phase_index ||
+                throw(ArgumentError("coupled R-L row is missing triangular inductance values"))
+            for column in 1:row.phase_index
+                resistance[row.phase_index, column] =
+                    row.triangular_resistance_values[column]
+                resistance[column, row.phase_index] =
+                    row.triangular_resistance_values[column]
+                inductance[row.phase_index, column] =
+                    row.triangular_inductance_values[column]
+                inductance[column, row.phase_index] =
+                    row.triangular_inductance_values[column]
+            end
+        end
+        return coupled_lumped_matrix_impedance(
+            Symbol("coupled_lumped_matrix_impedance_", group_index),
+            [row.phase_index for row in rows],
+            [row.from_node for row in rows],
+            [row.to_node for row in rows],
+            [row.from_node_value for row in rows],
+            [row.to_node_value for row in rows],
+            resistance,
+            inductance;
+            line_numbers = [row.line_no for row in rows],
+        )
     end
     return coupled_lumped_sequence_impedance(
         Symbol("coupled_lumped_sequence_impedance_", group_index),
@@ -912,7 +944,7 @@ function _kc_lee_modal_transform_rows_between(
     ]
 end
 
-function _kc_lee_real_modal_to_phase_transform(
+function _kc_lee_modal_to_phase_transform(
     rows::AbstractVector{DeckLineModalTransformRow},
     phase_count::Int,
 )
@@ -921,13 +953,17 @@ function _kc_lee_real_modal_to_phase_transform(
         throw(ArgumentError("modal transform requires $expected_row_count real/imaginary rows"))
     all(row -> length(row.values) == phase_count, rows) ||
         throw(ArgumentError("modal transform rows must each contain $phase_count values"))
-    modal_to_phase = zeros(Float64, phase_count, phase_count)
+    modal_to_phase = zeros(ComplexF64, phase_count, phase_count)
     for phase_index in 1:phase_count
         real_row = rows[2 * phase_index - 1]
         imaginary_row = rows[2 * phase_index]
-        maximum(abs.(imaginary_row.values)) <= 1.0e-12 ||
-            throw(ArgumentError("complex modal transforms are not yet executable in the real-time line owner"))
-        modal_to_phase[phase_index, :] .= real_row.values
+        modal_to_phase[phase_index, :] .=
+            complex.(real_row.values, imaginary_row.values)
+    end
+    try
+        inv(modal_to_phase)
+    catch
+        throw(ArgumentError("modal transform must be nonsingular"))
     end
     return modal_to_phase
 end
@@ -974,16 +1010,66 @@ function _kc_lee_modal_parameter_data(
         total_resistances = total_resistance,
         propagation_times_s = propagation_times,
         modal_to_phase_transform =
-            _kc_lee_real_modal_to_phase_transform(transform_rows, phase_count),
+            _kc_lee_modal_to_phase_transform(transform_rows, phase_count),
     )
+end
+
+function _kc_lee_complex_modal_norton_values(
+    signed_characteristic_impedances::AbstractVector{<:Real},
+    total_resistances::AbstractVector{<:Real},
+)
+    length(signed_characteristic_impedances) == length(total_resistances) ||
+        throw(ArgumentError("K.C. Lee modal impedance and resistance counts must match"))
+    admittance = Float64[]
+    damping = Float64[]
+    for (signed_impedance, total_resistance) in
+        zip(signed_characteristic_impedances, total_resistances)
+        impedance = abs(Float64(signed_impedance))
+        resistance = abs(Float64(total_resistance))
+        impedance > 0.0 || throw(ArgumentError(
+            "K.C. Lee modal characteristic impedance must be nonzero",
+        ))
+        if signed_impedance < 0.0
+            push!(admittance, 2.0 / impedance)
+            push!(damping, exp(-0.5 * resistance / impedance))
+        else
+            shifted_impedance = impedance + 0.25 * resistance
+            push!(admittance, 2.0 / shifted_impedance)
+            push!(
+                damping,
+                (shifted_impedance - 0.5 * resistance) / shifted_impedance,
+            )
+        end
+    end
+    all(>(0.0), admittance) && all(value -> 0.0 < value <= 1.0, damping) ||
+        throw(ArgumentError("K.C. Lee modal Norton coefficients must be passive"))
+    return admittance, damping
 end
 
 function _kc_lee_modal_state_from_group(
     rows::AbstractVector{DeckCoupledLineRow},
     data,
     group_index::Int,
+    timestep_s::Float64,
 )
     phase_count = length(rows)
+    modal_to_phase = data.modal_to_phase_transform
+    if maximum(abs, imag.(modal_to_phase); init=0.0) > 1.0e-12
+        admittance, damping = _kc_lee_complex_modal_norton_values(
+            data.signed_characteristic_impedances,
+            data.total_resistances,
+        )
+        transform = LineModalTransform(inv(modal_to_phase), modal_to_phase)
+        return ComplexModalBergeronLine(
+            [row.from_node_value for row in rows],
+            [row.to_node_value for row in rows],
+            transform,
+            complex.(admittance),
+            data.propagation_times_s,
+            timestep_s;
+            attenuation = damping,
+        )
+    end
     return distributed_modal_line_branch_state(
         Symbol("distributed_modal_line_branch_state_", group_index),
         collect(1:phase_count),
@@ -994,7 +1080,7 @@ function _kc_lee_modal_state_from_group(
         data.signed_characteristic_impedances,
         data.total_resistances,
         data.propagation_times_s,
-        data.modal_to_phase_transform;
+        real.(modal_to_phase);
         line_numbers = [row.line_no for row in rows],
         modal_admittance_denominator = 1.0,
     )
@@ -1288,9 +1374,10 @@ end
 
 function _deck_kc_lee_modal_branch_states(result::DeckParseResult)
     groups = _kc_lee_untransposed_line_row_groups(result.coupled_line_rows)
-    isempty(groups) && return DistributedTransposedLineModalBranchState[]
+    isempty(groups) && return Any[]
     source_data = Dict{Any,Any}()
-    states = DistributedTransposedLineModalBranchState[]
+    states = Any[]
+    timestep_s = deck_fixed_time_horizon_options(result).dt_s
     for (group_index, group) in enumerate(groups)
         next_line_no =
             group_index == length(groups) ? typemax(Int) : first(groups[group_index + 1]).line_no
@@ -1310,7 +1397,15 @@ function _deck_kc_lee_modal_branch_states(result::DeckParseResult)
         else
             throw(ArgumentError("modal line group requires parameters or reference terminals"))
         end
-        push!(states, _kc_lee_modal_state_from_group(group, data, group_index))
+        push!(
+            states,
+            _kc_lee_modal_state_from_group(
+                group,
+                data,
+                group_index,
+                timestep_s,
+            ),
+        )
     end
     return states
 end
@@ -1318,7 +1413,20 @@ end
 function accept_kc_lee_modal_line_groups!(result::DeckParseResult)
     states = _deck_kc_lee_modal_branch_states(result)
     isempty(states) && return result
+    groups = _kc_lee_untransposed_line_row_groups(result.coupled_line_rows)
     for (index, state) in enumerate(states)
+        if state isa ComplexModalBergeronLine
+            push!(result.elements, state)
+            push!(result.element_line_numbers, first(groups[index]).line_no)
+            push!(
+                result.element_names,
+                Symbol("complex_kc_lee_bergeron_line_", index),
+            )
+            record_card!(result, :fixed_card_kc_lee_complex_modal_transform)
+            record_card!(result, :fixed_card_kc_lee_complex_modal_history_state)
+            record_card!(result, :fixed_card_kc_lee_power_invariant_phase_stamp)
+            continue
+        end
         admittance = distributed_transposed_line_companion_admittance(
             state;
             name = Symbol("distributed_line_companion_admittance_", index),
@@ -1404,7 +1512,13 @@ function deck_distributed_transposed_line_modal_branch_states(result::DeckParseR
         for (index, constants) in enumerate(deck_distributed_transposed_line_constants(result))
     ]
     append!(states, _deck_single_phase_distributed_line_modal_branch_states(result))
-    append!(states, _deck_kc_lee_modal_branch_states(result))
+    append!(
+        states,
+        DistributedTransposedLineModalBranchState[
+            state for state in _deck_kc_lee_modal_branch_states(result)
+            if state isa DistributedTransposedLineModalBranchState
+        ],
+    )
     return states
 end
 
@@ -1931,6 +2045,19 @@ deck_over5_switch_closed_markers(result::DeckParseResult) =
 
 deck_over5_switch_marker_texts(result::DeckParseResult) =
     String[row.marker_text for row in deck_over5_switch_rows(result)]
+
+deck_over5_switch_critical_current_values(result::DeckParseResult) =
+    Float64[row.critical_current_a for row in deck_over5_switch_rows(result)]
+
+deck_over5_switch_random_opening_standard_deviation_s_values(
+    result::DeckParseResult,
+) = Float64[
+    row.random_opening_standard_deviation_s
+    for row in deck_over5_switch_rows(result)
+]
+
+deck_over5_switch_type_values(result::DeckParseResult) =
+    Int[row.switch_type for row in deck_over5_switch_rows(result)]
 
 deck_over5_switch_on_conductance_values(result::DeckParseResult) =
     Float64[row.on_conductance for row in deck_over5_switch_rows(result)]

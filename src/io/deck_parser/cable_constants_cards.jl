@@ -11,6 +11,15 @@ mutable struct CableConstantsParseState
     admittance_output_flag::Int
     pipe_count::Int
     grounding_selector::Int
+    pipe_radii_m::Vector{Float64}
+    pipe_resistivity_ohm_m::Float64
+    pipe_relative_permeability::Float64
+    pipe_inner_insulator_relative_permittivity::Float64
+    pipe_outer_insulator_relative_permittivity::Float64
+    cable_to_pipe_center_distances_m::Vector{Float64}
+    cable_to_pipe_angles_rad::Vector{Float64}
+    pipe_depths_m::Vector{Float64}
+    pipe_horizontal_positions_m::Vector{Float64}
     layer_counts::Vector{Int}
     boundary_radii_m::Matrix{Float64}
     resistivity_ohm_m::Matrix{Float64}
@@ -38,6 +47,15 @@ function CableConstantsParseState(request_line_no::Int)
         0,
         0,
         0,
+        Float64[],
+        NaN,
+        NaN,
+        NaN,
+        NaN,
+        Float64[],
+        Float64[],
+        Float64[],
+        Float64[],
         Int[],
         zeros(0, 0),
         zeros(0, 0),
@@ -133,6 +151,15 @@ function _reset_cable_case!(state::CableConstantsParseState)
     state.phase = :miscellaneous
     state.case_line_no = 0
     empty!(state.layer_counts)
+    empty!(state.pipe_radii_m)
+    state.pipe_resistivity_ohm_m = NaN
+    state.pipe_relative_permeability = NaN
+    state.pipe_inner_insulator_relative_permittivity = NaN
+    state.pipe_outer_insulator_relative_permittivity = NaN
+    empty!(state.cable_to_pipe_center_distances_m)
+    empty!(state.cable_to_pipe_angles_rad)
+    empty!(state.pipe_depths_m)
+    empty!(state.pipe_horizontal_positions_m)
     state.boundary_radii_m = zeros(0, 0)
     state.resistivity_ohm_m = zeros(0, 0)
     state.conductor_relative_permeability = zeros(0, 0)
@@ -164,12 +191,12 @@ function _parse_cable_miscellaneous!(
     state.admittance_output_flag = values[7]
     state.pipe_count = values[8]
     state.grounding_selector = values[9]
-    if state.cable_kind_code != 2
+    if state.cable_kind_code ∉ (2, 3)
         add_issue!(
             result.validation,
             unknown_field(
                 "line $line_no",
-                "CABLE CONSTANTS type $(state.cable_kind_code) is not accepted; this owner currently requires type 2 concentric cables",
+                "CABLE CONSTANTS type $(state.cable_kind_code) is not accepted; supported scientific owners are type 2 concentric and type 3 pipe cables",
             ),
         )
         state.phase = :unsupported
@@ -186,9 +213,102 @@ function _parse_cable_miscellaneous!(
         state.phase = :unsupported
         return
     end
-    state.phase = :layer_counts
+    if state.cable_kind_code == 3
+        state.pipe_count = 1
+        state.phase = :pipe_characteristic
+    else
+        state.phase = :layer_counts
+    end
     record_card!(result, :fixed_field)
     record_card!(result, :cable_constants_miscellaneous)
+    return
+end
+
+function _parse_cable_pipe_characteristic!(
+    result::DeckParseResult,
+    state::CableConstantsParseState,
+    line::AbstractString,
+    line_no::Int,
+)
+    values = _cable_required_floats!(
+        result,
+        line,
+        line_no,
+        7,
+        "cable_pipe_characteristic",
+    )
+    values === nothing && return
+    inner_radius, outer_radius, outer_insulation_radius, resistivity,
+        permeability, inner_permittivity, outer_permittivity = values
+    inner_radius > 0.0 && outer_radius > inner_radius ||
+        add_issue!(result.validation, invalid_value(
+            "line $line_no",
+            "pipe inner and outer radii must be positive and strictly increasing",
+        ))
+    if outer_insulation_radius == 0.0
+        outer_insulation_radius =
+            outer_radius + max(100.0 * eps(Float64), 1.0e-8 * outer_radius)
+        outer_permittivity = 1.0
+    elseif outer_insulation_radius <= outer_radius
+        add_issue!(result.validation, invalid_value(
+            "line $line_no",
+            "pipe outer-insulation radius must exceed the pipe outer radius",
+        ))
+    end
+    for (label, value) in (
+        ("pipe resistivity", resistivity),
+        ("pipe relative permeability", permeability),
+        ("pipe inner-insulator relative permittivity", inner_permittivity),
+        ("pipe outer-insulator relative permittivity", outer_permittivity),
+    )
+        isfinite(value) && value > 0.0 || add_issue!(
+            result.validation,
+            invalid_value("line $line_no", "$label must be finite and positive"),
+        )
+    end
+    state.pipe_radii_m = [inner_radius, outer_radius, outer_insulation_radius]
+    state.pipe_resistivity_ohm_m = resistivity
+    state.pipe_relative_permeability = permeability
+    state.pipe_inner_insulator_relative_permittivity = inner_permittivity
+    state.pipe_outer_insulator_relative_permittivity = outer_permittivity
+    state.phase = :cable_to_pipe_geometry
+    record_card!(result, :fixed_field)
+    record_card!(result, :cable_constants_pipe_characteristic)
+    return
+end
+
+function _parse_cable_to_pipe_geometry!(
+    result::DeckParseResult,
+    state::CableConstantsParseState,
+    line::AbstractString,
+    line_no::Int,
+)
+    values = _cable_required_floats!(
+        result,
+        line,
+        line_no,
+        2 * state.phase_count,
+        "cable_to_pipe_geometry",
+    )
+    values === nothing && return
+    distances = Float64[values[2 * index - 1] for index in 1:state.phase_count]
+    angles_deg = Float64[values[2 * index] for index in 1:state.phase_count]
+    all(value -> isfinite(value) && value >= 0.0, distances) ||
+        add_issue!(result.validation, invalid_value(
+            "line $line_no",
+            "cable-to-pipe center distances must be finite and nonnegative",
+        ))
+    all(isfinite, angles_deg) ||
+        add_issue!(result.validation, invalid_value(
+            "line $line_no",
+            "cable-to-pipe angles must be finite",
+        ))
+    reference_angle = first(angles_deg)
+    state.cable_to_pipe_center_distances_m = distances
+    state.cable_to_pipe_angles_rad = deg2rad.(angles_deg .- reference_angle)
+    state.phase = :layer_counts
+    record_card!(result, :fixed_field)
+    record_card!(result, :cable_constants_cable_to_pipe_geometry)
     return
 end
 
@@ -206,12 +326,12 @@ function _parse_cable_layer_counts!(
         "cable_layer_count",
     )
     values === nothing && return
-    if any(!=(3), values)
+    if any(count -> count < 1 || count > 3, values)
         add_issue!(
             result.validation,
-            unknown_field(
+            invalid_value(
                 "line $line_no",
-                "accepted type-2 CABLE CONSTANTS intake currently requires three concentric conductors per cable",
+                "cable conductor-layer counts must be between one and three",
             ),
         )
     end
@@ -230,6 +350,10 @@ function _parse_cable_layer_counts!(
     return
 end
 
+function _cable_inactive_radius_gap(radius::Float64)
+    return radius + max(100.0 * eps(Float64), 1.0e-8 * max(radius, 1.0))
+end
+
 function _parse_cable_boundary_radii!(
     result::DeckParseResult,
     state::CableConstantsParseState,
@@ -238,15 +362,31 @@ function _parse_cable_boundary_radii!(
 )
     values = _cable_required_floats!(result, line, line_no, 7, "cable_boundary_radius")
     values === nothing && return
-    _cable_positive_values!(result, values, line_no, "cable_boundary_radius")
-    if !issorted(values) || any(diff(values) .<= 0.0)
+    layer_count = state.layer_counts[state.phase_index]
+    active_boundary_count = 2 * layer_count + 1
+    active_values = values[1:active_boundary_count]
+    if values[1] < 0.0 || any(value -> !isfinite(value) || value <= 0.0, values[2:active_boundary_count])
         add_issue!(
             result.validation,
             invalid_value(
                 "line $line_no",
-                "cable boundary radii must be strictly increasing from core to outer insulation",
+                "active cable boundary radii must be finite, with a nonnegative core inner radius and positive outer radii",
             ),
         )
+    end
+    for index in 2:active_boundary_count
+        if values[index] == 0.0 && index == active_boundary_count
+            values[index] = _cable_inactive_radius_gap(values[index - 1])
+        end
+    end
+    if any(diff(values[1:active_boundary_count]) .<= 0.0)
+        add_issue!(result.validation, invalid_value(
+            "line $line_no",
+            "active cable boundary radii must be strictly increasing from core to outer insulation",
+        ))
+    end
+    for index in (active_boundary_count + 1):7
+        values[index] = values[active_boundary_count]
     end
     state.boundary_radii_m[state.phase_index, :] .= values
     state.phase = :primary_materials
@@ -273,7 +413,30 @@ function _parse_cable_primary_materials!(
     state.conductor_relative_permeability[phase, 2] = values[6]
     state.insulation_relative_permeability[phase, 2] = values[7]
     state.insulation_relative_permittivity[phase, 2] = values[8]
-    state.phase = :armor_materials
+    layer_count = state.layer_counts[phase]
+    if layer_count == 1
+        state.resistivity_ohm_m[phase, 2:3] .= values[1]
+        state.conductor_relative_permeability[phase, 2:3] .= 1.0
+        state.insulation_relative_permeability[phase, 2:3] .= 1.0
+        state.insulation_relative_permittivity[phase, 2:3] .= 1.0
+    elseif layer_count == 2
+        state.resistivity_ohm_m[phase, 3] = values[5]
+        state.conductor_relative_permeability[phase, 3] = 1.0
+        state.insulation_relative_permeability[phase, 3] = 1.0
+        state.insulation_relative_permittivity[phase, 3] = 1.0
+    end
+    if layer_count > 2
+        state.phase = :armor_materials
+    elseif phase < state.phase_count
+        state.phase_index += 1
+        state.phase = :boundary_radii
+    elseif state.cable_kind_code == 3
+        state.position_index = 1
+        state.phase = :pipe_positions
+    else
+        state.position_index = 1
+        state.phase = :positions
+    end
     record_card!(result, :fixed_field)
     record_card!(result, :cable_constants_materials)
     return
@@ -298,10 +461,61 @@ function _parse_cable_armor_materials!(
         state.phase = :boundary_radii
     else
         state.position_index = 1
-        state.phase = :positions
+        state.phase = state.cable_kind_code == 3 ? :pipe_positions : :positions
     end
     record_card!(result, :fixed_field)
     record_card!(result, :cable_constants_materials)
+    return
+end
+
+function _parse_cable_pipe_positions!(
+    result::DeckParseResult,
+    state::CableConstantsParseState,
+    line::AbstractString,
+    line_no::Int,
+)
+    values = _cable_required_floats!(
+        result,
+        line,
+        line_no,
+        2 * state.pipe_count,
+        "cable_pipe_position",
+    )
+    values === nothing && return
+    state.pipe_depths_m =
+        Float64[values[2 * index - 1] for index in 1:state.pipe_count]
+    state.pipe_horizontal_positions_m =
+        Float64[values[2 * index] for index in 1:state.pipe_count]
+    for index in 1:state.pipe_count
+        depth = state.pipe_depths_m[index]
+        horizontal = state.pipe_horizontal_positions_m[index]
+        isfinite(depth) && depth > state.pipe_radii_m[3] / 2.0 ||
+            add_issue!(result.validation, invalid_value(
+                "line $line_no",
+                "pipe depth must be finite and exceed half its outer diameter",
+            ))
+        isfinite(horizontal) || add_issue!(result.validation, invalid_value(
+            "line $line_no",
+            "pipe horizontal position must be finite",
+        ))
+    end
+    pipe_depth = first(state.pipe_depths_m)
+    pipe_horizontal = first(state.pipe_horizontal_positions_m)
+    state.depths_m = Float64[
+        pipe_depth -
+        state.cable_to_pipe_center_distances_m[index] *
+        sin(state.cable_to_pipe_angles_rad[index])
+        for index in 1:state.phase_count
+    ]
+    state.horizontal_positions_m = Float64[
+        pipe_horizontal +
+        state.cable_to_pipe_center_distances_m[index] *
+        cos(state.cable_to_pipe_angles_rad[index])
+        for index in 1:state.phase_count
+    ]
+    state.phase = :frequency
+    record_card!(result, :fixed_field)
+    record_card!(result, :cable_constants_pipe_positions)
     return
 end
 
@@ -400,6 +614,15 @@ function _finish_cable_case!(result::DeckParseResult, state::CableConstantsParse
             state.admittance_output_flag,
             state.pipe_count,
             state.grounding_selector,
+            copy(state.pipe_radii_m),
+            state.pipe_resistivity_ohm_m,
+            state.pipe_relative_permeability,
+            state.pipe_inner_insulator_relative_permittivity,
+            state.pipe_outer_insulator_relative_permittivity,
+            copy(state.cable_to_pipe_center_distances_m),
+            copy(state.cable_to_pipe_angles_rad),
+            copy(state.pipe_depths_m),
+            copy(state.pipe_horizontal_positions_m),
             copy(state.layer_counts),
             copy(state.boundary_radii_m),
             copy(state.resistivity_ohm_m),
@@ -453,6 +676,10 @@ function parse_cable_constants_card!(
 
     if state.phase == :miscellaneous
         _parse_cable_miscellaneous!(result, state, line, line_no)
+    elseif state.phase == :pipe_characteristic
+        _parse_cable_pipe_characteristic!(result, state, line, line_no)
+    elseif state.phase == :cable_to_pipe_geometry
+        _parse_cable_to_pipe_geometry!(result, state, line, line_no)
     elseif state.phase == :layer_counts
         _parse_cable_layer_counts!(result, state, line, line_no)
     elseif state.phase == :boundary_radii
@@ -463,6 +690,8 @@ function parse_cable_constants_card!(
         _parse_cable_armor_materials!(result, state, line, line_no)
     elseif state.phase == :positions
         _parse_cable_positions!(result, state, line, line_no)
+    elseif state.phase == :pipe_positions
+        _parse_cable_pipe_positions!(result, state, line, line_no)
     elseif state.phase == :frequency
         _parse_cable_frequency!(result, state, line, line_no)
     else

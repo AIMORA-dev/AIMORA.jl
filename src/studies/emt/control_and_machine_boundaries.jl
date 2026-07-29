@@ -108,10 +108,13 @@ function run_deck_universal_machine_horizon(
     predicted_current_coupling =
         machine_section.terminal_coupling == :predicted_current
     card1 = _deck_universal_machine_definition(parsed, machine_index, 1)
-    automatic_type8_initialization =
-        card1.machine_type == 8 &&
+    automatic_direct_machine_initialization =
+        card1.machine_type in (8, 9, 10, 11, 12) &&
         _deck_universal_machine_initialization_mode(parsed) == :automatic ?
-        _deck_type8_automatic_initialization(parsed, machine_index) : nothing
+        _deck_direct_machine_automatic_initialization(
+            parsed,
+            machine_index,
+        ) : nothing
     single_phase_initialization =
         card1.machine_type in (6, 7) &&
         _deck_universal_machine_initialization_mode(parsed) == :automatic ?
@@ -120,15 +123,15 @@ function run_deck_universal_machine_horizon(
         card1.machine_type in (1, 2) &&
         !isempty(DeckParser.deck_fixed_source_constraint_rows(parsed)) ?
         _deck_fixed_source_synchronous_steady_state(parsed) : nothing
-    steady_state = automatic_type8_initialization !== nothing ?
-        automatic_type8_initialization.steady_state :
+    steady_state = automatic_direct_machine_initialization !== nothing ?
+        automatic_direct_machine_initialization.steady_state :
         single_phase_initialization !== nothing ?
         single_phase_initialization.steady_state :
         fixed_source_synchronous_steady_state === nothing ?
         deck_steady_state_voltage_phasors(parsed) :
         fixed_source_synchronous_steady_state
-    state = automatic_type8_initialization !== nothing ?
-        automatic_type8_initialization.state :
+    state = automatic_direct_machine_initialization !== nothing ?
+        automatic_direct_machine_initialization.state :
         single_phase_initialization === nothing ?
         deck_coupled_dq_machine_initial_state(
             parsed;
@@ -272,6 +275,17 @@ function run_deck_universal_machine_horizon(
     )
     if !manually_initialized_machine
         _seed_steady_state_network_state!(context, steady_state)
+        if automatic_direct_machine_initialization !== nothing &&
+           parameters.machine_type in (9, 10, 11, 12)
+            _seed_direct_machine_power_leakage_currents!(
+                context,
+                runtime_parsed,
+                [machine_index],
+                [
+                    automatic_direct_machine_initialization.armature_current_injection,
+                ],
+            )
+        end
         _seed_machine_mechanical_inertia!(
             context.system,
             network_nodes.mechanical,
@@ -376,6 +390,16 @@ function run_deck_universal_machine_horizon(
     else
         stored_power_voltages(steady_state.node_voltage_values)
     end
+    initial_machine_power_voltages = copy(initial_power_voltages)
+    initial_machine_rotor_thevenin = zeros(Float64, 3, 3)
+    if automatic_direct_machine_initialization !== nothing &&
+       parameters.machine_type in (9, 10, 11, 12)
+        active_position = only(network_nodes.active_power_positions)
+        initial_machine_power_voltages[active_position] =
+            automatic_direct_machine_initialization.runtime_power_terminal_open_circuit_voltage
+        initial_machine_rotor_thevenin[active_position, active_position] =
+            automatic_direct_machine_initialization.runtime_power_terminal_thevenin_impedance
+    end
     initial_stator_voltages = manually_initialized_direct_machine ?
         zeros(Float64, stator_count) : external_field ?
         vcat(
@@ -386,17 +410,23 @@ function run_deck_universal_machine_horizon(
 
     initial_prediction_history = predicted_current_coupling ?
         copy(state.history_currents[1:3]) : Float64[]
+    retained_automatic_histories =
+        automatic_direct_machine_initialization !== nothing &&
+        parameters.machine_type in (9, 10, 11, 12) ?
+        copy(state.history_currents) : Float64[]
     initial_result = coupled_dq_machine_step!(
         state,
         parameters;
-        power_terminal_voltages = initial_power_voltages,
-        rotor_thevenin_matrix = zeros(3, 3),
+        power_terminal_voltages = initial_machine_power_voltages,
+        rotor_thevenin_matrix = initial_machine_rotor_thevenin,
         mechanical_speed_thevenin_rad_s = state.mechanical_speed_rad_s,
         generated_torque_impedance = 0.0,
         stator_terminal_voltages = initial_stator_voltages,
         stator_thevenin_matrix = zeros(stator_count, stator_count),
         initial_step = true,
     )
+    isempty(retained_automatic_histories) ||
+        (state.history_currents .= retained_automatic_histories)
     record_machine_result!(1, initial_result)
     if predicted_current_coupling
         histories[1:3, 1] .= initial_prediction_history
@@ -1178,13 +1208,21 @@ function _convert_deck_current_zero_switches!(
         for row in DeckParser.deck_over5_switch_rows(parsed)
         if row.name in current_zero_names
     )
+    critical_currents = Dict(
+        row.name => Float64(row.critical_current_a)
+        for row in DeckParser.deck_over5_switch_rows(parsed)
+        if row.name in current_zero_names
+    )
     for index in eachindex(elements, element_names)
         element_names[index] in current_zero_names || continue
         element = elements[index]
         element isa TimeSwitch || throw(ArgumentError(
             "current-zero switch row must own a time-switch model",
         ))
-        current_zero = CurrentZeroSwitch(element)
+        current_zero = CurrentZeroSwitch(
+            element;
+            critical_current_a = critical_currents[element_names[index]],
+        )
         current_zero.open_request_time_s = open_request_times[element_names[index]]
         elements[index] = current_zero
     end
@@ -1461,6 +1499,9 @@ function deck_over16_boundary_plan(parsed::DeckParser.DeckParseResult)
         DeckParser.deck_over5_switch_measuring_flags(parsed),
         DeckParser.deck_over5_switch_closed_markers(parsed),
         DeckParser.deck_over5_switch_marker_texts(parsed),
+        DeckParser.deck_over5_switch_type_values(parsed),
+        DeckParser.deck_over5_switch_critical_current_values(parsed),
+        DeckParser.deck_over5_switch_random_opening_standard_deviation_s_values(parsed),
         DeckParser.deck_over5_switch_on_conductance_values(parsed),
         DeckParser.deck_over5_switch_off_conductance_values(parsed),
         DeckParser.deck_over5_switch_output_codes(parsed),

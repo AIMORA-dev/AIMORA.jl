@@ -3,6 +3,7 @@ include(joinpath(@__DIR__, "nonlinear", "transformer_models.jl"))
 include(joinpath(@__DIR__, "nonlinear", "switching_resistor.jl"))
 include(joinpath(@__DIR__, "nonlinear", "triggered_timed_resistance.jl"))
 include(joinpath(@__DIR__, "nonlinear", "piecewise_nonlinear_inductor.jl"))
+include(joinpath(@__DIR__, "nonlinear", "preprocessing.jl"))
 include(joinpath(@__DIR__, "nonlinear", "inverse_columns_and_compensation.jl"))
 include(joinpath(@__DIR__, "nonlinear", "simultaneous_zno_and_updates.jl"))
 

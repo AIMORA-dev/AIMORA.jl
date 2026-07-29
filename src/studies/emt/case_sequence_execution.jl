@@ -18,6 +18,28 @@ struct DeckFrequencyScanSchedule
     frequencies_hz::Vector{Float64}
 end
 
+struct DeckNetworkFrequencyScanPoint
+    frequency_hz::Float64
+    node_voltage_phasors::Vector{ComplexF64}
+    nodal_current_phasors::Vector{ComplexF64}
+    source_injection_phasors::Vector{ComplexF64}
+    output_voltage_phasors::Vector{ComplexF64}
+    residual_max_abs::Float64
+    relative_residual_max_abs::Float64
+    admittance_symmetry_max_abs_error::Float64
+    minimum_dissipative_eigenvalue_s::Float64
+    physical_checks_passed::Bool
+end
+
+struct DeckNetworkFrequencyScanStudy
+    request_line_no::Int
+    node_names::Vector{Symbol}
+    output_node_indices::Vector{Int}
+    frequencies_hz::Vector{Float64}
+    points::Vector{DeckNetworkFrequencyScanPoint}
+    physical_checks_passed::Bool
+end
+
 struct DeckImpulseResponseFitControl
     fit_span_s::Float64
     time_step_s::Float64
@@ -59,6 +81,7 @@ end
 
 struct DeckAuxiliaryStudyRun
     schedules::Vector{DeckFrequencyScanSchedule}
+    network_frequency_scans::Vector{DeckNetworkFrequencyScanStudy}
     line_frequency_scans::Vector{DeckLineFrequencyScanStudy}
     impulse_responses::Vector{DeckLineImpulseResponseStudy}
     line_constants::Union{Nothing,LineConstantsStudyResult}
@@ -150,6 +173,128 @@ function _impulse_response_schedule(schedules::Vector{DeckFrequencyScanSchedule}
     )
     isempty(candidates) && return nothing
     return first(candidates)
+end
+
+function _network_frequency_scan_partition(
+    parsed::DeckParser.DeckParseResult,
+    frequency_hz::Float64,
+)
+    base = DeckParser.deck_steady_state_frequency_partition(parsed)
+    source_frequencies = copy(base.source_frequencies_hz)
+    for source_index in base.active_source_row_indices
+        source_frequencies[source_index] = frequency_hz
+    end
+    return DeckParser.DeckSteadyStateFrequencyPartition(
+        copy(base.node_source_row_indices),
+        fill(frequency_hz, length(base.node_frequencies_hz)),
+        copy(base.active_source_row_indices),
+        source_frequencies,
+        copy(base.source_successor_indices),
+        copy.(base.source_groups),
+        fill(frequency_hz, length(base.subnetwork_frequencies_hz)),
+        copy.(base.subnetwork_node_indices),
+        copy(base.inactive_node_indices),
+        base.scalar_branch_count,
+        base.initially_closed_switch_count,
+        copy(base.unsupported_topology_kinds),
+    )
+end
+
+function _network_frequency_scan_point(
+    parsed::DeckParser.DeckParseResult,
+    frequency_hz::Float64,
+    output_node_indices::Vector{Int},
+)
+    node_count = maximum(values(parsed.node_map); init = 0)
+    node_count > 0 ||
+        throw(ArgumentError("whole-network frequency scan requires at least one network node"))
+    partition = _network_frequency_scan_partition(parsed, frequency_hz)
+    admittance, rhs, switch_representatives =
+        _deck_steady_state_nodal_equations(
+            parsed,
+            node_count;
+            frequency_partition = partition,
+        )
+    voltage = _solve_grouped_steady_state_admittance(
+        admittance,
+        rhs,
+        switch_representatives,
+    )
+    nodal_current = admittance * voltage
+    residual = nodal_current - rhs
+    residual_max = maximum(abs, residual; init = 0.0)
+    residual_scale = max(
+        norm(rhs, Inf),
+        norm(admittance, Inf) * norm(voltage, Inf),
+        1.0,
+    )
+    relative_residual = residual_max / residual_scale
+    symmetry_error = maximum(
+        abs,
+        admittance - transpose(admittance);
+        init = 0.0,
+    )
+    dissipative = Hermitian(0.5 .* (admittance + adjoint(admittance)))
+    minimum_dissipative_eigenvalue =
+        minimum(eigvals(dissipative); init = 0.0)
+    output_voltage = ComplexF64[
+        node == 0 ? 0.0 + 0.0im : voltage[node]
+        for node in output_node_indices
+    ]
+    finite_values =
+        all(isfinite, real.(voltage)) &&
+        all(isfinite, imag.(voltage)) &&
+        all(isfinite, real.(nodal_current)) &&
+        all(isfinite, imag.(nodal_current))
+    physical_checks =
+        finite_values &&
+        relative_residual <= 1.0e-10 &&
+        symmetry_error <= 1.0e-10
+    physical_checks || throw(ArgumentError(
+        "whole-network frequency scan failed its nodal residual or reciprocity check at $frequency_hz Hz",
+    ))
+    return DeckNetworkFrequencyScanPoint(
+        frequency_hz,
+        voltage,
+        nodal_current,
+        rhs,
+        output_voltage,
+        residual_max,
+        relative_residual,
+        symmetry_error,
+        minimum_dissipative_eigenvalue,
+        physical_checks,
+    )
+end
+
+function _network_frequency_scan_study(
+    parsed::DeckParser.DeckParseResult,
+    schedule::DeckFrequencyScanSchedule,
+)
+    schedule.request_kind == :frequency_scan ||
+        throw(ArgumentError("whole-network scan requires a FREQUENCY SCAN schedule"))
+    output_node_indices = DeckParser.deck_over16_output_node_indices(parsed)
+    points = DeckNetworkFrequencyScanPoint[
+        _network_frequency_scan_point(
+            parsed,
+            frequency_hz,
+            output_node_indices,
+        )
+        for frequency_hz in schedule.frequencies_hz
+    ]
+    checks =
+        length(points) == length(schedule.frequencies_hz) &&
+        all(point -> point.physical_checks_passed, points)
+    checks ||
+        throw(ArgumentError("whole-network frequency scan did not execute every requested point"))
+    return DeckNetworkFrequencyScanStudy(
+        schedule.request_line_no,
+        ordered_node_names(parsed.node_map),
+        output_node_indices,
+        copy(schedule.frequencies_hz),
+        points,
+        checks,
+    )
 end
 
 function _line_impulse_response_study(group, mode, schedule, fit_control)
@@ -265,6 +410,7 @@ function run_deck_auxiliary_studies(
     simulation_control_kinds =
         Set(getfield.(simulation_control_rows, :request_kind))
     groups = DeckParser.deck_rational_frequency_line_groups(parsed)
+    network_frequency_scans = DeckNetworkFrequencyScanStudy[]
     line_frequency_scans = DeckLineFrequencyScanStudy[]
     impulse_responses = DeckLineImpulseResponseStudy[]
     handled_requests = Symbol[]
@@ -293,6 +439,15 @@ function run_deck_auxiliary_studies(
                 )
             end
         end
+    end
+
+    for schedule in schedules
+        schedule.request_kind == :frequency_scan || continue
+        push!(
+            network_frequency_scans,
+            _network_frequency_scan_study(parsed, schedule),
+        )
+        push!(handled_requests, :whole_network_frequency_scan)
     end
 
     if :hauer_impulse_response_setup in requested_kinds
@@ -339,6 +494,7 @@ function run_deck_auxiliary_studies(
         )
     return DeckAuxiliaryStudyRun(
         schedules,
+        network_frequency_scans,
         line_frequency_scans,
         impulse_responses,
         line_constants,
@@ -431,6 +587,11 @@ function deck_case_sequence_result(run::DeckCaseSequenceRun; elapsed_s::Float64=
         run.cases;
         init=0,
     )
+    network_frequency_scan_count = sum(
+        data_case -> length(data_case.auxiliary.network_frequency_scans),
+        run.cases;
+        init=0,
+    )
     impulse_response_count = sum(
         data_case -> length(data_case.auxiliary.impulse_responses),
         run.cases;
@@ -473,6 +634,11 @@ function deck_case_sequence_result(run::DeckCaseSequenceRun; elapsed_s::Float64=
             result_quantity(:executed_emt_case_count, executed_count; unit="count"),
             result_quantity(:aborted_case_count, run.aborted_case_count; unit="count"),
             result_quantity(:frequency_scan_count, schedule_count; unit="count"),
+            result_quantity(
+                :whole_network_frequency_scan_count,
+                network_frequency_scan_count;
+                unit="count",
+            ),
             result_quantity(
                 :line_model_frequency_scan_count,
                 line_frequency_scan_count;
@@ -547,6 +713,20 @@ function write_deck_case_sequence_summary(
                 io,
                 "frequency_scan_count = ",
                 length(data_case.auxiliary.schedules),
+            )
+            println(
+                io,
+                "whole_network_frequency_scan_count = ",
+                length(data_case.auxiliary.network_frequency_scans),
+            )
+            println(
+                io,
+                "whole_network_frequency_sample_count = ",
+                sum(
+                    scan -> length(scan.points),
+                    data_case.auxiliary.network_frequency_scans;
+                    init=0,
+                ),
             )
             println(
                 io,

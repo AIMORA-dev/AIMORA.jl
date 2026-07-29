@@ -477,6 +477,9 @@ function _electromagnetic_history_rhs_values(
         elseif kind == COUPLED_INDUCTIVE_HISTORY
             element = plan.coupled_inductive_branches[batch_index]
             stamp_history_current!(rhs, element, context.dt_s)
+        elseif kind == COUPLED_SERIES_RL_HISTORY
+            element = plan.coupled_series_rl_branches[batch_index]
+            stamp_history_current!(rhs, element, context.dt_s)
         else
             element = plan.breqiv_injections[batch_index]
             initialize_breqiv_history_injection!(element, context.dt_s)
@@ -2027,6 +2030,25 @@ function _seed_steady_state_coupled_inductive_branch!(
     return branch
 end
 
+function _seed_steady_state_coupled_series_rl_branch!(
+    branch::CoupledSeriesRLBranch,
+    sample,
+    frequency_hz::Float64,
+)
+    port_voltage_phasors = ComplexF64[
+        _steady_state_node_voltage_phasor(sample, branch.a[index]) -
+        _steady_state_node_voltage_phasor(sample, branch.b[index])
+        for index in eachindex(branch.a)
+    ]
+    impedance =
+        complex.(branch.resistance_matrix, 2.0 * pi * frequency_hz .* branch.inductance_matrix)
+    current_phasors = impedance \ port_voltage_phasors
+    branch.previous_voltage .= real.(port_voltage_phasors)
+    branch.previous_current .= real.(current_phasors)
+    branch.last_current .= branch.previous_current
+    return branch
+end
+
 function _sequence_modal_phasors(phase_phasors::AbstractVector{<:Complex})
     nph = length(phase_phasors)
     nph > 0 || throw(ArgumentError("phase_phasors must not be empty"))
@@ -2119,6 +2141,39 @@ function _seed_semlyen_line_steady_state!(
     return element
 end
 
+function _seed_complex_modal_line_steady_state!(
+    element::ComplexModalBergeronLine,
+    sample,
+    default_frequency_hz::Float64,
+)
+    frequencies = Float64[
+        _steady_state_branch_frequency_hz(
+            sample,
+            element.from_nodes[phase],
+            element.to_nodes[phase],
+            default_frequency_hz,
+        )
+        for phase in eachindex(element.from_nodes)
+        if element.from_nodes[phase] != 0 || element.to_nodes[phase] != 0
+    ]
+    frequency_hz = isempty(frequencies) ? default_frequency_hz : first(frequencies)
+    all(value -> isapprox(value, frequency_hz; atol = 1.0e-9, rtol = 1.0e-9), frequencies) ||
+        throw(ArgumentError("complex modal line phases have different steady-state frequencies"))
+    from_phasors = ComplexF64[
+        _steady_state_node_voltage_phasor(sample, node) for node in element.from_nodes
+    ]
+    to_phasors = ComplexF64[
+        _steady_state_node_voltage_phasor(sample, node) for node in element.to_nodes
+    ]
+    initialize_complex_modal_bergeron_steady_state!(
+        element,
+        from_phasors,
+        to_phasors,
+        frequency_hz,
+    )
+    return element
+end
+
 function _steady_state_current_injections(context::EMTStepContext, sample)
     values = sample.node_voltage_values
     length(values) >= context.system.node_count ||
@@ -2140,7 +2195,11 @@ function _seed_steady_state_network_state!(context::EMTStepContext, sample)
     end
     frequency_hz = Float64(sample.steady_state_frequency_hz)
     for element in context.system.elements
-        if element isa SemlyenFrequencyDependentLine &&
+        if element isa ComplexModalBergeronLine &&
+           hasproperty(sample, :node_voltage_phasors)
+            _seed_complex_modal_line_steady_state!(element, sample, frequency_hz)
+            continue
+        elseif element isa SemlyenFrequencyDependentLine &&
            hasproperty(sample, :node_voltage_phasors)
             _seed_semlyen_line_steady_state!(element, sample, frequency_hz)
             continue
@@ -2207,6 +2266,19 @@ function _seed_steady_state_network_state!(context::EMTStepContext, sample)
         elseif element isa CoupledInductiveBranch && hasproperty(sample, :node_voltage_phasors)
             _seed_steady_state_coupled_inductive_branch!(element, sample)
             continue
+        elseif element isa CoupledSeriesRLBranch && hasproperty(sample, :node_voltage_phasors)
+            element_frequency_hz = _steady_state_branch_frequency_hz(
+                sample,
+                first(element.a),
+                first(element.b),
+                frequency_hz,
+            )
+            _seed_steady_state_coupled_series_rl_branch!(
+                element,
+                sample,
+                element_frequency_hz,
+            )
+            continue
         end
         if !hasproperty(sample, :node_voltage_phasors)
             if element isa SeriesRLBranch
@@ -2241,9 +2313,55 @@ function _seed_steady_state_network_state!(context::EMTStepContext, sample)
                 fill!(element.previous_current, 0.0)
                 fill!(element.last_current, 0.0)
                 continue
+            elseif element isa CoupledSeriesRLBranch
+                for port in eachindex(element.a)
+                    element.previous_voltage[port] =
+                        _deck_node_voltage(context.system.v, element.a[port]) -
+                        _deck_node_voltage(context.system.v, element.b[port])
+                end
+                fill!(element.previous_current, 0.0)
+                fill!(element.last_current, 0.0)
+                continue
             end
         end
         update!(element, context.system.v, context.dt_s)
+    end
+    return context
+end
+
+function _seed_direct_machine_power_leakage_currents!(
+    context::EMTStepContext,
+    parsed::DeckParser.DeckParseResult,
+    machine_indices::AbstractVector{<:Integer},
+    power_terminal_currents::AbstractVector{<:Real},
+)
+    indices = Int.(machine_indices)
+    currents = Float64.(power_terminal_currents)
+    length(indices) == length(currents) ||
+        throw(ArgumentError("direct-machine leakage-current seeds must align with machine indices"))
+    for (machine_index, current) in zip(indices, currents)
+        rows = [
+            row
+            for row in DeckParser.deck_universal_machine_generated_branch_rows(parsed)
+            if row.machine_index == machine_index &&
+               row.from_node_value != row.to_node_value
+        ]
+        length(rows) == 1 ||
+            throw(ArgumentError("automatic direct machine $machine_index requires one generated power-leakage branch"))
+        row = only(rows)
+        matches = SeriesRLBranch[
+            element
+            for element in context.system.elements
+            if element isa SeriesRLBranch &&
+               element.a == row.from_node_value &&
+               element.b == row.to_node_value
+        ]
+        length(matches) == 1 ||
+            throw(ArgumentError("automatic direct machine $machine_index power-leakage runtime branch is missing or ambiguous"))
+        branch = only(matches)
+        branch.i_prev = current
+        branch.i_last = current
+        branch.v_prev = branch.r * current
     end
     return context
 end
@@ -2605,6 +2723,27 @@ function _saturated_transformer_physical_node_map(
     return node_map
 end
 
+function _saturated_transformer_frequency_node_indices(
+    physical_node_map::AbstractDict{Symbol,<:Integer},
+    arrays::SaturatedTransformerNonlinearArrays,
+    maximum_partition_node_index::Integer,
+)
+    maximum_index = Int(maximum_partition_node_index)
+    maximum_index >= 0 ||
+        throw(ArgumentError("maximum partition node index must be nonnegative"))
+    node_indices = Int[]
+    for node_name in Iterators.flatten((
+        arrays.winding_from_nodes,
+        arrays.winding_to_nodes,
+    ))
+        _deck_reference_node_name(node_name) && continue
+        node_index = get(physical_node_map, node_name, 0)
+        1 <= node_index <= maximum_index || continue
+        push!(node_indices, Int(node_index))
+    end
+    return sort!(unique!(node_indices))
+end
+
 function _saturated_transformer_augmented_node_map(
     physical_node_map::AbstractDict{Symbol,<:Integer},
     branch_assembly,
@@ -2923,6 +3062,27 @@ function coupled_lumped_sequence_history_injection_elements(
     element_names = Symbol[]
     element_line_numbers = Int[]
     for impedance in DeckParser.deck_coupled_lumped_sequence_impedances(parsed)
+        if impedance.input_kind == :triangular_matrix
+            physical_inductance = map(
+                value -> _coupled_lumped_sequence_timestep_inductance(parsed, value),
+                impedance.phase_inductance_matrix,
+            )
+            push!(
+                elements,
+                CoupledSeriesRLBranch(
+                    impedance.from_node_indices,
+                    impedance.to_node_indices,
+                    impedance.phase_resistance_matrix,
+                    physical_inductance,
+                ),
+            )
+            push!(element_names, impedance.name)
+            push!(
+                element_line_numbers,
+                isempty(impedance.line_numbers) ? 0 : first(impedance.line_numbers),
+            )
+            continue
+        end
         initial_voltage = [
             _branch_phase_voltage(
                 voltage_guess,
@@ -3076,6 +3236,17 @@ function saturated_transformer_branch_augmented_step_context(
     DeckParser.assert_deck_valid!(parsed)
     arrays = _saturated_transformer_branch_arrays(saturated_transformer_intake)
     physical_node_map = _saturated_transformer_physical_node_map(parsed, arrays)
+    frequency_partition =
+        DeckParser.deck_steady_state_frequency_partition(parsed)
+    transformer_frequency_hz = _steady_state_terminal_frequency_hz(
+        frequency_partition,
+        _saturated_transformer_frequency_node_indices(
+            physical_node_map,
+            arrays,
+            length(frequency_partition.node_frequencies_hz),
+        ),
+        _deck_steady_state_frequency_hz(parsed),
+    )
     branch_assembly = saturated_transformer_winding_branch_assembly(
         arrays,
         physical_node_map;
@@ -3083,7 +3254,7 @@ function saturated_transformer_branch_augmented_step_context(
     )
     branch_elements = saturated_transformer_branch_elements(
         branch_assembly;
-        reactance_units = 2.0 * pi * _deck_steady_state_frequency_hz(parsed),
+        reactance_units = 2.0 * pi * transformer_frequency_hz,
     )
     node_map = _saturated_transformer_augmented_node_map(physical_node_map, branch_assembly)
     deck_elements = Any[parsed.elements...]

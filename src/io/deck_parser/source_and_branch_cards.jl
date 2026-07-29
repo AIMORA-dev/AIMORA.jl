@@ -804,7 +804,7 @@ end
 
 function fixed_card_kc_lee_transform_row_candidate(tokens)::Bool
     values = fixed_card_numeric_token_values(tokens)
-    return values !== nothing && length(values) == 2
+    return values !== nothing && 1 <= length(values) <= 30
 end
 
 function parse_fixed_card_kc_lee_transform_row!(
@@ -899,6 +899,8 @@ function push_fixed_card_deferred_coupled_line_row!(
             phase_index,
             missing,
             missing,
+            Float64[],
+            Float64[],
             raw_resistance,
             raw_inductance,
             raw_capacitance,
@@ -1025,22 +1027,31 @@ function parse_fixed_card_coupled_line_row!(
     reference_to_name, reference_to_index =
         fixed_card_optional_node!(result, reference_to)
     if descriptor.kind == :mutual_source_equivalent
-        sequence_resistance = fixed_card_optional_float_field!(
-            result,
-            image,
-            line_no,
-            27,
-            32,
-            "coupled_lumped_sequence_resistance",
-        )
-        sequence_inductance = fixed_card_optional_float_field!(
-            result,
-            image,
-            line_no,
-            33,
-            44,
-            "coupled_lumped_sequence_inductance",
-        )
+        triangular_resistance_values = Float64[]
+        triangular_inductance_values = Float64[]
+        for column in 1:descriptor.phase_index
+            first_column = 27 + 18 * (column - 1)
+            resistance_value = fixed_card_optional_float_field!(
+                result,
+                image,
+                line_no,
+                first_column,
+                first_column + 5,
+                "coupled_lumped_resistance_$column",
+            )
+            inductance_value = fixed_card_optional_float_field!(
+                result,
+                image,
+                line_no,
+                first_column + 6,
+                first_column + 17,
+                "coupled_lumped_inductance_$column",
+            )
+            push!(triangular_resistance_values, ismissing(resistance_value) ? 0.0 : resistance_value)
+            push!(triangular_inductance_values, ismissing(inductance_value) ? 0.0 : inductance_value)
+        end
+        sequence_resistance = first(triangular_resistance_values)
+        sequence_inductance = first(triangular_inductance_values)
         raw_resistance = sequence_resistance
         raw_inductance = sequence_inductance
         raw_capacitance = missing
@@ -1048,6 +1059,8 @@ function parse_fixed_card_coupled_line_row!(
     else
         sequence_resistance = missing
         sequence_inductance = missing
+        triangular_resistance_values = Float64[]
+        triangular_inductance_values = Float64[]
         raw_resistance = fixed_card_optional_float_field!(
             result,
             image,
@@ -1102,6 +1115,8 @@ function parse_fixed_card_coupled_line_row!(
             descriptor.phase_index,
             sequence_resistance,
             sequence_inductance,
+            triangular_resistance_values,
+            triangular_inductance_values,
             raw_resistance,
             raw_inductance,
             raw_capacitance,

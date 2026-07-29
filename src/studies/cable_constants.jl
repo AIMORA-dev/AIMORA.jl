@@ -61,7 +61,8 @@ function _cable_study_frequency_states(
 end
 
 function _cable_study_pipe_sheath_state(case::DeckCableConstantsCase)
-    conductor_count = sum(case.layer_counts)
+    conductor_count =
+        sum(case.layer_counts) + (case.cable_kind_code == 3 ? case.pipe_count : 0)
     phase_and_sheath_count = case.phase_count + count(>=(2), case.layer_counts)
     return cable_pipe_sheath_derived_state(
         cable_kind_code = case.cable_kind_code,
@@ -77,19 +78,50 @@ function _cable_study_pipe_sheath_state(case::DeckCableConstantsCase)
         resistivity_ohm_m = case.resistivity_ohm_m,
         relative_permeability = case.conductor_relative_permeability,
         relative_permittivity = case.insulation_relative_permittivity,
-        pipe_radii_m = ones(3),
-        pipe_resistivity_ohm_m = 1.0,
-        pipe_relative_permeability = 1.0,
-        pipe_inner_insulator_relative_permittivity = 1.0,
-        pipe_outer_insulator_relative_permittivity = 1.0,
+        pipe_radii_m =
+            case.cable_kind_code == 3 ? case.pipe_radii_m : ones(3),
+        pipe_resistivity_ohm_m =
+            case.cable_kind_code == 3 ? case.pipe_resistivity_ohm_m : 1.0,
+        pipe_relative_permeability =
+            case.cable_kind_code == 3 ? case.pipe_relative_permeability : 1.0,
+        pipe_inner_insulator_relative_permittivity =
+            case.cable_kind_code == 3 ?
+            case.pipe_inner_insulator_relative_permittivity : 1.0,
+        pipe_outer_insulator_relative_permittivity =
+            case.cable_kind_code == 3 ?
+            case.pipe_outer_insulator_relative_permittivity : 1.0,
         conductor_depths_m = case.depths_m,
         conductor_distances_m = case.horizontal_positions_m,
-        conductor_pipe_center_distances_m = zeros(case.phase_count),
-        conductor_angles_rad = zeros(case.phase_count),
+        conductor_pipe_center_distances_m =
+            case.cable_kind_code == 3 ?
+            case.cable_to_pipe_center_distances_m : zeros(case.phase_count),
+        conductor_angles_rad =
+            case.cable_kind_code == 3 ?
+            case.cable_to_pipe_angles_rad : zeros(case.phase_count),
     )
 end
 
 function _cable_study_geometry(case::DeckCableConstantsCase)
+    if case.cable_kind_code == 3
+        length(case.pipe_depths_m) == case.pipe_count == 1 ||
+            throw(ArgumentError("type-3 cable study requires one owned pipe position"))
+        conductors = CableGeometryConductor[
+            CableGeometryConductor(
+                case.pipe_radii_m[3],
+                only(case.pipe_horizontal_positions_m),
+                only(case.pipe_depths_m);
+                resistivity_ohm_m = case.pipe_resistivity_ohm_m,
+                relative_permittivity =
+                    case.pipe_outer_insulator_relative_permittivity,
+                relative_permeability = case.pipe_relative_permeability,
+            ),
+        ]
+        return cable_geometry_constants(
+            conductors;
+            phase_conductor_counts = [1],
+            grounded_conductor_count = 0,
+        )
+    end
     conductors = CableGeometryConductor[
         CableGeometryConductor(
             case.boundary_radii_m[phase, 7],
@@ -130,7 +162,14 @@ function _cable_study_physical_checks(
     schedules::AbstractVector{CableFrequencyScanLoopSchedule},
 )
     radii_ordered = all(
-        phase -> all(diff(case.boundary_radii_m[phase, :]) .> 0.0),
+        phase -> all(
+            diff(
+                case.boundary_radii_m[
+                    phase,
+                    1:(2 * case.layer_counts[phase] + 1),
+                ],
+            ) .> 0.0,
+        ),
         1:case.phase_count,
     )
     positive_materials = all(>(0.0), case.resistivity_ohm_m) &&
@@ -151,8 +190,26 @@ function _cable_study_physical_checks(
     frequency_complete = !isempty(schedules) && all(schedule -> schedule.loop_executed, schedules)
     wave_speeds_finite = all(isfinite, state.layer_wave_speeds_m_per_s) &&
         all(>(0.0), state.layer_wave_speeds_m_per_s)
+    pipe_geometry_valid =
+        case.cable_kind_code != 3 ||
+        (
+            state.pipe_return_included &&
+            state.pipe_radius_allows_inner_conductors &&
+            length(case.cable_to_pipe_center_distances_m) == case.phase_count &&
+            all(
+                case.cable_to_pipe_center_distances_m .+
+                [
+                    case.boundary_radii_m[
+                        phase,
+                        2 * case.layer_counts[phase] + 1,
+                    ] for phase in 1:case.phase_count
+                ] .<
+                state.pipe_radii_m[1],
+            )
+        )
     return radii_ordered && positive_materials && symmetric_geometry &&
-        frequency_complete && wave_speeds_finite && state.derived_state_executed
+        frequency_complete && wave_speeds_finite && pipe_geometry_valid &&
+        state.derived_state_executed
 end
 
 function run_cable_constants_study(parsed::DeckParseResult; case_index::Integer = 1)

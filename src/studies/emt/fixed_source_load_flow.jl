@@ -226,7 +226,7 @@ function _fixed_source_machine_voltage_boundary(
 )
     card1 = _deck_universal_machine_definition(parsed, machine_index, 1)
     if card1.machine_type in (1, 2) ||
-       (card1.machine_type == 8 &&
+       (card1.machine_type in (8, 9, 10, 11, 12) &&
         _deck_universal_machine_initialization_mode(parsed) == :automatic)
         return _fixed_source_prescribed_machine_voltage_boundary(
             parsed,
@@ -375,13 +375,41 @@ function _fixed_source_network_admittance(parsed::DeckParser.DeckParseResult)
         )
     end
     if !constant_source_domain
-        _stamp_coupled_lumped_sequence_steady_state_admittance!(matrix, parsed)
-        _stamp_generator_equivalent_steady_state_admittance!(matrix, parsed)
-        _stamp_coupled_lumped_phase_pi_steady_state_admittance!(matrix, parsed)
-        _stamp_cascaded_phase_pi_steady_state_admittance!(matrix, parsed)
-        _stamp_distributed_line_steady_state_admittance!(matrix, parsed)
-        _stamp_semlyen_line_steady_state_admittance!(matrix, parsed)
-        _stamp_deck_induction_machine_steady_state_admittance!(matrix, parsed)
+        _stamp_coupled_lumped_sequence_steady_state_admittance!(
+            matrix,
+            parsed,
+            frequency_partition,
+        )
+        _stamp_generator_equivalent_steady_state_admittance!(
+            matrix,
+            parsed,
+            frequency_partition,
+        )
+        _stamp_coupled_lumped_phase_pi_steady_state_admittance!(
+            matrix,
+            parsed,
+            frequency_partition,
+        )
+        _stamp_cascaded_phase_pi_steady_state_admittance!(
+            matrix,
+            parsed,
+            frequency_partition,
+        )
+        _stamp_distributed_line_steady_state_admittance!(
+            matrix,
+            parsed,
+            frequency_partition,
+        )
+        _stamp_semlyen_line_steady_state_admittance!(
+            matrix,
+            parsed,
+            frequency_partition,
+        )
+        _stamp_deck_induction_machine_steady_state_admittance!(
+            matrix,
+            parsed,
+            frequency_partition,
+        )
     end
     return matrix
 end

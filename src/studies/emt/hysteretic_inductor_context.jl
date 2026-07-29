@@ -1,3 +1,5 @@
+export hysteresis_runtime_table
+
 function _deck_hysteretic_inductor_point_groups(
     rows::Vector{DeckParser.DeckHystereticInductorRow},
     points::Vector{DeckParser.DeckHystereticInductorPointRow},
@@ -29,7 +31,23 @@ function _deck_hysteretic_inductor_table(
     points::Vector{DeckParser.DeckHystereticInductorPointRow},
     delta2::Float64,
 )
-    point_count = length(points)
+    return _hysteretic_inductor_table(
+        Float64[point.current_A for point in points],
+        Float64[point.flux_Wb for point in points],
+        delta2,
+    )
+end
+
+function _hysteretic_inductor_table(
+    currents::Vector{Float64},
+    fluxes::Vector{Float64},
+    delta2::Float64,
+)
+    point_count = length(currents)
+    point_count == length(fluxes) >= 3 ||
+        throw(ArgumentError("type-96 runtime table requires at least three aligned points"))
+    all(isfinite, currents) && all(isfinite, fluxes) ||
+        throw(ArgumentError("type-96 runtime points must be finite"))
     state_start = 1
     major_loop_start = state_start + 6
     table_length = 2 * point_count + 8
@@ -37,8 +55,6 @@ function _deck_hysteretic_inductor_table(
     vchar = zeros(Float64, table_length)
     gslope = zeros(Float64, table_length)
 
-    currents = Float64[point.current_A for point in points]
-    fluxes = Float64[point.flux_Wb for point in points]
     major_currents = vcat(-currents[end - 1], currents)
     major_fluxes = vcat(-fluxes[end - 1], fluxes)
     major_stop = major_loop_start + point_count
@@ -85,6 +101,35 @@ function _deck_hysteretic_inductor_table(
     gslope[state_start + 4] = 0.0
     gslope[state_start + 5] = currents[end - 1]
     return cchar, vchar, gslope, state_start, major_loop_start
+end
+
+function hysteresis_runtime_table(
+    characteristic::HysteresisLoopPreprocessResult;
+    half_timestep_s::Real,
+)
+    characteristic.physical_checks_passed ||
+        throw(ArgumentError("hysteresis preprocessing must pass physical checks"))
+    delta2 = Float64(half_timestep_s)
+    isfinite(delta2) && delta2 > 0.0 ||
+        throw(ArgumentError("hysteresis half_timestep_s must be finite and positive"))
+    cchar, vchar, gslope, state_start, major_loop_start =
+        _hysteretic_inductor_table(
+            characteristic.runtime_current_a,
+            characteristic.runtime_flux_wb,
+            delta2,
+        )
+    return (
+        cchar,
+        vchar,
+        gslope,
+        state_start_index = state_start,
+        major_loop_start_index = major_loop_start,
+        table_end_index = length(cchar),
+        active_runtime_owner = :hysteretic_inductor_current_update,
+        physical_checks_passed =
+            gslope[state_start + 1] > 0.0 &&
+            characteristic.energy_loss_j > 0.0,
+    )
 end
 
 function deck_hysteretic_inductor_nonlinear_current_config(

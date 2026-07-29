@@ -3,14 +3,18 @@ export SemlyenRationalTerm,
        SemlyenFrequencyDependentLine,
        SemlyenFrequencyScanFitResult,
        PoleResidueTransfer,
+       PoleResidueFitResult,
        PoleResidueReductionResult,
        RationalLineModeConversion,
+       RationalLineFrequencyFitResult,
        semlyen_rational_terms,
        pole_residue_transfer_value,
+       pole_residue_transfer_fit,
        pole_residue_transfer_for_timestep,
        rational_frequency_dependent_mode_parameters,
        semlyen_frequency_dependent_line,
        semlyen_frequency_dependent_line_from_scan_fit,
+       semlyen_frequency_dependent_line_from_rational_fit,
        semlyen_line_physical_checks,
        semlyen_line_steady_state_terminal_admittance,
        initialize_semlyen_line_steady_state!
@@ -127,6 +131,399 @@ function pole_residue_transfer_value(response::PoleResidueTransfer, s::Number)
         value += response.residues[index] / (frequency + response.poles[index])
     end
     return value
+end
+
+struct PoleResidueFitResult
+    response::PoleResidueTransfer
+    frequencies_hz::Vector{Float64}
+    sample_values::Vector{ComplexF64}
+    fitted_values::Vector{ComplexF64}
+    maximum_absolute_error::Float64
+    relative_maximum_absolute_error::Float64
+    normalized_root_mean_square_error::Float64
+    pole_refinement_sweeps::Int
+    maximum_frequency_response_gain::Float64
+    passivity_projection_scale::Float64
+    stable_poles::Bool
+    passivity_checks_passed::Bool
+    fit_checks_passed::Bool
+end
+
+function _pole_residue_weighted_system(
+    frequencies_hz::Vector{Float64},
+    sample_values::Vector{ComplexF64},
+    poles::Vector{Float64},
+    fixed_direct_term::Union{Nothing,Float64},
+)
+    sample_scale = maximum(abs, sample_values; init = 0.0)
+    weight_floor = max(sample_scale * 1.0e-6, eps(Float64))
+    direct_unknown = fixed_direct_term === nothing
+    column_count = length(poles) + (direct_unknown ? 1 : 0)
+    matrix = zeros(Float64, 2 * length(frequencies_hz), column_count)
+    target = zeros(Float64, 2 * length(frequencies_hz))
+    for sample_index in eachindex(frequencies_hz)
+        frequency = 2.0im * pi * frequencies_hz[sample_index]
+        sample = sample_values[sample_index] -
+            (direct_unknown ? 0.0 : something(fixed_direct_term))
+        weight = inv(max(abs(sample_values[sample_index]), weight_floor))
+        real_row = 2 * sample_index - 1
+        imaginary_row = real_row + 1
+        column = 1
+        if direct_unknown
+            matrix[real_row, column] = weight
+            column += 1
+        end
+        for pole in poles
+            basis = pole / (frequency + pole)
+            matrix[real_row, column] = weight * real(basis)
+            matrix[imaginary_row, column] = weight * imag(basis)
+            column += 1
+        end
+        target[real_row] = weight * real(sample)
+        target[imaginary_row] = weight * imag(sample)
+    end
+    return matrix, target
+end
+
+function _pole_residue_nonnegative_least_squares(
+    matrix::Matrix{Float64},
+    target::Vector{Float64};
+    maximum_sweeps::Int = 20_000,
+)
+    column_count = size(matrix, 2)
+    column_norms = vec(sum(abs2, matrix; dims = 1))
+    all(>(0.0), column_norms) ||
+        throw(ArgumentError("pole-residue fit basis contains a zero column"))
+    values = max.(matrix \ target, 0.0)
+    residual = target - matrix * values
+    for sweep in 1:maximum_sweeps
+        maximum_change = 0.0
+        for column in 1:column_count
+            old_value = values[column]
+            numerator =
+                dot(@view(matrix[:, column]), residual) +
+                column_norms[column] * old_value
+            new_value = max(0.0, numerator / column_norms[column])
+            change = new_value - old_value
+            change == 0.0 && continue
+            residual .-= change .* @view(matrix[:, column])
+            values[column] = new_value
+            maximum_change = max(maximum_change, abs(change))
+        end
+        scale = max(maximum(abs, values; init = 0.0), 1.0)
+        maximum_change <= 1.0e-12 * scale && return values, sweep
+    end
+    return values, maximum_sweeps
+end
+
+function _pole_residue_linear_fit(
+    frequencies_hz::Vector{Float64},
+    sample_values::Vector{ComplexF64},
+    poles::Vector{Float64},
+    fixed_direct_term::Union{Nothing,Float64},
+    enforce_nonnegative_coefficients::Bool,
+)
+    matrix, target = _pole_residue_weighted_system(
+        frequencies_hz,
+        sample_values,
+        poles,
+        fixed_direct_term,
+    )
+    coefficients, sweeps = if enforce_nonnegative_coefficients
+        _pole_residue_nonnegative_least_squares(matrix, target)
+    else
+        matrix \ target, 1
+    end
+    if fixed_direct_term === nothing
+        direct_term = coefficients[1]
+        normalized_residues = coefficients[2:end]
+    else
+        direct_term = fixed_direct_term
+        normalized_residues = coefficients
+    end
+    residues = normalized_residues .* poles
+    return PoleResidueTransfer(direct_term, residues, poles), sweeps
+end
+
+function _pole_residue_fit_objective(
+    response::PoleResidueTransfer,
+    frequencies_hz::Vector{Float64},
+    sample_values::Vector{ComplexF64},
+)
+    fitted = ComplexF64[
+        pole_residue_transfer_value(response, 2.0im * pi * frequency)
+        for frequency in frequencies_hz
+    ]
+    sample_scale = maximum(abs, sample_values; init = 0.0)
+    floor_scale = max(sample_scale * 1.0e-6, eps(Float64))
+    normalized_errors = Float64[
+        abs(fitted[index] - sample_values[index]) /
+        max(abs(sample_values[index]), floor_scale)
+        for index in eachindex(sample_values)
+    ]
+    return maximum(normalized_errors; init = 0.0)
+end
+
+function _pole_residue_passivity_grid(frequencies_hz::Vector{Float64})
+    positive = filter(>(0.0), frequencies_hz)
+    grid = copy(frequencies_hz)
+    for index in 1:(length(positive) - 1)
+        lower = positive[index]
+        upper = positive[index + 1]
+        for fraction in 1:7
+            push!(
+                grid,
+                exp(
+                    log(lower) +
+                    (fraction / 8.0) * (log(upper) - log(lower)),
+                ),
+            )
+        end
+    end
+    return sort!(unique(grid))
+end
+
+function _pole_residue_global_rate_grid(
+    response::PoleResidueTransfer,
+    frequencies_hz::Vector{Float64},
+)
+    sample_rates = 2.0 .* pi .* filter(>(0.0), frequencies_hz)
+    anchors = sort!(unique(vcat(sample_rates, response.poles)))
+    isempty(anchors) &&
+        throw(ArgumentError("pole-residue global response grid requires a positive rate"))
+    lower = first(anchors) / 1024.0
+    upper = last(anchors) * 1024.0
+    knots = sort!(unique(vcat(lower, anchors, upper)))
+    rates = Float64[0.0]
+    for fraction in 1:16
+        push!(rates, lower * fraction / 16.0)
+    end
+    for index in 1:(length(knots) - 1)
+        first_rate = knots[index]
+        last_rate = knots[index + 1]
+        for fraction in 0:16
+            push!(
+                rates,
+                exp(
+                    log(first_rate) +
+                    (fraction / 16.0) * (log(last_rate) - log(first_rate)),
+                ),
+            )
+        end
+    end
+    return sort!(unique(rates))
+end
+
+function _pole_residue_maximum_gain(
+    response::PoleResidueTransfer,
+    frequencies_hz::Vector{Float64},
+)
+    return maximum(
+        rate -> abs(pole_residue_transfer_value(response, complex(0.0, rate))),
+        _pole_residue_global_rate_grid(response, frequencies_hz);
+        init = abs(response.direct_term),
+    )
+end
+
+function _pole_residue_passivity_projection(
+    response::PoleResidueTransfer,
+    frequencies_hz::Vector{Float64},
+)
+    maximum_gain = _pole_residue_maximum_gain(response, frequencies_hz)
+    maximum_gain > 1.0 || return response, maximum_gain, 1.0
+    scale = prevfloat(1.0) / maximum_gain
+    projected = PoleResidueTransfer(
+        response.direct_term * scale,
+        response.residues .* scale,
+        response.poles,
+    )
+    return projected, maximum_gain, scale
+end
+
+"""
+    pole_residue_transfer_fit(frequencies_hz, sample_values; order, ...)
+
+Fit a stable real-coefficient rational response directly to complex-frequency
+samples. Stable logarithmic poles are refined in the physical frequency band;
+the dimensionless `r/p` coefficients and optional direct term are recomputed
+at every sweep in a conditioned `p/(s+p)` basis.
+Characteristic-impedance fits use a nonnegative Stieltjes basis, which makes
+the fitted impedance positive real and gives its reciprocal stable,
+real-interlacing poles.
+"""
+function pole_residue_transfer_fit(
+    frequencies_hz::AbstractVector,
+    sample_values::AbstractVector;
+    order::Integer,
+    fixed_direct_term::Union{Nothing,Real} = nothing,
+    response_kind::Symbol = :generic,
+    relative_tolerance::Real = 0.10,
+    passivity_tolerance::Real = 1.0e-8,
+    maximum_refinement_sweeps::Integer = 6,
+)
+    frequencies = Float64.(frequencies_hz)
+    samples = ComplexF64.(sample_values)
+    length(frequencies) == length(samples) && !isempty(frequencies) ||
+        throw(ArgumentError("pole-residue fit frequencies and samples must be nonempty and aligned"))
+    all(value -> isfinite(value) && value >= 0.0, frequencies) &&
+        all(isfinite, real.(samples)) && all(isfinite, imag.(samples)) ||
+        throw(ArgumentError("pole-residue fit samples must be finite at nonnegative frequencies"))
+    issorted(frequencies) && all(diff(frequencies) .> 0.0) ||
+        throw(ArgumentError("pole-residue fit frequencies must be strictly increasing"))
+    response_kind in (:generic, :characteristic_impedance, :propagation) ||
+        throw(ArgumentError("unsupported pole-residue response kind $response_kind"))
+    term_count = Int(order)
+    term_count > 0 || throw(ArgumentError("pole-residue fit order must be positive"))
+    fixed_direct = fixed_direct_term === nothing ?
+        nothing : Float64(fixed_direct_term)
+    fixed_direct === nothing || isfinite(fixed_direct) ||
+        throw(ArgumentError("pole-residue fixed direct term must be finite"))
+    unknown_count = term_count + (fixed_direct === nothing ? 1 : 0)
+    2 * length(frequencies) >= unknown_count ||
+        throw(ArgumentError("pole-residue fit has fewer real equations than coefficients"))
+    tolerance = Float64(relative_tolerance)
+    passivity_limit = Float64(passivity_tolerance)
+    isfinite(tolerance) && tolerance > 0.0 &&
+        isfinite(passivity_limit) && passivity_limit > 0.0 ||
+        throw(ArgumentError("pole-residue fit tolerances must be finite and positive"))
+    refinement_sweeps = Int(maximum_refinement_sweeps)
+    refinement_sweeps >= 0 ||
+        throw(ArgumentError("pole-residue refinement sweep count must be nonnegative"))
+    positive_frequencies = filter(>(0.0), frequencies)
+    isempty(positive_frequencies) &&
+        throw(ArgumentError("pole-residue fit requires at least one positive frequency"))
+    minimum_rate = 2.0 * pi * first(positive_frequencies)
+    maximum_rate = 2.0 * pi * last(positive_frequencies)
+    lower_pole = max(0.1 * minimum_rate, sqrt(eps(Float64)))
+    upper_pole = max(10.0 * maximum_rate, 10.0 * lower_pole)
+    initial_grid = range(
+        log(lower_pole),
+        log(upper_pole);
+        length = term_count + 2,
+    )
+    poles = exp.(initial_grid[2:(end - 1)])
+    enforce_nonnegative = response_kind == :characteristic_impedance
+    response, _ = _pole_residue_linear_fit(
+        frequencies,
+        samples,
+        poles,
+        fixed_direct,
+        enforce_nonnegative,
+    )
+    unprojected_maximum_gain = _pole_residue_maximum_gain(response, frequencies)
+    passivity_projection_scale = 1.0
+    if response_kind == :propagation
+        response, unprojected_maximum_gain, passivity_projection_scale =
+            _pole_residue_passivity_projection(response, frequencies)
+    end
+    objective = _pole_residue_fit_objective(response, frequencies, samples)
+    completed_sweeps = 0
+    for sweep in 1:refinement_sweeps
+        changed = false
+        for index in eachindex(poles)
+            retained_pole = poles[index]
+            retained_response = response
+            retained_objective = objective
+            lower_bound =
+                index == firstindex(poles) ? lower_pole / 100.0 :
+                poles[index - 1] * (1.0 + 1.0e-6)
+            upper_bound =
+                index == lastindex(poles) ? upper_pole * 100.0 :
+                poles[index + 1] * (1.0 - 1.0e-6)
+            for multiplier in (0.5, 0.75, 0.9, 0.95, 1.05, 1.1, 1.25, 2.0)
+                candidate_pole = clamp(retained_pole * multiplier, lower_bound, upper_bound)
+                candidate_pole == retained_pole && continue
+                candidate_poles = copy(poles)
+                candidate_poles[index] = candidate_pole
+                candidate_response, _ = _pole_residue_linear_fit(
+                    frequencies,
+                    samples,
+                    candidate_poles,
+                    fixed_direct,
+                    enforce_nonnegative,
+                )
+                candidate_maximum_gain =
+                    _pole_residue_maximum_gain(candidate_response, frequencies)
+                candidate_projection_scale = 1.0
+                if response_kind == :propagation
+                    candidate_response,
+                    candidate_maximum_gain,
+                    candidate_projection_scale =
+                        _pole_residue_passivity_projection(
+                            candidate_response,
+                            frequencies,
+                        )
+                end
+                candidate_objective = _pole_residue_fit_objective(
+                    candidate_response,
+                    frequencies,
+                    samples,
+                )
+                if candidate_objective < retained_objective
+                    retained_pole = candidate_pole
+                    retained_response = candidate_response
+                    retained_objective = candidate_objective
+                    unprojected_maximum_gain = candidate_maximum_gain
+                    passivity_projection_scale = candidate_projection_scale
+                end
+            end
+            if retained_pole != poles[index]
+                poles[index] = retained_pole
+                response = retained_response
+                objective = retained_objective
+                changed = true
+            end
+        end
+        completed_sweeps = sweep
+        changed || break
+    end
+    fitted = ComplexF64[
+        pole_residue_transfer_value(response, 2.0im * pi * frequency)
+        for frequency in frequencies
+    ]
+    errors = abs.(fitted .- samples)
+    maximum_error = maximum(errors; init = 0.0)
+    sample_scale = maximum(abs, samples; init = 0.0)
+    floor_scale = max(sample_scale * 1.0e-6, eps(Float64))
+    relative_errors = Float64[
+        errors[index] / max(abs(samples[index]), floor_scale)
+        for index in eachindex(samples)
+    ]
+    relative_maximum_error = maximum(relative_errors; init = 0.0)
+    normalized_rms_error =
+        sqrt(sum(abs2, relative_errors) / length(relative_errors))
+    stable_poles = all(>(0.0), response.poles)
+    passivity_values = ComplexF64[
+        pole_residue_transfer_value(response, complex(0.0, rate))
+        for rate in _pole_residue_global_rate_grid(response, frequencies)
+    ]
+    maximum_gain = maximum(abs, passivity_values; init = abs(response.direct_term))
+    passivity_checks = if response_kind == :characteristic_impedance
+        response.direct_term > 0.0 &&
+            all(value -> real(value) >= -passivity_limit, passivity_values)
+    elseif response_kind == :propagation
+        abs(response.direct_term) <= passivity_limit &&
+            all(value -> abs(value) <= 1.0 + passivity_limit, passivity_values)
+    else
+        true
+    end
+    fit_checks = stable_poles && passivity_checks &&
+        relative_maximum_error <= tolerance
+    return PoleResidueFitResult(
+        response,
+        frequencies,
+        samples,
+        fitted,
+        maximum_error,
+        relative_maximum_error,
+        normalized_rms_error,
+        completed_sweeps,
+        maximum_gain,
+        passivity_projection_scale,
+        stable_poles,
+        passivity_checks,
+        fit_checks,
+    )
 end
 
 struct PoleResidueReductionResult
@@ -294,21 +691,70 @@ function _reciprocal_rational_terms(
     roots = _ascending_polynomial_roots(numerator)
     derivative = [index * numerator[index + 1] for index in 1:(length(numerator) - 1)]
     terms = SemlyenRationalTerm[]
-    for root in sort(roots; by = value -> (real(value), imag(value)))
-        scale = max(1.0, abs(real(root)))
-        abs(imag(root)) <= root_tolerance * scale || throw(ArgumentError(
-            "characteristic-admittance poles must be real for the real-time line owner",
-        ))
-        normalized_pole = -real(root)
-        pole = normalized_pole * frequency_scale
-        pole > 0.0 || throw(ArgumentError(
+    ordered_roots = sort(roots; by = value -> (real(value), imag(value)))
+    consumed = falses(length(ordered_roots))
+    for root_index in eachindex(ordered_roots)
+        consumed[root_index] && continue
+        root = ordered_roots[root_index]
+        normalized_pole = -root
+        scale = max(1.0, abs(root))
+        real(normalized_pole) > root_tolerance * scale || throw(ArgumentError(
             "characteristic-admittance reciprocal has a non-stable pole",
         ))
-        residue = _ascending_polynomial_value(denominator, root) /
+        conventional_residue =
+            _ascending_polynomial_value(denominator, root) /
             _ascending_polynomial_value(derivative, root)
-        abs(imag(residue)) <= root_tolerance * max(1.0, abs(real(residue))) ||
-            throw(ArgumentError("characteristic-admittance residue is not real"))
-        push!(terms, SemlyenRationalTerm(pole, real(residue) / normalized_pole))
+        if abs(imag(root)) <= root_tolerance * scale
+            residue_scale = max(1.0, abs(conventional_residue))
+            abs(imag(conventional_residue)) <= root_tolerance * residue_scale ||
+                throw(ArgumentError("characteristic-admittance residue is not real"))
+            real_pole = real(normalized_pole) * frequency_scale
+            push!(
+                terms,
+                SemlyenRationalTerm(
+                    real_pole,
+                    real(conventional_residue) / real(normalized_pole),
+                ),
+            )
+            consumed[root_index] = true
+            continue
+        end
+        conjugate_index = findfirst(
+            candidate_index ->
+                !consumed[candidate_index] &&
+                candidate_index != root_index &&
+                abs(
+                    ordered_roots[candidate_index] - conj(root),
+                ) <= root_tolerance * scale,
+            eachindex(ordered_roots),
+        )
+        conjugate_index === nothing && throw(ArgumentError(
+            "characteristic-admittance reciprocal has an unpaired complex pole",
+        ))
+        conjugate_root = ordered_roots[conjugate_index]
+        conjugate_residue =
+            _ascending_polynomial_value(denominator, conjugate_root) /
+            _ascending_polynomial_value(derivative, conjugate_root)
+        residue_scale = max(1.0, abs(conventional_residue))
+        abs(conjugate_residue - conj(conventional_residue)) <=
+            root_tolerance * residue_scale || throw(ArgumentError(
+            "characteristic-admittance reciprocal has inconsistent conjugate residues",
+        ))
+        retained_root, retained_residue =
+            imag(normalized_pole) >= 0.0 ?
+            (root, conventional_residue) :
+            (conjugate_root, conjugate_residue)
+        retained_pole = -retained_root
+        push!(
+            terms,
+            SemlyenRationalTerm(
+                retained_pole * frequency_scale,
+                retained_residue / retained_pole;
+                conjugate_pair = true,
+            ),
+        )
+        consumed[root_index] = true
+        consumed[conjugate_index] = true
     end
     return terms
 end
@@ -317,6 +763,10 @@ function _rational_terms_value(terms::AbstractVector{SemlyenRationalTerm}, s::Co
     value = 0.0 + 0.0im
     for term in terms
         value += term.residue * term.pole / (s + term.pole)
+        term.conjugate_pair || continue
+        conjugate_pole = conj(term.pole)
+        conjugate_residue = conj(term.residue)
+        value += conjugate_residue * conjugate_pole / (s + conjugate_pole)
     end
     return value
 end
@@ -519,6 +969,95 @@ struct SemlyenFrequencyScanFitResult
     stable_poles::Bool
     fit_checks_passed::Bool
     physical_checks_passed::Bool
+end
+
+struct RationalLineFrequencyFitResult
+    line::SemlyenFrequencyDependentLine
+    sample_frequencies_hz::Vector{Float64}
+    phasor_frequency_hz::Float64
+    requested_travel_times_s::Vector{Float64}
+    travel_times_s::Vector{Float64}
+    travel_time_refinement_evaluations::Vector{Int}
+    maximum_travel_time_adjustment_s::Float64
+    characteristic_impedance_orders::Vector{Int}
+    characteristic_impedance_fits::Vector{PoleResidueFitResult}
+    propagation_without_delay_fits::Vector{PoleResidueFitResult}
+    mode_conversions::Vector{RationalLineModeConversion}
+    maximum_relative_fit_error::Float64
+    stable_poles::Bool
+    passivity_checks_passed::Bool
+    fit_checks_passed::Bool
+    physical_checks_passed::Bool
+end
+
+function _pole_residue_propagation_fit(
+    frequencies::Vector{Float64},
+    propagation_samples::Vector{ComplexF64},
+    requested_travel_time_s::Float64,
+    timestep_s::Float64;
+    order::Int,
+    relative_tolerance::Float64,
+    passivity_tolerance::Float64,
+    maximum_refinement_sweeps::Int,
+    refine_travel_time::Bool,
+)
+    maximum_frequency = last(frequencies)
+    maximum_frequency > 0.0 ||
+        throw(ArgumentError("propagation fitting requires a positive maximum frequency"))
+    evaluation_count = 0
+    function fit_at_delay(delay_s::Float64)
+        evaluation_count += 1
+        without_delay = ComplexF64[
+            propagation_samples[index] *
+            cis(2.0 * pi * frequencies[index] * delay_s)
+            for index in eachindex(frequencies)
+        ]
+        return pole_residue_transfer_fit(
+            frequencies,
+            without_delay;
+            order,
+            fixed_direct_term = 0.0,
+            response_kind = :propagation,
+            relative_tolerance,
+            passivity_tolerance,
+            maximum_refinement_sweeps,
+        )
+    end
+    best_delay = requested_travel_time_s
+    best_fit = fit_at_delay(best_delay)
+    refine_travel_time || return best_fit, best_delay, evaluation_count
+    half_span = min(
+        1.0e-3 / maximum_frequency,
+        max(1.0e-3 * requested_travel_time_s, 32.0 * eps(requested_travel_time_s)),
+    )
+    absolute_lower = max(timestep_s, requested_travel_time_s - half_span)
+    absolute_upper = requested_travel_time_s + half_span
+    for _ in 1:3
+        lower = max(absolute_lower, best_delay - half_span)
+        upper = min(absolute_upper, best_delay + half_span)
+        candidates = range(lower, upper; length = 17)
+        for candidate in candidates
+            delay = Float64(candidate)
+            delay == best_delay && continue
+            fit = fit_at_delay(delay)
+            fit_key = (
+                !fit.passivity_checks_passed,
+                fit.relative_maximum_absolute_error,
+                fit.normalized_root_mean_square_error,
+            )
+            best_key = (
+                !best_fit.passivity_checks_passed,
+                best_fit.relative_maximum_absolute_error,
+                best_fit.normalized_root_mean_square_error,
+            )
+            if fit_key < best_key
+                best_fit = fit
+                best_delay = delay
+            end
+        end
+        half_span /= 8.0
+    end
+    return best_fit, best_delay, evaluation_count
 end
 
 _semlyen_term_multiplier(term::SemlyenRationalTerm) = term.conjugate_pair ? 2.0 : 1.0
@@ -884,6 +1423,187 @@ function semlyen_frequency_dependent_line_from_scan_fit(
     )
 end
 
+"""
+    semlyen_frequency_dependent_line_from_rational_fit(...)
+
+Fit general stable Marti pole-residue responses to modal complex-frequency
+samples and construct the existing executable rational-line owner. The
+propagation delay remains explicit; only the attenuation/dispersion response
+is fitted, preserving the runtime history-ring mutation order.
+"""
+function semlyen_frequency_dependent_line_from_rational_fit(
+    from_nodes::AbstractVector{<:Integer},
+    to_nodes::AbstractVector{<:Integer},
+    sample_rows::AbstractVector,
+    travel_times_s::AbstractVector,
+    voltage_modal_to_phase::AbstractMatrix,
+    current_modal_to_phase::AbstractMatrix,
+    timestep_s::Real;
+    phasor_frequency_hz::Real,
+    characteristic_impedance_order::Integer = 10,
+    minimum_characteristic_impedance_order::Integer = 2,
+    propagation_order::Integer = 6,
+    relative_fit_tolerance::Real = 0.10,
+    passivity_tolerance::Real = 1.0e-8,
+    reciprocal_tolerance::Real = 5.0e-8,
+    maximum_refinement_sweeps::Integer = 6,
+    refine_travel_times::Bool = true,
+)
+    frequencies, rows, mode_count =
+        _checked_line_frequency_sample_rows(sample_rows)
+    length(from_nodes) == mode_count && length(to_nodes) == mode_count ||
+        throw(ArgumentError("rational scan terminal count must match its modal samples"))
+    travel_times = Float64.(travel_times_s)
+    length(travel_times) == mode_count ||
+        throw(ArgumentError("rational scan travel-time count must match its modes"))
+    timestep = _checked_line_positive_finite(timestep_s, "rational scan timestep_s")
+    all(value -> isfinite(value) && value >= timestep, travel_times) ||
+        throw(ArgumentError("rational scan travel times must be finite and at least one timestep"))
+    phasor_frequency = _checked_line_positive_finite(
+        phasor_frequency_hz,
+        "rational scan phasor_frequency_hz",
+    )
+    fit_tolerance = _checked_line_positive_finite(
+        relative_fit_tolerance,
+        "rational scan relative_fit_tolerance",
+    )
+    passivity_limit = _checked_line_positive_finite(
+        passivity_tolerance,
+        "rational scan passivity_tolerance",
+    )
+    refinement_sweeps = Int(maximum_refinement_sweeps)
+    refinement_sweeps >= 0 ||
+        throw(ArgumentError("rational scan refinement sweep count must be nonnegative"))
+    requested_characteristic_order = Int(characteristic_impedance_order)
+    minimum_characteristic_order = Int(minimum_characteristic_impedance_order)
+    requested_characteristic_order >= minimum_characteristic_order >= 1 ||
+        throw(ArgumentError(
+            "rational scan characteristic-impedance order range must be positive and ordered",
+        ))
+    characteristic_fits = PoleResidueFitResult[]
+    propagation_fits = PoleResidueFitResult[]
+    conversions = RationalLineModeConversion[]
+    characteristic_orders = Int[]
+    fitted_travel_times = Float64[]
+    travel_time_evaluations = Int[]
+    maximum_relative_error = 0.0
+    for mode in 1:mode_count
+        characteristic_samples = ComplexF64[
+            row[mode].characteristic_impedance for row in rows
+        ]
+        propagation_samples =
+            ComplexF64[row[mode].propagation_factor for row in rows]
+        propagation_fit, fitted_travel_time, evaluation_count =
+            _pole_residue_propagation_fit(
+            frequencies,
+            propagation_samples,
+            travel_times[mode],
+            timestep;
+            order = Int(propagation_order),
+            relative_tolerance = fit_tolerance,
+            passivity_tolerance = passivity_limit,
+                maximum_refinement_sweeps = refinement_sweeps,
+                refine_travel_time = refine_travel_times,
+            )
+        propagation_fit.fit_checks_passed || throw(ArgumentError(
+            "mode $mode propagation rational fit exceeds its accepted tolerance or passive-gain boundary",
+        ))
+        characteristic_fit = nothing
+        conversion = nothing
+        selected_characteristic_order = 0
+        conversion_error = nothing
+        for candidate_order in
+            requested_characteristic_order:-1:minimum_characteristic_order
+            candidate_fit = pole_residue_transfer_fit(
+                frequencies,
+                characteristic_samples;
+                order = candidate_order,
+                response_kind = :characteristic_impedance,
+                relative_tolerance = fit_tolerance,
+                passivity_tolerance = passivity_limit,
+                maximum_refinement_sweeps = refinement_sweeps,
+            )
+            candidate_fit.fit_checks_passed || continue
+            candidate_conversion = try
+                rational_frequency_dependent_mode_parameters(
+                    candidate_fit.response,
+                    propagation_fit.response,
+                    fitted_travel_time,
+                    phasor_frequency;
+                    reciprocal_tolerance,
+                )
+            catch error
+                error isa ArgumentError || rethrow()
+                conversion_error = error
+                nothing
+            end
+            candidate_conversion === nothing && continue
+            characteristic_fit = candidate_fit
+            conversion = candidate_conversion
+            selected_characteristic_order = candidate_order
+            break
+        end
+        characteristic_fit === nothing && throw(ArgumentError(
+            "mode $mode has no accepted characteristic-impedance order in " *
+            "$minimum_characteristic_order:$requested_characteristic_order" *
+            (conversion_error === nothing ? "" :
+             "; last conversion error: $(sprint(showerror, conversion_error))"),
+        ))
+        push!(characteristic_fits, characteristic_fit)
+        push!(propagation_fits, propagation_fit)
+        push!(conversions, conversion)
+        push!(characteristic_orders, selected_characteristic_order)
+        push!(fitted_travel_times, fitted_travel_time)
+        push!(travel_time_evaluations, evaluation_count)
+        maximum_relative_error = max(
+            maximum_relative_error,
+            characteristic_fit.relative_maximum_absolute_error,
+            propagation_fit.relative_maximum_absolute_error,
+        )
+    end
+    stable_poles = all(
+        fit -> fit.stable_poles,
+        Iterators.flatten((characteristic_fits, propagation_fits)),
+    )
+    passivity_checks = all(
+        fit -> fit.passivity_checks_passed,
+        Iterators.flatten((characteristic_fits, propagation_fits)),
+    )
+    fit_checks = stable_poles && passivity_checks &&
+        maximum_relative_error <= fit_tolerance
+    physical = semlyen_line_physical_checks(
+        getfield.(conversions, :parameters),
+        voltage_modal_to_phase,
+        current_modal_to_phase,
+    )
+    line = semlyen_frequency_dependent_line(
+        from_nodes,
+        to_nodes,
+        getfield.(conversions, :parameters),
+        voltage_modal_to_phase,
+        current_modal_to_phase,
+        timestep,
+    )
+    return RationalLineFrequencyFitResult(
+        line,
+        collect(frequencies),
+        phasor_frequency,
+        travel_times,
+        fitted_travel_times,
+        travel_time_evaluations,
+        maximum(abs.(fitted_travel_times .- travel_times); init = 0.0),
+        characteristic_orders,
+        characteristic_fits,
+        propagation_fits,
+        conversions,
+        maximum_relative_error,
+        stable_poles,
+        passivity_checks,
+        fit_checks,
+        physical.physical_checks_passed,
+    )
+end
+
 function _semlyen_modal_terminal_admittance(parameters::SemlyenModeParameters)
     series_impedance = parameters.phasor_series_impedance
     shunt_admittance = parameters.phasor_characteristic_admittance
@@ -898,9 +1618,45 @@ function _semlyen_modal_terminal_admittance(parameters::SemlyenModeParameters)
     return self_admittance, mutual_admittance
 end
 
-function _semlyen_modal_pi_parameters(parameters::SemlyenModeParameters)
-    series_impedance = parameters.phasor_series_impedance
-    shunt_admittance = parameters.phasor_characteristic_admittance
+function _semlyen_modal_pi_parameters(
+    parameters::SemlyenModeParameters,
+    frequency_hz::Float64,
+)
+    series_impedance, shunt_admittance = if isapprox(
+        parameters.phasor_frequency_hz,
+        frequency_hz;
+        atol = 1.0e-9,
+        rtol = 1.0e-9,
+    )
+        (
+            parameters.phasor_series_impedance,
+            parameters.phasor_characteristic_admittance,
+        )
+    else
+        angular_frequency = 2.0 * pi * frequency_hz
+        point = ComplexF64(0.0, angular_frequency)
+        propagation_without_delay =
+            _rational_terms_value(parameters.propagation_terms, point)
+        abs(propagation_without_delay) > eps(Float64) ||
+            throw(ArgumentError("Semlyen frequency response has zero propagation gain"))
+        abs(propagation_without_delay) <= 1.0 + 1.0e-8 ||
+            throw(ArgumentError("Semlyen frequency response has active propagation gain"))
+        characteristic_admittance =
+            parameters.characteristic_admittance_s +
+            _rational_terms_value(parameters.admittance_terms, point)
+        real(characteristic_admittance) > 0.0 ||
+            throw(ArgumentError("Semlyen frequency response has non-passive characteristic admittance"))
+        characteristic_impedance = inv(characteristic_admittance)
+        propagation =
+            -log(propagation_without_delay) +
+            ComplexF64(0.0, angular_frequency * parameters.travel_time_s)
+        real(propagation) >= -1.0e-8 ||
+            throw(ArgumentError("Semlyen frequency response has negative attenuation"))
+        (
+            characteristic_impedance * propagation,
+            propagation / characteristic_impedance,
+        )
+    end
     propagation = sqrt(series_impedance * shunt_admittance)
     characteristic_impedance = sqrt(series_impedance / shunt_admittance)
     series_branch_impedance = characteristic_impedance * sinh(propagation)
@@ -926,22 +1682,11 @@ function semlyen_line_steady_state_terminal_admittance(
     frequency = Float64(frequency_hz)
     isfinite(frequency) && frequency > 0.0 ||
         throw(ArgumentError("Semlyen steady-state frequency must be finite and positive"))
-    all(
-        mode -> isapprox(
-            mode.parameters.phasor_frequency_hz,
-            frequency;
-            atol = 1.0e-9,
-            rtol = 1.0e-9,
-        ),
-        line.modes,
-    ) || throw(ArgumentError(
-        "Semlyen supplied phasor parameters do not match the steady-state frequency",
-    ))
     series_modal = ComplexF64[]
     shunt_modal = ComplexF64[]
     for state in line.modes
         series_impedance, shunt_admittance =
-            _semlyen_modal_pi_parameters(state.parameters)
+            _semlyen_modal_pi_parameters(state.parameters, frequency)
         push!(series_modal, series_impedance)
         push!(shunt_modal, shunt_admittance)
     end

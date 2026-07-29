@@ -612,7 +612,7 @@ function parse_universal_machine_definition_card!(
             image = fixed_image(line)
             field_source = universal_machine_fixed_node_symbol(image, 29, 34)
             mechanical_source = universal_machine_fixed_node_symbol(image, 35, 40)
-            if state.machine_type in (1, 2, 6, 7, 8)
+            if state.machine_type in (1, 2, 6, 7, 8, 9, 10, 11, 12)
                 state.field_slack_source = field_source
                 state.mechanical_slack_source = mechanical_source
                 node = mechanical_source === nothing ? missing : mechanical_source

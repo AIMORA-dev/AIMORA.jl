@@ -115,6 +115,7 @@ function _terminal_state_complete(
             SeriesRLBranch,
             SeriesRLCBranch,
             CoupledInductiveBranch,
+            CoupledSeriesRLBranch,
             CapacitorBranch,
         } || continue
         push!(expected_branch_names, parsed.element_names[index])

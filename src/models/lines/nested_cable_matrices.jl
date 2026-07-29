@@ -146,6 +146,33 @@ function _nested_cable_nonnegative_resistance(value::ComplexF64)
     return real(value) < 0.0 ? ComplexF64(0.0, imag(value)) : value
 end
 
+function _nested_cable_layer_layout(
+    layer_counts::AbstractVector{<:Integer};
+    include_pipe::Bool=false,
+)
+    counts = Int.(layer_counts)
+    all(count -> 1 <= count <= 3, counts) ||
+        throw(ArgumentError("nested cable layer counts must be between one and three"))
+    indices = [zeros(Int, count) for count in counts]
+    phase_by_conductor = Int[]
+    next_index = 1
+    for layer in 1:3, phase in eachindex(counts)
+        counts[phase] >= layer || continue
+        indices[phase][layer] = next_index
+        push!(phase_by_conductor, phase)
+        next_index += 1
+    end
+    pipe_index = include_pipe ? next_index : 0
+    include_pipe && push!(phase_by_conductor, 0)
+    return (
+        layer_indices = indices,
+        phase_by_conductor = phase_by_conductor,
+        cable_conductor_count = next_index - 1,
+        total_conductor_count = next_index - 1 + (include_pipe ? 1 : 0),
+        pipe_index = pipe_index,
+    )
+end
+
 function _nested_cable_internal_impedance_matrix(
     state::CablePipeSheathDerivedState,
     radii::Matrix{Float64},
@@ -153,24 +180,33 @@ function _nested_cable_internal_impedance_matrix(
     conductor_permeability::Matrix{Float64},
     insulation_permeability::Matrix{Float64},
     frequency::Float64,
+    layer_counts::Vector{Int},
+    layout,
 )
-    phases = state.phase_count
-    total = state.conductor_count
-    internal = zeros(ComplexF64, total, total)
+    internal = zeros(
+        ComplexF64,
+        layout.total_conductor_count,
+        layout.total_conductor_count,
+    )
     omega = 2.0 * pi * frequency
-    dielectric_scale = ComplexF64(0.0, omega * LINE_VACUUM_PERMEABILITY_H_PER_M / (2.0 * pi))
-    for phase in 1:phases
-        core = phase
-        sheath = phases + phase
-        armor = 2 * phases + phase
+    magnetic_scale =
+        ComplexF64(0.0, omega * LINE_VACUUM_PERMEABILITY_H_PER_M / (2.0 * pi))
+    for phase in 1:state.phase_count
+        count = layer_counts[phase]
+        core = layout.layer_indices[phase][1]
         core_impedance = cable_skin_effect_internal_impedance(
             state.core_inner_diffusion_factors[phase],
             state.core_outer_diffusion_factors[phase],
             conductor_permeability[phase, 1],
             frequency,
         )
-        core_insulation = dielectric_scale * insulation_permeability[phase, 1] *
+        core_insulation = magnetic_scale * insulation_permeability[phase, 1] *
             state.core_insulation_log_ratios[phase]
+        if count == 1
+            internal[core, core] = core_impedance + core_insulation
+            continue
+        end
+        sheath = layout.layer_indices[phase][2]
         sheath_inner, sheath_outer, sheath_mutual =
             _nested_cable_hollow_conductor_impedances(
                 state.sheath_inner_diffusion_factors[phase],
@@ -181,8 +217,21 @@ function _nested_cable_internal_impedance_matrix(
                 radii[phase, 4],
                 frequency,
             )
-        sheath_insulation = dielectric_scale * insulation_permeability[phase, 2] *
+        sheath_insulation = magnetic_scale * insulation_permeability[phase, 2] *
             state.sheath_insulation_log_ratios[phase]
+        if count == 2
+            outer_path = sheath_outer + sheath_insulation
+            core_sheath =
+                _nested_cable_nonnegative_resistance(outer_path - sheath_mutual)
+            internal[core, core] =
+                core_impedance + core_insulation + sheath_inner +
+                outer_path - 2.0 * sheath_mutual
+            internal[sheath, sheath] = outer_path
+            internal[core, sheath] = core_sheath
+            internal[sheath, core] = core_sheath
+            continue
+        end
+        armor = layout.layer_indices[phase][3]
         armor_inner, armor_outer, armor_mutual =
             _nested_cable_hollow_conductor_impedances(
                 state.armor_inner_diffusion_factors[phase],
@@ -195,9 +244,6 @@ function _nested_cable_internal_impedance_matrix(
             )
         inner_path = core_impedance + core_insulation + sheath_inner
         middle_path = sheath_outer + sheath_insulation + armor_inner
-        # The external field starts at the outer cable boundary used by the
-        # underground earth-return term, so the armor-to-boundary insulation
-        # must not be counted again in the concentric internal impedance.
         outer_path = armor_outer
         armor_loop = outer_path - 2.0 * armor_mutual
         core_armor = _nested_cable_nonnegative_resistance(outer_path - armor_mutual)
@@ -219,7 +265,7 @@ end
 
 function _nested_cable_earth_impedance_matrix(
     geometry::CableGeometryConstants,
-    total_conductor_count::Int,
+    phase_by_conductor::Vector{Int},
     frequency::Float64,
     earth_resistivity::Float64,
 )
@@ -233,44 +279,276 @@ function _nested_cable_earth_impedance_matrix(
             frequency,
         )
     end
-    phases = geometry.phase_count
+    total_conductor_count = length(phase_by_conductor)
     earth = Matrix{ComplexF64}(undef, total_conductor_count, total_conductor_count)
     for row in 1:total_conductor_count, column in 1:total_conductor_count
-        earth[row, column] = phase_earth[mod1(row, phases), mod1(column, phases)]
+        row_phase = phase_by_conductor[row]
+        column_phase = phase_by_conductor[column]
+        row_geometry =
+            geometry.conductor_count == 1 ? 1 :
+            row_phase == 0 ? geometry.conductor_count : row_phase
+        column_geometry =
+            geometry.conductor_count == 1 ? 1 :
+            column_phase == 0 ? geometry.conductor_count : column_phase
+        1 <= row_geometry <= geometry.conductor_count &&
+            1 <= column_geometry <= geometry.conductor_count ||
+            throw(ArgumentError("nested cable earth-return geometry does not cover every conductor phase"))
+        earth[row, column] = phase_earth[row_geometry, column_geometry]
     end
     return earth
 end
 
+function _nested_pipe_cavity_log_matrix(
+    state::CablePipeSheathDerivedState,
+    radii::Matrix{Float64},
+    layer_counts::Vector{Int},
+)
+    phase_count = state.phase_count
+    pipe_radius = state.pipe_radii_m[1]
+    coordinates = ComplexF64[
+        state.conductor_pipe_center_distances_m[phase] *
+        cis(state.conductor_angles_rad[phase])
+        for phase in 1:phase_count
+    ]
+    outer_boundaries = Float64[
+        radii[phase, 2 * layer_counts[phase] + 1] for phase in 1:phase_count
+    ]
+    all(
+        abs(coordinates[phase]) + outer_boundaries[phase] < pipe_radius
+        for phase in 1:phase_count
+    ) || throw(ArgumentError("cable outer boundaries must lie inside the pipe"))
+    values = zeros(Float64, phase_count, phase_count)
+    for row in 1:phase_count, column in 1:phase_count
+        if row == column
+            numerator = pipe_radius^2 - abs2(coordinates[row])
+            denominator = pipe_radius * outer_boundaries[row]
+        else
+            numerator =
+                abs(pipe_radius^2 - coordinates[row] * conj(coordinates[column]))
+            denominator =
+                pipe_radius * abs(coordinates[row] - coordinates[column])
+        end
+        numerator > denominator > 0.0 ||
+            throw(ArgumentError("pipe-cavity potential coefficient must be positive"))
+        values[row, column] = log(numerator / denominator)
+    end
+    return 0.5 .* (values .+ transpose(values))
+end
+
+function _nested_pipe_wall_proximity_impedance_matrix(
+    state::CablePipeSheathDerivedState,
+    frequency::Float64;
+    term_count::Int=19,
+)
+    term_count >= 1 ||
+        throw(ArgumentError("pipe-wall proximity term count must be positive"))
+    pipe_radius = state.pipe_radii_m[1]
+    normalized_distances =
+        state.conductor_pipe_center_distances_m ./ pipe_radius
+    all(distance -> 0.0 <= distance < 1.0, normalized_distances) ||
+        throw(ArgumentError("pipe-wall proximity distances must lie inside the pipe"))
+    omega = 2.0 * pi * frequency
+    sqrt_jw = sqrt(ComplexF64(0.0, omega))
+    inner_diffusion_factor =
+        pipe_radius *
+        sqrt(
+            LINE_VACUUM_PERMEABILITY_H_PER_M /
+            state.pipe_resistivity_ohm_m *
+            state.pipe_relative_permeability,
+        )
+    inner_argument = ComplexF64(inner_diffusion_factor) * sqrt_jw
+    scaled = abs(inner_argument) > 10.0
+    _, _, k0, k1 =
+        _line_skin_effect_bessel_i0_i1_k0_k1(inner_argument, scaled)
+    k1 != 0.0 + 0.0im ||
+        throw(ArgumentError("pipe-wall proximity Bessel K1 must be nonzero"))
+    bessel_ratios = Vector{ComplexF64}(undef, term_count)
+    ratio = k0 / k1
+    for order in 1:term_count
+        bessel_ratios[order] = ratio
+        ratio = inv(ratio + 2.0 * order / inner_argument)
+    end
+
+    phase_count = state.phase_count
+    correction = zeros(ComplexF64, phase_count, phase_count)
+    for row in 1:phase_count, column in row:phase_count
+        radial_product =
+            normalized_distances[row] * normalized_distances[column]
+        angle =
+            state.conductor_angles_rad[column] -
+            state.conductor_angles_rad[row]
+        value = 0.0 + 0.0im
+        radial_power = radial_product
+        for order in 1:term_count
+            denominator =
+                order * (state.pipe_relative_permeability + 1.0) +
+                inner_argument * bessel_ratios[order]
+            denominator != 0.0 + 0.0im ||
+                throw(ArgumentError("pipe-wall proximity denominator must be nonzero"))
+            value += radial_power * cos(order * angle) / denominator
+            radial_power *= radial_product
+        end
+        correction[row, column] = value
+        correction[column, row] = value
+    end
+    magnetic_scale =
+        ComplexF64(
+            0.0,
+            omega * LINE_VACUUM_PERMEABILITY_H_PER_M / (2.0 * pi),
+        )
+    return (
+        2.0 *
+        state.pipe_relative_permeability *
+        magnetic_scale .*
+        correction
+    )
+end
+
+function _nested_pipe_series_coupling!(
+    series::Matrix{ComplexF64},
+    state::CablePipeSheathDerivedState,
+    radii::Matrix{Float64},
+    resistivity::Matrix{Float64},
+    conductor_permeability::Matrix{Float64},
+    insulation_permeability::Matrix{Float64},
+    frequency::Float64,
+    layer_counts::Vector{Int},
+    layout,
+)
+    cavity = _nested_pipe_cavity_log_matrix(state, radii, layer_counts)
+    wall_proximity =
+        _nested_pipe_wall_proximity_impedance_matrix(state, frequency)
+    omega = 2.0 * pi * frequency
+    magnetic_scale =
+        ComplexF64(0.0, omega * LINE_VACUUM_PERMEABILITY_H_PER_M / (2.0 * pi))
+    for row in 1:layout.cable_conductor_count,
+        column in 1:layout.cable_conductor_count
+        row_phase = layout.phase_by_conductor[row]
+        column_phase = layout.phase_by_conductor[column]
+        value = cavity[row_phase, column_phase]
+        if row_phase == column_phase && layer_counts[row_phase] == 3
+            layer = layer_counts[row_phase]
+            value += insulation_permeability[row_phase, layer] *
+                log(
+                    radii[row_phase, 2 * layer + 1] /
+                    radii[row_phase, 2 * layer],
+                )
+        end
+        series[row, column] +=
+            magnetic_scale * value +
+            wall_proximity[row_phase, column_phase]
+    end
+    pipe_inner_factor =
+        state.pipe_radii_m[1] *
+        sqrt(
+            LINE_VACUUM_PERMEABILITY_H_PER_M /
+            state.pipe_resistivity_ohm_m *
+            state.pipe_relative_permeability,
+        )
+    pipe_outer_factor =
+        state.pipe_radii_m[2] *
+        sqrt(
+            LINE_VACUUM_PERMEABILITY_H_PER_M /
+            state.pipe_resistivity_ohm_m *
+            state.pipe_relative_permeability,
+        )
+    pipe_inner, pipe_outer, pipe_mutual =
+        _nested_cable_hollow_conductor_impedances(
+            pipe_inner_factor,
+            pipe_outer_factor,
+            state.pipe_relative_permeability,
+            state.pipe_resistivity_ohm_m,
+            state.pipe_radii_m[1],
+            state.pipe_radii_m[2],
+            frequency,
+        )
+    pipe_outer_insulation =
+        magnetic_scale *
+        log(state.pipe_radii_m[3] / state.pipe_radii_m[2])
+    cable_common =
+        pipe_inner + pipe_outer - 2.0 * pipe_mutual +
+        pipe_outer_insulation
+    cable_pipe =
+        pipe_outer - pipe_mutual + pipe_outer_insulation
+    for row in 1:layout.cable_conductor_count,
+        column in 1:layout.cable_conductor_count
+        series[row, column] += cable_common
+    end
+    pipe_index = layout.pipe_index
+    for conductor in 1:layout.cable_conductor_count
+        series[conductor, pipe_index] += cable_pipe
+        series[pipe_index, conductor] += cable_pipe
+    end
+    series[pipe_index, pipe_index] += pipe_outer + pipe_outer_insulation
+    return series
+end
+
 function _nested_cable_admittance_matrix(
+    state::CablePipeSheathDerivedState,
     radii::Matrix{Float64},
     insulation_permittivity::Matrix{Float64},
     frequency::Float64,
+    layer_counts::Vector{Int},
+    layout,
 )
-    phases = size(radii, 1)
-    total = 3 * phases
-    capacitance = zeros(Float64, total, total)
-    for phase in 1:phases
-        core = phase
-        sheath = phases + phase
-        armor = 2 * phases + phase
-        layer_capacitances = (
-            2.0 * pi * LINE_VACUUM_PERMITTIVITY_F_PER_M * insulation_permittivity[phase, 1] /
-                log(radii[phase, 3] / radii[phase, 2]),
-            2.0 * pi * LINE_VACUUM_PERMITTIVITY_F_PER_M * insulation_permittivity[phase, 2] /
-                log(radii[phase, 5] / radii[phase, 4]),
-            2.0 * pi * LINE_VACUUM_PERMITTIVITY_F_PER_M * insulation_permittivity[phase, 3] /
-                log(radii[phase, 7] / radii[phase, 6]),
-        )
-        for (first, second, value) in (
-            (core, sheath, layer_capacitances[1]),
-            (sheath, armor, layer_capacitances[2]),
-        )
+    capacitance =
+        zeros(Float64, layout.total_conductor_count, layout.total_conductor_count)
+    outer_indices = Int[]
+    for phase in 1:state.phase_count
+        count = layer_counts[phase]
+        phase_indices = layout.layer_indices[phase]
+        for layer in 1:(count - 1)
+            first = phase_indices[layer]
+            second = phase_indices[layer + 1]
+            value =
+                2.0 * pi * LINE_VACUUM_PERMITTIVITY_F_PER_M *
+                insulation_permittivity[phase, layer] /
+                log(radii[phase, 2 * layer + 1] / radii[phase, 2 * layer])
             capacitance[first, first] += value
             capacitance[second, second] += value
             capacitance[first, second] -= value
             capacitance[second, first] -= value
         end
-        capacitance[armor, armor] += layer_capacitances[3]
+        push!(outer_indices, phase_indices[end])
+    end
+    if state.cable_kind == :pipe_type_cable
+        potential =
+            _nested_pipe_cavity_log_matrix(state, radii, layer_counts) ./
+            state.pipe_inner_insulator_relative_permittivity
+        for phase in 1:state.phase_count
+            layer = layer_counts[phase]
+            potential[phase, phase] +=
+                log(
+                    radii[phase, 2 * layer + 1] /
+                    radii[phase, 2 * layer],
+                ) / insulation_permittivity[phase, layer]
+        end
+        potential ./= 2.0 * pi * LINE_VACUUM_PERMITTIVITY_F_PER_M
+        outer_capacitance = inv(Symmetric(potential))
+        pipe_index = layout.pipe_index
+        for row in 1:state.phase_count, column in 1:state.phase_count
+            value = outer_capacitance[row, column]
+            capacitance[outer_indices[row], outer_indices[column]] += value
+            capacitance[outer_indices[row], pipe_index] -= value
+            capacitance[pipe_index, outer_indices[column]] -= value
+            capacitance[pipe_index, pipe_index] += value
+        end
+        capacitance[pipe_index, pipe_index] +=
+            2.0 * pi * LINE_VACUUM_PERMITTIVITY_F_PER_M *
+            state.pipe_outer_insulator_relative_permittivity /
+            log(state.pipe_radii_m[3] / state.pipe_radii_m[2])
+    else
+        for phase in 1:state.phase_count
+            layer = layer_counts[phase]
+            value =
+                2.0 * pi * LINE_VACUUM_PERMITTIVITY_F_PER_M *
+                insulation_permittivity[phase, layer] /
+                log(
+                    radii[phase, 2 * layer + 1] /
+                    radii[phase, 2 * layer],
+                )
+            capacitance[outer_indices[phase], outer_indices[phase]] += value
+        end
     end
     return ComplexF64.(0.0, 2.0 * pi * frequency .* capacitance)
 end
@@ -341,17 +619,26 @@ function nested_cable_frequency_state(
     earth_resistivity_ohm_m::Real;
     layer_counts::AbstractVector{<:Integer} = fill(3, state.phase_count),
 )
-    state.cable_kind == :non_pipe_cable ||
-        throw(ArgumentError("nested cable frequency state currently requires single-core concentric cables"))
+    state.cable_kind in (:non_pipe_cable, :pipe_type_cable) ||
+        throw(ArgumentError("nested cable frequency state requires a non-pipe or pipe-type cable"))
     phases = state.phase_count
+    counts = Int.(layer_counts)
+    length(counts) == phases && all(count -> 1 <= count <= 3, counts) ||
+        throw(ArgumentError("nested cable layer counts must cover every phase with one to three layers"))
+    include_pipe = state.cable_kind == :pipe_type_cable
+    layout = _nested_cable_layer_layout(counts; include_pipe = include_pipe)
     total = state.conductor_count
-    total == 3 * phases || throw(ArgumentError("nested cable frequency state requires core, sheath, and armor per phase"))
-    state.selected_grounded_conductor_count == 2 * phases ||
-        throw(ArgumentError("nested cable frequency state requires grounded armor conductors"))
-    length(layer_counts) == phases && all(==(3), layer_counts) ||
-        throw(ArgumentError("nested cable frequency state requires three layers per phase"))
-    geometry.phase_count == phases && geometry.conductor_count == phases ||
-        throw(ArgumentError("nested cable outer geometry must contain one conductor per phase"))
+    layout.total_conductor_count == total ||
+        throw(ArgumentError("nested cable conductor count does not match its layer and pipe layout"))
+    if include_pipe
+        state.pipe_return_included && state.pipe_count == 1 ||
+            throw(ArgumentError("pipe-type cable frequency state requires one owned return pipe"))
+        geometry.phase_count == 1 && geometry.conductor_count == 1 ||
+            throw(ArgumentError("pipe-type cable outer geometry must contain the single enclosing pipe"))
+    else
+        geometry.phase_count == phases && geometry.conductor_count == phases ||
+            throw(ArgumentError("non-pipe cable outer geometry must contain one conductor per phase"))
+    end
     frequency = _checked_line_positive(frequency_hz, "nested cable frequency_hz")
     earth_resistivity = _checked_line_positive(earth_resistivity_ohm_m, "nested cable earth_resistivity_ohm_m")
     radii = _checked_line_real_matrix(boundary_radii_m, phases, 7, "boundary_radii_m")
@@ -374,12 +661,18 @@ function nested_cable_frequency_state(
         3,
         "insulation_relative_permittivity",
     )
-    all(>(0.0), radii) && all(>(0.0), resistivity) &&
-        all(>(0.0), conductor_permeability) && all(>(0.0), insulation_permeability) &&
-        all(>(0.0), insulation_permittivity) ||
-        throw(ArgumentError("nested cable radii and material values must be positive"))
-    all(phase -> all(diff(radii[phase, :]) .> 0.0), 1:phases) ||
-        throw(ArgumentError("nested cable boundary radii must be strictly increasing"))
+    for phase in 1:phases
+        layer_count = counts[phase]
+        active_radii = @view radii[phase, 1:(2 * layer_count + 1)]
+        first(active_radii) >= 0.0 && all(>(0.0), @view(active_radii[2:end])) &&
+            all(diff(active_radii) .> 0.0) ||
+            throw(ArgumentError("active nested cable boundary radii must be nonnegative and strictly increasing"))
+        all(>(0.0), @view(resistivity[phase, 1:layer_count])) &&
+            all(>(0.0), @view(conductor_permeability[phase, 1:layer_count])) &&
+            all(>(0.0), @view(insulation_permeability[phase, 1:layer_count])) &&
+            all(>(0.0), @view(insulation_permittivity[phase, 1:layer_count])) ||
+            throw(ArgumentError("active nested cable material values must be positive"))
+    end
 
     internal = _nested_cable_internal_impedance_matrix(
         state,
@@ -388,24 +681,50 @@ function nested_cable_frequency_state(
         conductor_permeability,
         insulation_permeability,
         frequency,
+        counts,
+        layout,
+    )
+    include_pipe && _nested_pipe_series_coupling!(
+        internal,
+        state,
+        radii,
+        resistivity,
+        conductor_permeability,
+        insulation_permeability,
+        frequency,
+        counts,
+        layout,
     )
     earth = _nested_cable_earth_impedance_matrix(
         geometry,
-        total,
+        layout.phase_by_conductor,
         frequency,
         earth_resistivity,
     )
     unreduced_series = internal + earth
     active = state.selected_grounded_conductor_count
+    1 <= active <= total ||
+        throw(ArgumentError("nested cable frequency state requires at least one active conductor"))
     active_indices = 1:active
     grounded_indices = (active + 1):total
-    reduced_series = Matrix{ComplexF64}(
-        unreduced_series[active_indices, active_indices] -
-        unreduced_series[active_indices, grounded_indices] *
-        (unreduced_series[grounded_indices, grounded_indices] \
-            unreduced_series[grounded_indices, active_indices]),
+    reduced_series = if isempty(grounded_indices)
+        Matrix{ComplexF64}(unreduced_series[active_indices, active_indices])
+    else
+        Matrix{ComplexF64}(
+            unreduced_series[active_indices, active_indices] -
+            unreduced_series[active_indices, grounded_indices] *
+            (unreduced_series[grounded_indices, grounded_indices] \
+                unreduced_series[grounded_indices, active_indices]),
+        )
+    end
+    unreduced_shunt = _nested_cable_admittance_matrix(
+        state,
+        radii,
+        insulation_permittivity,
+        frequency,
+        counts,
+        layout,
     )
-    unreduced_shunt = _nested_cable_admittance_matrix(radii, insulation_permittivity, frequency)
     reduced_shunt = Matrix{ComplexF64}(unreduced_shunt[active_indices, active_indices])
     zy, solution, modal_series, modal_shunt, characteristic_impedance,
         characteristic_admittance, attenuation, velocity, diagonalization_error =
@@ -418,9 +737,14 @@ function nested_cable_frequency_state(
     ))
     capacitance = Matrix{Float64}(imag.(reduced_shunt) ./ (2.0 * pi * frequency))
     capacitance_minimum_eigenvalue = minimum(eigvals(Symmetric(capacitance)))
-    core_row_sum_error = maximum(abs.(vec(sum(capacitance[1:phases, :]; dims = 2))))
-    sheath_row_sums = vec(sum(capacitance[(phases + 1):active, :]; dims = 2))
-    admittance_balance_passed = core_row_sum_error <= 1.0e-18 && all(>(0.0), sheath_row_sums)
+    capacitance_row_sums = vec(sum(capacitance; dims = 2))
+    balance_tolerance = max(
+        1.0e-18,
+        100.0 * eps(Float64) * maximum(abs, capacitance; init = 0.0),
+    )
+    admittance_balance_passed =
+        all(>=(-balance_tolerance), capacitance_row_sums) &&
+        sum(capacitance_row_sums) > balance_tolerance
     finite_modal = all(isfinite, attenuation) && all(isfinite, velocity) && all(>(0.0), velocity)
     physical_checks = symmetry_error <= 1.0e-12 &&
         capacitance_minimum_eigenvalue >= -1.0e-18 &&
@@ -441,7 +765,7 @@ function nested_cable_frequency_state(
         characteristic_admittance,
         attenuation,
         velocity,
-        true,
+        !isempty(grounded_indices),
         true,
         true,
         true,

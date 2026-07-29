@@ -36,6 +36,7 @@ function _electromagnetic_history_execution_plan(system::NodalSystem)
     series_rlc_branches = SeriesRLCBranch[]
     capacitor_branches = CapacitorBranch[]
     coupled_inductive_branches = CoupledInductiveBranch[]
+    coupled_series_rl_branches = CoupledSeriesRLBranch[]
     breqiv_injections = BreqivHistoryInjection[]
     for (element_index, element) in enumerate(system.elements)
         kind = if element isa SeriesRLBranch
@@ -50,6 +51,9 @@ function _electromagnetic_history_execution_plan(system::NodalSystem)
         elseif element isa CoupledInductiveBranch
             push!(coupled_inductive_branches, element)
             COUPLED_INDUCTIVE_HISTORY
+        elseif element isa CoupledSeriesRLBranch
+            push!(coupled_series_rl_branches, element)
+            COUPLED_SERIES_RL_HISTORY
         elseif element isa BreqivHistoryInjection
             push!(breqiv_injections, element)
             BREQIV_HISTORY
@@ -66,6 +70,8 @@ function _electromagnetic_history_execution_plan(system::NodalSystem)
             length(capacitor_branches)
         elseif kind == COUPLED_INDUCTIVE_HISTORY
             length(coupled_inductive_branches)
+        elseif kind == COUPLED_SERIES_RL_HISTORY
+            length(coupled_series_rl_branches)
         else
             length(breqiv_injections)
         end)
@@ -78,6 +84,7 @@ function _electromagnetic_history_execution_plan(system::NodalSystem)
         series_rlc_branches,
         capacitor_branches,
         coupled_inductive_branches,
+        coupled_series_rl_branches,
         breqiv_injections,
     )
 end
@@ -648,6 +655,33 @@ function _deck_current_source_seed_clear_nodes(parsed::DeckParser.DeckParseResul
     )
 end
 
+function _steady_state_terminal_frequency_hz(
+    partition::DeckParser.DeckSteadyStateFrequencyPartition,
+    node_indices,
+    default_frequency_hz::Float64,
+)
+    frequency_hz = nothing
+    for node in node_indices
+        node_index = abs(Int(node))
+        node_index == 0 && continue
+        1 <= node_index <= length(partition.node_frequencies_hz) ||
+            throw(ArgumentError("steady-state terminal is outside the frequency partition"))
+        node_frequency_hz = partition.node_frequencies_hz[node_index]
+        node_frequency_hz == 0.0 && continue
+        if frequency_hz === nothing
+            frequency_hz = node_frequency_hz
+        elseif !isapprox(
+            frequency_hz,
+            node_frequency_hz;
+            atol=1.0e-12,
+            rtol=1.0e-12,
+        )
+            throw(ArgumentError("coupled steady-state terminals have different frequencies"))
+        end
+    end
+    return frequency_hz === nothing ? default_frequency_hz : frequency_hz
+end
+
 function _deck_source_voltage_phasor(row)
     if row.iform == 11
         return complex(Float64(row.crest), 0.0)
@@ -661,7 +695,8 @@ function _stamp_deck_branch_steady_state_admittance!(
     matrix::AbstractMatrix{ComplexF64},
     parsed::DeckParser.DeckParseResult,
     frequency_partition::DeckParser.DeckSteadyStateFrequencyPartition=
-        DeckParser.deck_steady_state_frequency_partition(parsed),
+        DeckParser.deck_steady_state_frequency_partition(parsed);
+    excluded_universal_machine_indices::AbstractVector{<:Integer}=Int[],
 )
     default_frequency_hz = _deck_steady_state_frequency_hz(parsed)
     for row in DeckParser.deck_over2_branch_rows(parsed)
@@ -698,6 +733,7 @@ function _stamp_deck_branch_steady_state_admittance!(
         end
     end
     for row in DeckParser.deck_universal_machine_generated_branch_rows(parsed)
+        row.machine_index in excluded_universal_machine_indices && continue
         row.reactance === missing && continue
         frequency_hz = DeckParser.deck_node_steady_state_frequency_hz(
             frequency_partition,
@@ -753,20 +789,17 @@ end
 function _stamp_deck_induction_machine_steady_state_admittance!(
     matrix::AbstractMatrix{ComplexF64},
     parsed::DeckParser.DeckParseResult,
+    frequency_partition::DeckParser.DeckSteadyStateFrequencyPartition=
+        DeckParser.deck_steady_state_frequency_partition(parsed),
 )
     definitions = DeckParser.deck_universal_machine_definition_rows(parsed)
     terminals = DeckParser.deck_universal_machine_terminal_rows(parsed)
-    frequency_hz = _deck_steady_state_frequency_hz(parsed)
+    default_frequency_hz = _deck_steady_state_frequency_hz(parsed)
     for machine_index in sort(unique(row.machine_index for row in definitions))
         card1 = _deck_universal_machine_definition(parsed, machine_index, 1)
         card1.machine_type in (3, 4, 5, 6, 7) || continue
         _deck_universal_machine_initialization_mode(parsed) == :manual &&
             continue
-        equivalent = _deck_induction_machine_steady_state_equivalent(
-            parsed,
-            machine_index;
-            frequency_hz = frequency_hz,
-        )
         machine_terminals = sort!(
             [row for row in terminals if row.machine_index == machine_index];
             by = row -> row.terminal_index,
@@ -774,6 +807,19 @@ function _stamp_deck_induction_machine_steady_state_admittance!(
         active_terminals = card1.machine_type in (6, 7) ?
             machine_terminals[3:3] :
             card1.machine_type == 5 ? machine_terminals[2:3] : machine_terminals[1:3]
+        frequency_hz = _steady_state_terminal_frequency_hz(
+            frequency_partition,
+            vcat(
+                [row.terminal_node_value for row in active_terminals],
+                [row.reference_node_value for row in active_terminals],
+            ),
+            default_frequency_hz,
+        )
+        equivalent = _deck_induction_machine_steady_state_equivalent(
+            parsed,
+            machine_index;
+            frequency_hz = frequency_hz,
+        )
         for row in active_terminals
             _stamp_complex_branch_admittance!(
                 matrix,
@@ -898,6 +944,8 @@ function _steady_state_closed_switch_representatives(
     parsed::DeckParser.DeckParseResult,
     node_count::Int,
     time_s::Union{Nothing,Float64}=nothing,
+    ;
+    additional_closed_node_pairs::AbstractVector{<:Tuple}=Tuple{Int,Int}[],
 )
     representatives = collect(1:node_count)
 
@@ -936,6 +984,16 @@ function _steady_state_closed_switch_representatives(
         from_node = Int(row.from_node_value)
         to_node = Int(row.to_node_value)
         (from_node == 0 || to_node == 0) && continue
+        union_nodes(from_node, to_node)
+    end
+    for pair in additional_closed_node_pairs
+        length(pair) == 2 ||
+            throw(ArgumentError("additional steady-state closed-node pair must contain two nodes"))
+        from_node = Int(pair[1])
+        to_node = Int(pair[2])
+        (from_node == 0 || to_node == 0) && continue
+        1 <= from_node <= node_count && 1 <= to_node <= node_count ||
+            throw(ArgumentError("additional steady-state closed-node pair is outside the network"))
         union_nodes(from_node, to_node)
     end
 
@@ -1028,10 +1086,21 @@ end
 function _stamp_coupled_lumped_sequence_steady_state_admittance!(
     matrix::AbstractMatrix{ComplexF64},
     parsed::DeckParser.DeckParseResult,
+    frequency_partition::DeckParser.DeckSteadyStateFrequencyPartition=
+        DeckParser.deck_steady_state_frequency_partition(parsed),
 )
+    default_frequency_hz = _deck_steady_state_frequency_hz(parsed)
+    input_frequency_hz = DeckParser.deck_fixed_time_horizon_options(parsed).x_frequency_hz
+    input_frequency_hz > 0.0 || (input_frequency_hz = default_frequency_hz)
     for impedance in DeckParser.deck_coupled_lumped_sequence_impedances(parsed)
+        frequency_hz = _steady_state_terminal_frequency_hz(
+            frequency_partition,
+            vcat(impedance.from_node_indices, impedance.to_node_indices),
+            default_frequency_hz,
+        )
         phase_impedance = ComplexF64.(
             impedance.phase_resistance_matrix,
+            (frequency_hz / input_frequency_hz) .*
             impedance.phase_inductance_matrix,
         )
         _stamp_complex_phase_admittance!(
@@ -1062,9 +1131,17 @@ end
 function _stamp_generator_equivalent_steady_state_admittance!(
     matrix::AbstractMatrix{ComplexF64},
     parsed::DeckParser.DeckParseResult,
+    frequency_partition::DeckParser.DeckSteadyStateFrequencyPartition=
+        DeckParser.deck_steady_state_frequency_partition(parsed),
 )
-    angular_frequency = 2.0 * pi * _deck_steady_state_frequency_hz(parsed)
+    default_frequency_hz = _deck_steady_state_frequency_hz(parsed)
     for row in DeckParser.deck_generator_equivalent_rows(parsed)
+        frequency_hz = _steady_state_terminal_frequency_hz(
+            frequency_partition,
+            vcat(row.from_node_indices, row.to_node_indices),
+            default_frequency_hz,
+        )
+        angular_frequency = 2.0 * pi * frequency_hz
         nph = length(row.from_node_indices)
         zero_admittance = sum(
             _generator_equivalent_modal_admittance(branch_row.branch, angular_frequency)
@@ -1094,9 +1171,17 @@ end
 function _stamp_coupled_lumped_phase_pi_steady_state_admittance!(
     matrix::AbstractMatrix{ComplexF64},
     parsed::DeckParser.DeckParseResult,
+    frequency_partition::DeckParser.DeckSteadyStateFrequencyPartition=
+        DeckParser.deck_steady_state_frequency_partition(parsed),
 )
-    angular_frequency = 2.0 * pi * _deck_steady_state_frequency_hz(parsed)
+    default_frequency_hz = _deck_steady_state_frequency_hz(parsed)
     for section in DeckParser.deck_coupled_lumped_phase_pi_sections(parsed)
+        frequency_hz = _steady_state_terminal_frequency_hz(
+            frequency_partition,
+            vcat(section.from_node_indices, section.to_node_indices),
+            default_frequency_hz,
+        )
+        angular_frequency = 2.0 * pi * frequency_hz
         phase_impedance = ComplexF64.(
             section.phase_resistance_matrix,
             angular_frequency .* section.phase_inductance_matrix,
@@ -1128,11 +1213,32 @@ end
 function _stamp_cascaded_phase_pi_steady_state_admittance!(
     matrix::AbstractMatrix{ComplexF64},
     parsed::DeckParser.DeckParseResult,
+    frequency_partition::DeckParser.DeckSteadyStateFrequencyPartition=
+        DeckParser.deck_steady_state_frequency_partition(parsed),
 )
+    default_frequency_hz = _deck_steady_state_frequency_hz(parsed)
     for equivalent in DeckParser.deck_cascaded_phase_pi_equivalents(parsed)
+        frequency_hz = _steady_state_terminal_frequency_hz(
+            frequency_partition,
+            vcat(equivalent.from_node_indices, equivalent.to_node_indices),
+            default_frequency_hz,
+        )
+        frequency_equivalent =
+            isapprox(
+                equivalent.frequency_hz,
+                frequency_hz;
+                atol = 1.0e-12,
+                rtol = 1.0e-12,
+            ) ?
+            equivalent :
+            cascaded_phase_pi_equivalent(
+                equivalent.name,
+                equivalent.blocks,
+                frequency_hz,
+            )
         node_indices = vcat(
-            equivalent.from_node_indices,
-            equivalent.to_node_indices,
+            frequency_equivalent.from_node_indices,
+            frequency_equivalent.to_node_indices,
         )
         for local_column in eachindex(node_indices)
             column = node_indices[local_column]
@@ -1141,7 +1247,10 @@ function _stamp_cascaded_phase_pi_steady_state_admittance!(
                 row = node_indices[local_row]
                 row == 0 && continue
                 matrix[row, column] +=
-                    equivalent.terminal_admittance_s[local_row, local_column]
+                    frequency_equivalent.terminal_admittance_s[
+                        local_row,
+                        local_column,
+                    ]
             end
         end
     end
@@ -1151,15 +1260,26 @@ end
 function _stamp_distributed_line_steady_state_admittance!(
     matrix::AbstractMatrix{ComplexF64},
     parsed::DeckParser.DeckParseResult,
+    frequency_partition::DeckParser.DeckSteadyStateFrequencyPartition=
+        DeckParser.deck_steady_state_frequency_partition(parsed),
 )
-    equivalents = DeckParser.deck_distributed_transposed_line_steady_state_pi_equivalents(parsed)
+    constants_rows = DeckParser.deck_distributed_transposed_line_constants(parsed)
     modal_states = DeckParser.deck_distributed_transposed_line_modal_branch_states(parsed)
-    length(equivalents) == length(modal_states) ||
-        throw(ArgumentError("distributed line pi/modal counts must match"))
     ground_nodes = fill(0, 3)
-    for index in eachindex(equivalents)
-        equivalent = equivalents[index]
+    default_frequency_hz = _deck_steady_state_frequency_hz(parsed)
+    for (index, constants) in enumerate(constants_rows)
         modal_state = modal_states[index]
+        frequency_hz = _steady_state_terminal_frequency_hz(
+            frequency_partition,
+            vcat(modal_state.from_node_indices, modal_state.to_node_indices),
+            default_frequency_hz,
+        )
+        equivalent = distributed_transposed_line_steady_state_pi_equivalent(
+            constants;
+            steady_state_frequency_hz = frequency_hz,
+            storage_start_index = 1,
+            name = Symbol("mixed_frequency_distributed_line_pi_", index),
+        )
         _stamp_complex_phase_admittance!(
             matrix,
             modal_state.from_node_indices,
@@ -1179,20 +1299,49 @@ function _stamp_distributed_line_steady_state_admittance!(
             equivalent.phase_shunt_admittance_matrix,
         )
     end
+    for element in parsed.elements
+        element isa ComplexModalBergeronLine || continue
+        frequency_hz = _steady_state_terminal_frequency_hz(
+            frequency_partition,
+            vcat(element.from_nodes, element.to_nodes),
+            default_frequency_hz,
+        )
+        terminal_admittance =
+            complex_modal_bergeron_steady_state_terminal_admittance(
+                element,
+                frequency_hz,
+            )
+        nodes = vcat(element.from_nodes, element.to_nodes)
+        for column in eachindex(nodes), row in eachindex(nodes)
+            row_node = nodes[row]
+            column_node = nodes[column]
+            row_node == 0 && continue
+            column_node == 0 && continue
+            matrix[row_node, column_node] +=
+                terminal_admittance[row, column]
+        end
+    end
     return matrix
 end
 
 function _stamp_semlyen_line_steady_state_admittance!(
     matrix::AbstractMatrix{ComplexF64},
     parsed::DeckParser.DeckParseResult,
+    frequency_partition::DeckParser.DeckSteadyStateFrequencyPartition=
+        DeckParser.deck_steady_state_frequency_partition(parsed),
 )
     options = DeckParser.deck_fixed_time_horizon_options(parsed)
-    frequency_hz = _deck_steady_state_frequency_hz(parsed)
+    default_frequency_hz = _deck_steady_state_frequency_hz(parsed)
     lines = vcat(
         DeckParser.deck_semlyen_line_elements(parsed, options.dt_s),
         DeckParser.deck_rational_frequency_line_elements(parsed, options.dt_s),
     )
     for line in lines
+        frequency_hz = _steady_state_terminal_frequency_hz(
+            frequency_partition,
+            vcat(line.from_nodes, line.to_nodes),
+            default_frequency_hz,
+        )
         terminal_admittance =
             semlyen_line_steady_state_terminal_admittance(line, frequency_hz)
         nodes = vcat(line.from_nodes, line.to_nodes)
@@ -1259,6 +1408,7 @@ function _deck_steady_state_nodal_equations(
     parsed::DeckParser.DeckParseResult,
     node_count::Int;
     include_induction_machines::Bool=true,
+    excluded_universal_machine_indices::AbstractVector{<:Integer}=Int[],
     transformer_admittance=nothing,
     frequency_partition::DeckParser.DeckSteadyStateFrequencyPartition=
         DeckParser.deck_steady_state_frequency_partition(parsed),
@@ -1273,21 +1423,61 @@ function _deck_steady_state_nodal_equations(
         admittance,
         parsed,
         frequency_partition,
+        excluded_universal_machine_indices =
+            excluded_universal_machine_indices,
     )
     include_induction_machines &&
-        _stamp_deck_induction_machine_steady_state_admittance!(admittance, parsed)
+        _stamp_deck_induction_machine_steady_state_admittance!(
+            admittance,
+            parsed,
+            frequency_partition,
+        )
     _stamp_deck_open_switch_steady_state_admittance!(admittance, parsed)
     _stamp_deck_source_steady_state_admittance!(admittance, rhs, parsed)
-    _stamp_coupled_lumped_sequence_steady_state_admittance!(admittance, parsed)
-    _stamp_generator_equivalent_steady_state_admittance!(admittance, parsed)
-    _stamp_coupled_lumped_phase_pi_steady_state_admittance!(admittance, parsed)
-    _stamp_cascaded_phase_pi_steady_state_admittance!(admittance, parsed)
-    _stamp_distributed_line_steady_state_admittance!(admittance, parsed)
-    _stamp_semlyen_line_steady_state_admittance!(admittance, parsed)
+    _stamp_coupled_lumped_sequence_steady_state_admittance!(
+        admittance,
+        parsed,
+        frequency_partition,
+    )
+    _stamp_generator_equivalent_steady_state_admittance!(
+        admittance,
+        parsed,
+        frequency_partition,
+    )
+    _stamp_coupled_lumped_phase_pi_steady_state_admittance!(
+        admittance,
+        parsed,
+        frequency_partition,
+    )
+    _stamp_cascaded_phase_pi_steady_state_admittance!(
+        admittance,
+        parsed,
+        frequency_partition,
+    )
+    _stamp_distributed_line_steady_state_admittance!(
+        admittance,
+        parsed,
+        frequency_partition,
+    )
+    _stamp_semlyen_line_steady_state_admittance!(
+        admittance,
+        parsed,
+        frequency_partition,
+    )
     transformer_admittance === nothing ||
         _stamp_saturated_transformer_steady_state_admittance!(admittance, transformer_admittance)
-    switch_representatives =
-        _steady_state_closed_switch_representatives(parsed, node_count)
+    zeroed_universal_machine_branch_pairs = Tuple{Int,Int}[
+        (row.from_node_value, row.to_node_value)
+        for row in DeckParser.deck_universal_machine_generated_branch_rows(parsed)
+        if row.machine_index in excluded_universal_machine_indices &&
+           row.from_node_value != row.to_node_value
+    ]
+    switch_representatives = _steady_state_closed_switch_representatives(
+        parsed,
+        node_count;
+        additional_closed_node_pairs =
+            zeroed_universal_machine_branch_pairs,
+    )
     return admittance, rhs, switch_representatives
 end
 
@@ -1331,6 +1521,8 @@ end
 function _deck_external_steady_state_voltage_phasors(
     parsed::DeckParser.DeckParseResult,
     current_injections::AbstractDict{<:Integer,<:Complex},
+    ;
+    excluded_universal_machine_indices::AbstractVector{<:Integer}=Int[],
 )
     node_map = Dict{Symbol,Int}(parsed.node_map)
     node_count = maximum(values(node_map); init = 0)
@@ -1338,6 +1530,7 @@ function _deck_external_steady_state_voltage_phasors(
         parsed,
         node_count;
         include_induction_machines = false,
+        excluded_universal_machine_indices,
     )
     for (node_value, injection) in current_injections
         node = Int(node_value)
@@ -1369,16 +1562,20 @@ function deck_steady_state_voltage_phasors(
 )
     node_map = Dict{Symbol,Int}(parsed.node_map)
     frequency_partition = DeckParser.deck_steady_state_frequency_partition(parsed)
-    if saturated_transformer_intake !== nothing &&
-       length(unique(filter(>(0.0), frequency_partition.node_frequencies_hz))) > 1
-        throw(ArgumentError(
-            "mixed-frequency steady state is not yet owned for saturated-transformer topology",
-        ))
-    end
     branch_assembly = nothing
+    transformer_frequency_hz = _deck_steady_state_frequency_hz(parsed)
     if saturated_transformer_intake !== nothing
         arrays = saturated_transformer_nonlinear_arrays(saturated_transformer_intake)
         physical_node_map = _saturated_transformer_physical_node_map(parsed, arrays)
+        transformer_frequency_hz = _steady_state_terminal_frequency_hz(
+            frequency_partition,
+            _saturated_transformer_frequency_node_indices(
+                physical_node_map,
+                arrays,
+                length(frequency_partition.node_frequencies_hz),
+            ),
+            transformer_frequency_hz,
+        )
         branch_assembly = saturated_transformer_winding_branch_assembly(
             arrays,
             physical_node_map;
@@ -1397,7 +1594,7 @@ function deck_steady_state_voltage_phasors(
             physical_node_map;
             nonlinear_winding_number = winding_number,
             reference_node_index = 0,
-            reactance_units = 2.0 * pi * _deck_steady_state_frequency_hz(parsed),
+            reactance_units = 2.0 * pi * transformer_frequency_hz,
         )
     admittance, rhs, switch_representatives = _deck_steady_state_nodal_equations(
         parsed,

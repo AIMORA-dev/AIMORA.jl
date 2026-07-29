@@ -1,13 +1,14 @@
 module Branches
 
 using ..Companion
-using LinearAlgebra: mul!
+using LinearAlgebra: I, Symmetric, cholesky, isposdef, mul!
 
 export ConductanceBranch,
        IdealTransformerVoltageConstraint,
        SeriesRLBranch,
        SeriesRLCBranch,
        CoupledInductiveBranch,
+       CoupledSeriesRLBranch,
        CapacitorBranch,
        GeneratorEquivalentModalBranch,
        BreqivHistoryInjection,
@@ -152,6 +153,86 @@ mutable struct CoupledInductiveBranch <: EMTElement
     history_current_workspace::Vector{Float64}
     port_voltage_workspace::Vector{Float64}
     current_workspace::Vector{Float64}
+end
+
+"""
+    CoupledSeriesRLBranch(a, b, resistance_matrix, inductance_matrix)
+
+An explicitly coupled, passive series R-L branch whose port equation is
+`v = R*i + L*di/dt`. The trapezoidal companion is
+`G = inv(R + 2L/dt)` with history current
+`G * (v_previous + (2L/dt - R) * i_previous)`.
+"""
+mutable struct CoupledSeriesRLBranch <: EMTElement
+    a::Vector{Int}
+    b::Vector{Int}
+    resistance_matrix::Matrix{Float64}
+    inductance_matrix::Matrix{Float64}
+    previous_current::Vector{Float64}
+    previous_voltage::Vector{Float64}
+    last_current::Vector{Float64}
+    conductance_workspace::Matrix{Float64}
+    history_current_workspace::Vector{Float64}
+    port_voltage_workspace::Vector{Float64}
+    current_workspace::Vector{Float64}
+    cached_dt_s::Float64
+end
+
+function _symmetric_coupled_matrix(
+    values::AbstractMatrix{<:Real},
+    port_count::Int,
+    field::AbstractString,
+)
+    size(values) == (port_count, port_count) ||
+        throw(ArgumentError("$field matrix size must match coupled R-L ports"))
+    matrix = Matrix{Float64}(values)
+    all(isfinite, matrix) ||
+        throw(ArgumentError("$field matrix entries must be finite"))
+    tolerance = 64.0 * eps(Float64) * max(maximum(abs, matrix; init=0.0), 1.0)
+    maximum(abs, matrix - transpose(matrix); init=0.0) <= tolerance ||
+        throw(ArgumentError("$field matrix must be symmetric"))
+    return 0.5 .* (matrix .+ transpose(matrix))
+end
+
+function CoupledSeriesRLBranch(
+    a::AbstractVector{<:Integer},
+    b::AbstractVector{<:Integer},
+    resistance_matrix::AbstractMatrix{<:Real},
+    inductance_matrix::AbstractMatrix{<:Real},
+)
+    port_count = length(a)
+    port_count > 0 ||
+        throw(ArgumentError("coupled series R-L branch requires at least one port"))
+    length(b) == port_count ||
+        throw(ArgumentError("coupled series R-L terminal counts must match"))
+    from_nodes = Int.(a)
+    to_nodes = Int.(b)
+    all(>=(0), from_nodes) && all(>=(0), to_nodes) ||
+        throw(ArgumentError("coupled series R-L nodes must be nonnegative"))
+    resistance =
+        _symmetric_coupled_matrix(resistance_matrix, port_count, "resistance")
+    inductance =
+        _symmetric_coupled_matrix(inductance_matrix, port_count, "inductance")
+    resistance_tolerance =
+        64.0 * eps(Float64) * max(maximum(abs, resistance; init=0.0), 1.0)
+    isposdef(Symmetric(resistance + resistance_tolerance * I)) ||
+        throw(ArgumentError("coupled series R-L resistance matrix must be positive semidefinite"))
+    isposdef(Symmetric(inductance)) ||
+        throw(ArgumentError("coupled series R-L inductance matrix must be positive definite"))
+    return CoupledSeriesRLBranch(
+        from_nodes,
+        to_nodes,
+        resistance,
+        inductance,
+        zeros(Float64, port_count),
+        zeros(Float64, port_count),
+        zeros(Float64, port_count),
+        zeros(Float64, port_count, port_count),
+        zeros(Float64, port_count),
+        zeros(Float64, port_count),
+        zeros(Float64, port_count),
+        NaN,
+    )
 end
 
 function CoupledInductiveBranch(
@@ -417,6 +498,43 @@ function branch_companion_snapshot(
     )
 end
 
+function branch_companion_snapshot(
+    b::CoupledSeriesRLBranch,
+    voltage::AbstractVector{Float64},
+    dt::Float64,
+)
+    conductance = _coupled_series_rl_conductance_matrix!(
+        b.conductance_workspace,
+        b,
+        dt,
+    )
+    history_current = _coupled_series_rl_history_current!(
+        b.history_current_workspace,
+        b,
+        conductance,
+        dt,
+    )
+    branch_voltages = _coupled_branch_port_voltages!(
+        b.port_voltage_workspace,
+        voltage,
+        b.a,
+        b.b,
+    )
+    mul!(b.current_workspace, conductance, branch_voltages)
+    b.current_workspace .+= history_current
+    return BranchCompanionSnapshot(
+        :coupled_series_rl,
+        b.a[1],
+        b.b[1],
+        conductance[1, 1],
+        history_current[1],
+        branch_voltages[1],
+        b.current_workspace[1],
+        b.previous_current[1],
+        b.previous_voltage[1],
+    )
+end
+
 function branch_companion_snapshot(b::CapacitorBranch, voltage::AbstractVector{Float64}, dt::Float64)
     g, ih = companion(b, dt)
     vb = branch_voltage(voltage, b.a, b.b)
@@ -455,6 +573,12 @@ branch_current_value(
 
 branch_current_value(
     b::CoupledInductiveBranch,
+    ::AbstractVector{Float64},
+    ::Float64,
+) = b.last_current[1]
+
+branch_current_value(
+    b::CoupledSeriesRLBranch,
     ::AbstractVector{Float64},
     ::Float64,
 ) = b.last_current[1]
@@ -914,6 +1038,40 @@ function _coupled_inductive_history_current!(
     return destination
 end
 
+function _coupled_series_rl_conductance_matrix!(
+    destination::Matrix{Float64},
+    b::CoupledSeriesRLBranch,
+    dt::Float64,
+)
+    dt > 0.0 || throw(ArgumentError("dt must be positive"))
+    size(destination) == size(b.resistance_matrix) ||
+        throw(ArgumentError("coupled series R-L conductance workspace size must match ports"))
+    b.cached_dt_s == dt && return destination
+    companion_impedance =
+        b.resistance_matrix .+ (2.0 / dt) .* b.inductance_matrix
+    factor = cholesky(Symmetric(companion_impedance))
+    destination .= factor \ I
+    b.cached_dt_s = dt
+    return destination
+end
+
+function _coupled_series_rl_history_current!(
+    destination::Vector{Float64},
+    b::CoupledSeriesRLBranch,
+    conductance::AbstractMatrix{Float64},
+    dt::Float64,
+)
+    dt > 0.0 || throw(ArgumentError("dt must be positive"))
+    length(destination) == length(b.previous_current) ||
+        throw(ArgumentError("coupled series R-L history workspace size must match ports"))
+    companion_history =
+        b.previous_voltage .+
+        ((2.0 / dt) .* b.inductance_matrix .- b.resistance_matrix) *
+        b.previous_current
+    mul!(destination, conductance, companion_history)
+    return destination
+end
+
 function _coupled_branch_port_voltages(
     voltage::AbstractVector{Float64},
     a::AbstractVector{Int},
@@ -954,6 +1112,28 @@ function stamp_history_current!(
         dt,
     )
     for index in eachindex(history_current)
+        stamp_history_current!(rhs, b.a[index], b.b[index], history_current[index])
+    end
+    return rhs
+end
+
+function stamp_history_current!(
+    rhs::AbstractVector{Float64},
+    b::CoupledSeriesRLBranch,
+    dt::Float64,
+)
+    conductance = _coupled_series_rl_conductance_matrix!(
+        b.conductance_workspace,
+        b,
+        dt,
+    )
+    history_current = _coupled_series_rl_history_current!(
+        b.history_current_workspace,
+        b,
+        conductance,
+        dt,
+    )
+    @inbounds for index in eachindex(history_current)
         stamp_history_current!(rhs, b.a[index], b.b[index], history_current[index])
     end
     return rhs
@@ -1058,6 +1238,34 @@ function stamp!(y, rhs, b::CoupledInductiveBranch, t::Float64, dt::Float64)
     return nothing
 end
 
+function stamp!(y, rhs, b::CoupledSeriesRLBranch, t::Float64, dt::Float64)
+    conductance = _coupled_series_rl_conductance_matrix!(
+        b.conductance_workspace,
+        b,
+        dt,
+    )
+    for col in eachindex(b.a), row in eachindex(b.a)
+        stamp_admittance_entry!(
+            y,
+            b.a[row],
+            b.b[row],
+            b.a[col],
+            b.b[col],
+            conductance[row, col],
+        )
+    end
+    history_current = _coupled_series_rl_history_current!(
+        b.history_current_workspace,
+        b,
+        conductance,
+        dt,
+    )
+    for index in eachindex(history_current)
+        stamp_history_current!(rhs, b.a[index], b.b[index], history_current[index])
+    end
+    return nothing
+end
+
 function stamp!(y, rhs, b::CapacitorBranch, t::Float64, dt::Float64)
     g, ih = companion(b, dt)
     stamp_conductance!(y, b.a, b.b, g)
@@ -1154,6 +1362,31 @@ function update!(b::CoupledInductiveBranch, v, dt::Float64)
     @inbounds @simd for index in eachindex(b.last_current, history_current)
         b.last_current[index] += history_current[index]
     end
+    copyto!(b.previous_voltage, voltage)
+    copyto!(b.previous_current, b.last_current)
+    return nothing
+end
+
+function update!(b::CoupledSeriesRLBranch, v, dt::Float64)
+    conductance = _coupled_series_rl_conductance_matrix!(
+        b.conductance_workspace,
+        b,
+        dt,
+    )
+    history_current = _coupled_series_rl_history_current!(
+        b.history_current_workspace,
+        b,
+        conductance,
+        dt,
+    )
+    voltage = _coupled_branch_port_voltages!(
+        b.port_voltage_workspace,
+        v,
+        b.a,
+        b.b,
+    )
+    mul!(b.last_current, conductance, voltage)
+    b.last_current .+= history_current
     copyto!(b.previous_voltage, voltage)
     copyto!(b.previous_current, b.last_current)
     return nothing
