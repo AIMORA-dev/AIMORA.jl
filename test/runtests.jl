@@ -238,26 +238,26 @@ end
                                transformer_short_circuit_parameters
 end
 
-@testset "retired input-converter dispositions" begin
-    parsed = AIMORA.DeckParser.parse_deck_lines(
-        [
-            "BEGIN NEW DATA CASE",
-            "CS",
-            "CZ",
-            "BLANK CARD TERMINATING THE CASE",
-        ];
-        source = "retired-input-converter-contract",
-    )
-    @test AIMORA.ValidationCore.is_valid(parsed.validation)
-    auxiliary = AIMORA.EMTStudy.run_deck_auxiliary_studies(parsed)
-    @test auxiliary.compatibility_exclusions == [
-        :pre_m37_zinc_oxide_card_converter,
-        :pre_m37_switch_pseudononlinear_card_converter,
-    ]
-    @test isempty(auxiliary.deferred_requests)
-end
-
 if AIMORA.solver_available()
+    @testset "retired input-converter dispositions" begin
+        parsed = AIMORA.DeckParser.parse_deck_lines(
+            [
+                "BEGIN NEW DATA CASE",
+                "CS",
+                "CZ",
+                "BLANK CARD TERMINATING THE CASE",
+            ];
+            source = "retired-input-converter-contract",
+        )
+        @test AIMORA.ValidationCore.is_valid(parsed.validation)
+        auxiliary = AIMORA.EMTStudy.run_deck_auxiliary_studies(parsed)
+        @test auxiliary.compatibility_exclusions == [
+            :pre_m37_zinc_oxide_card_converter,
+            :pre_m37_switch_pseudononlinear_card_converter,
+        ]
+        @test isempty(auxiliary.deferred_requests)
+    end
+
     @testset "private solver integration" begin
         system = AIMORA.Nodal.NodalSystem(2, [
             AIMORA.Branches.TheveninSource(1, 1.0e9, _ -> 1.0),
