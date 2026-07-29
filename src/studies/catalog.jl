@@ -77,6 +77,7 @@ const STUDIES = [
     StudyDescriptor(:duct_bank_derating, "Duct-bank and tray derating", :thermal, :planned, "planned"),
     StudyDescriptor(:line_constants, "Overhead line impedance and capacitance constants", :lines, :implemented, "src/studies/line_constants.jl"),
     StudyDescriptor(:cable_constants, "Cable constants and frequency scan", :lines, :implemented, "src/studies/cable_constants.jl"),
+    StudyDescriptor(:transformer_parameters, "Transformer parameter conversion and branch generation", :static, :implemented, "src/studies/transformer_parameters.jl"),
     StudyDescriptor(:sheath_bonding, "Cable sheath bonding and circulating current", :lines, :planned, "planned"),
     StudyDescriptor(:conductor_sizing, "Conductor sizing", :sizing, :planned, "planned"),
     StudyDescriptor(:transformer_sizing, "Transformer sizing", :sizing, :planned, "planned"),
