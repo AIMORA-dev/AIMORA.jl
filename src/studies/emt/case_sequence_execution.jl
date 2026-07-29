@@ -254,12 +254,16 @@ function run_deck_auxiliary_studies(
 )
     assert_deck_valid!(parsed)
     rows = DeckParser.deck_study_option_request_rows(parsed)
+    simulation_control_rows =
+        DeckParser.deck_simulation_control_request_rows(parsed)
     schedules = DeckFrequencyScanSchedule[
         deck_frequency_scan_schedule(row)
         for row in rows
         if row.request_kind in (:frequency_scan, :line_model_frequency_scan)
     ]
     requested_kinds = Set(getfield.(rows, :request_kind))
+    simulation_control_kinds =
+        Set(getfield.(simulation_control_rows, :request_kind))
     groups = DeckParser.deck_rational_frequency_line_groups(parsed)
     line_frequency_scans = DeckLineFrequencyScanStudy[]
     impulse_responses = DeckLineImpulseResponseStudy[]
@@ -323,6 +327,16 @@ function run_deck_auxiliary_studies(
     # not as a silently deferred production side effect.
     :zinc_oxide_format_conversion in requested_kinds &&
         push!(compatibility_exclusions, :pre_m37_zinc_oxide_card_converter)
+    # CHANGE SWITCH (special request 37) invoked OVER41/CRDCHG only to
+    # rewrite pre-M37 type-91/92/93 input cards into newer formats. It
+    # never participated in a simulation. Keep the accepted request visible
+    # as a retired input-conversion utility instead of treating CRDCHG as
+    # transformer-parameter behavior or a deferred runtime effect.
+    :switch_pseudononlinear_conversion in simulation_control_kinds &&
+        push!(
+            compatibility_exclusions,
+            :pre_m37_switch_pseudononlinear_card_converter,
+        )
     return DeckAuxiliaryStudyRun(
         schedules,
         line_frequency_scans,
