@@ -1,7 +1,12 @@
 export PIECEWISE_NONLINEAR_INDUCTOR_TYPE,
+       PSEUDO_NONLINEAR_INDUCTOR_TYPE,
        piecewise_nonlinear_inductor_network_step
 
 const PIECEWISE_NONLINEAR_INDUCTOR_TYPE = 93
+const PSEUDO_NONLINEAR_INDUCTOR_TYPE = 98
+
+_is_pseudo_nonlinear_inductor_type(type_code::Integer) =
+    Int(type_code) in (PSEUDO_NONLINEAR_INDUCTOR_TYPE, SATURATED_TRANSFORMER_NONLINEAR_TYPE)
 
 function _piecewise_nonlinear_inductor_segment(
     current::Float64,

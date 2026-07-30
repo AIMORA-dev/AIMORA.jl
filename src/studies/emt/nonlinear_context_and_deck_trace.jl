@@ -971,7 +971,14 @@ function _with_nonlinear_reports(run, nonlinear_config::NamedTuple)
             ),
         )
     end
-    if any(==(PIECEWISE_NONLINEAR_INDUCTOR_TYPE), types)
+    if any(
+        type_code ->
+            type_code in (
+                PIECEWISE_NONLINEAR_INDUCTOR_TYPE,
+                PSEUDO_NONLINEAR_INDUCTOR_TYPE,
+            ),
+        types,
+    )
         reports = merge(
             reports,
             (
@@ -1018,6 +1025,7 @@ function _run_primary_nonlinear_deck(
             TheveninSource,
             CurrentInjection,
             TACSControlledSwitch,
+            SaturatedTransformerNonlinearSlopeBranch,
         },
         context.system.elements,
     ) || throw(ArgumentError(
@@ -1030,8 +1038,23 @@ function _run_primary_nonlinear_deck(
     )
     nonlinear_current_config === nothing &&
         throw(ArgumentError("primary nonlinear runtime requires parsed nonlinear owners"))
+    if any(
+        ==(PSEUDO_NONLINEAR_INDUCTOR_TYPE),
+        nonlinear_current_config.nonlinear_types,
+    )
+        nonlinear_current_config =
+            _pseudo_nonlinear_inductor_initial_state_config(
+                nonlinear_current_config,
+                deck_steady_state_voltage_phasors(parsed),
+            )
+    end
     includes_inductive_state = any(
-        type -> type == -96 || type == PIECEWISE_NONLINEAR_INDUCTOR_TYPE,
+        type ->
+            type in (
+                HYSTERETIC_INDUCTOR_NONLINEAR_TYPE,
+                PIECEWISE_NONLINEAR_INDUCTOR_TYPE,
+                PSEUDO_NONLINEAR_INDUCTOR_TYPE,
+            ),
         nonlinear_current_config.nonlinear_types,
     )
     state = _deck_dynamic_timestep_state(
@@ -1611,7 +1634,7 @@ function _prepare_dynamic_deck_runtime(
         ) :
         nothing
     saturated_transformer_current_config =
-        _saturated_transformer_initial_nonlinear_state_config(
+        _pseudo_nonlinear_inductor_initial_state_config(
             saturated_transformer_current_config,
             steady_state_initial_sample,
         )

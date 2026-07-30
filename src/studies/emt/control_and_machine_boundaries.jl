@@ -1306,6 +1306,33 @@ function initialize_step_context(
         element_names,
         DeckParser.deck_rational_frequency_line_element_names(parsed),
     )
+    nonlinear_inductor_rows =
+        DeckParser.deck_piecewise_nonlinear_inductor_rows(parsed)
+    if any(
+        row -> row.nonlinear_type == PSEUDO_NONLINEAR_INDUCTOR_TYPE,
+        nonlinear_inductor_rows,
+    )
+        nonlinear_inductor_config =
+            deck_piecewise_nonlinear_inductor_current_config(
+                parsed;
+                delta2 = dt_s / 2.0,
+            )
+        nodal_nonlinear_inductor_config = merge(
+            nonlinear_inductor_config,
+            (
+                nonlinear_from_nodes =
+                    [row.from_node_index for row in nonlinear_inductor_rows],
+                nonlinear_to_nodes =
+                    [row.to_node_index for row in nonlinear_inductor_rows],
+            ),
+        )
+        nonlinear_slope_branches =
+            saturated_transformer_nonlinear_slope_branches(
+                nodal_nonlinear_inductor_config,
+            )
+        append!(elements, nonlinear_slope_branches.elements)
+        append!(element_names, nonlinear_slope_branches.element_names)
+    end
     _append_switching_nonlinear_resistor_safety_shunts!(
         elements,
         element_names,

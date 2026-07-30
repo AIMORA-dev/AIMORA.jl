@@ -822,7 +822,9 @@ function _over16_nonlinear_difference_inputs(
 
     for index in eachindex(nonlinear_types)
         nonlinear_type = nonlinear_types[index]
-        if nonlinear_type < 0 || nonlinear_type > 920
+        if _is_pseudo_nonlinear_inductor_type(nonlinear_type) ||
+           nonlinear_type < 0 ||
+           nonlinear_type > 920
             continue
         end
         from_node = nonlinear_from_nodes[index]

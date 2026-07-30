@@ -78,6 +78,8 @@ function _nonlinear_kind(type_code::Int)
         return :triggered_timed_resistance
     type_code == PIECEWISE_NONLINEAR_INDUCTOR_TYPE &&
         return :piecewise_nonlinear_inductor
+    type_code == PSEUDO_NONLINEAR_INDUCTOR_TYPE &&
+        return :pseudo_nonlinear_inductor
     type_code == HYSTERETIC_INDUCTOR_NONLINEAR_TYPE &&
         return :hysteretic_inductor
     type_code == SATURATED_TRANSFORMER_NONLINEAR_TYPE &&
@@ -206,11 +208,14 @@ function _terminal_nonlinear_states(parsed::DeckParser.DeckParseResult, run)
     for (property, type_code) in reports
         hasproperty(run, property) || continue
         report = getproperty(run, property)
+        type_codes = hasproperty(report, :nonlinear_types) ?
+            Int.(report.nonlinear_types) :
+            fill(type_code, length(report.names))
         _append_terminal_nonlinear_report!(
             rows,
             seen,
             report,
-            fill(type_code, length(report.names)),
+            type_codes,
             owners,
         )
     end

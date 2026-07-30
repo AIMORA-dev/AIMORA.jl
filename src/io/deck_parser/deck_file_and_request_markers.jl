@@ -1236,6 +1236,16 @@ function parse_deck_lines(lines; source::AbstractString="deck")
             )
         end
     end
+    pending_nonlinear_names =
+        get(result.pending_fixed_owner_names, :nonlinear, String[])
+    isempty(pending_nonlinear_names) || add_issue!(
+        result.validation,
+        missing_data(
+            "end of deck",
+            "expected a nonlinear owner after NONLIN NAME moniker " *
+            join(pending_nonlinear_names, ','),
+        ),
+    )
     validate_over5a_controlled_source_rows!(result)
     validate_fixed_source_load_flow_rows!(result)
     validate_coupled_line_rows!(result)

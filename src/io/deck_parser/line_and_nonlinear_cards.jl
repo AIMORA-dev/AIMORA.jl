@@ -1400,9 +1400,11 @@ function push_zinc_oxide_nonlinear_row!(
         1 <= reference_index <= length(result.zinc_oxide_nonlinear_rows) ||
             throw(ArgumentError("zinc-oxide nonlinear reference index is outside prior rows"))
     end
-    name = inline_name === nothing ?
-        Symbol("zinc_oxide_nonlinear_", length(result.zinc_oxide_nonlinear_rows) + 1) :
-        Symbol(String(inline_name))
+    name = bpa_fixed_nonlinear_owner_name(
+        result,
+        string("zinc_oxide_nonlinear_", length(result.zinc_oxide_nonlinear_rows) + 1);
+        explicit_name = inline_name,
+    )
     from_index = node_id!(result, from_node)
     to_index = node_id!(result, to_node)
     first_characteristic_index =
@@ -1573,9 +1575,14 @@ function push_triggered_timed_resistance_row!(
     else
         nothing
     end
-    name = inline_name === nothing ?
-        Symbol("triggered_timed_resistance_", length(result.triggered_timed_resistance_rows) + 1) :
-        Symbol(String(inline_name))
+    name = bpa_fixed_nonlinear_owner_name(
+        result,
+        string(
+            "triggered_timed_resistance_",
+            length(result.triggered_timed_resistance_rows) + 1,
+        );
+        explicit_name = inline_name,
+    )
     push!(
         result.triggered_timed_resistance_rows,
         DeckTriggeredTimedResistanceRow(
@@ -1750,9 +1757,14 @@ function push_switching_nonlinear_resistor_row!(
         ))
         return true
     end
-    name = inline_name === nothing ?
-        Symbol("switching_nonlinear_resistor_", length(result.switching_nonlinear_resistor_rows) + 1) :
-        Symbol(String(inline_name))
+    name = bpa_fixed_nonlinear_owner_name(
+        result,
+        string(
+            "switching_nonlinear_resistor_",
+            length(result.switching_nonlinear_resistor_rows) + 1,
+        );
+        explicit_name = inline_name,
+    )
     copied = reference_index > 0
     if copied
         1 <= reference_index <= length(result.switching_nonlinear_resistor_rows) ||
@@ -2031,9 +2043,15 @@ function push_nonlinear_resistance_row!(
         result.nonlinear_resistance_rows[reference_index].nonlinear_type == nonlinear_type ||
             throw(ArgumentError("nonlinear resistance COPY reference type must match the current row"))
     end
-    name = inline_name === nothing ?
-        Symbol(String(element_kind), "_nonlinear_", length(result.nonlinear_resistance_rows) + 1) :
-        Symbol(String(inline_name))
+    name = bpa_fixed_nonlinear_owner_name(
+        result,
+        string(
+            element_kind,
+            "_nonlinear_",
+            length(result.nonlinear_resistance_rows) + 1,
+        );
+        explicit_name = inline_name,
+    )
     from_index = node_id!(result, from_node)
     to_index = node_id!(result, to_node)
     first_characteristic_index =
@@ -2136,11 +2154,14 @@ function push_piecewise_nonlinear_inductor_row!(
     line_no::Int,
     from_node::AbstractString,
     to_node::AbstractString,
+    nonlinear_type::Int,
     initial_issues::Int;
     inline_name::Union{Nothing,AbstractString}=nothing,
     reference_kind::Symbol=:none,
     reference_index::Int=0,
 )::Bool
+    nonlinear_type in (93, 98) ||
+        throw(ArgumentError("nonlinear-inductor type must be 93 or 98"))
     steady_state_current = fixed_float_or_default!(
         result,
         image,
@@ -2183,12 +2204,26 @@ function push_piecewise_nonlinear_inductor_row!(
             "nonlinear-inductor steady-state flux must be finite",
         ),
     )
-    name = inline_name === nothing ?
-        Symbol("piecewise_nonlinear_inductor_", length(result.piecewise_nonlinear_inductor_rows) + 1) :
-        Symbol(String(inline_name))
+    fallback_name = nonlinear_type == 93 ?
+        string(
+            "piecewise_nonlinear_inductor_",
+            length(result.piecewise_nonlinear_inductor_rows) + 1,
+        ) :
+        string(
+            "pseudo_nonlinear_inductor_",
+            length(result.piecewise_nonlinear_inductor_rows) + 1,
+        )
+    name = bpa_fixed_nonlinear_owner_name(
+        result,
+        fallback_name;
+        explicit_name = inline_name,
+    )
     source_kind = reference_index == 0 ? :direct : :copy_reference
     reference_row = reference_index == 0 ? nothing :
         result.piecewise_nonlinear_inductor_rows[reference_index]
+    reference_row === nothing ||
+        reference_row.nonlinear_type == nonlinear_type ||
+        throw(ArgumentError("nonlinear-inductor COPY reference type must match the current row"))
     owned_steady_state_current = reference_row === nothing ?
         Float64(steady_state_current) : reference_row.steady_state_current_a
     owned_steady_state_flux = reference_row === nothing ?
@@ -2202,6 +2237,7 @@ function push_piecewise_nonlinear_inductor_row!(
             node_id!(result, from_node),
             node_id!(result, to_node),
             line_no,
+            nonlinear_type,
             owned_steady_state_current,
             owned_steady_state_flux,
             Int(output_code),
@@ -2219,7 +2255,12 @@ function push_piecewise_nonlinear_inductor_row!(
         :piecewise_nonlinear_inductor_row,
         initial_issues,
     )
-    record_card!(result, :piecewise_nonlinear_inductor_type_93_row)
+    record_card!(
+        result,
+        nonlinear_type == 93 ?
+            :piecewise_nonlinear_inductor_type_93_row :
+            :pseudo_nonlinear_inductor_type_98_row,
+    )
     inline_name === nothing || record_card!(result, :piecewise_nonlinear_inductor_inline_name)
     return true
 end
@@ -2347,9 +2388,11 @@ function push_hysteretic_inductor_row!(
     else
         nothing
     end
-    name = inline_name === nothing ?
-        Symbol("hysteretic_inductor_", length(result.hysteretic_inductor_rows) + 1) :
-        Symbol(String(inline_name))
+    name = bpa_fixed_nonlinear_owner_name(
+        result,
+        string("hysteretic_inductor_", length(result.hysteretic_inductor_rows) + 1);
+        explicit_name = inline_name,
+    )
     push!(
         result.hysteretic_inductor_rows,
         DeckHystereticInductorRow(
@@ -2537,9 +2580,11 @@ function push_arrester_nonlinear_row!(
         1 <= reference_index <= length(result.arrester_nonlinear_rows) ||
             throw(ArgumentError("arrester nonlinear reference index is outside prior rows"))
     end
-    name = inline_name === nothing ?
-        Symbol("arrester_nonlinear_", length(result.arrester_nonlinear_rows) + 1) :
-        Symbol(String(inline_name))
+    name = bpa_fixed_nonlinear_owner_name(
+        result,
+        string("arrester_nonlinear_", length(result.arrester_nonlinear_rows) + 1);
+        explicit_name = inline_name,
+    )
     from_index = node_id!(result, from_node)
     to_index = node_id!(result, to_node)
     first_constant_index =

@@ -311,7 +311,33 @@ function _node_voltage_phasor(
     return node_voltage_phasors[index]
 end
 
-function _saturated_transformer_initial_nonlinear_state_config(
+function _nonlinear_initial_frequency_hz(
+    steady_state_initial_sample,
+    from_node::Int,
+    to_node::Int,
+)
+    if hasproperty(
+        steady_state_initial_sample,
+        :node_steady_state_frequencies_hz,
+    )
+        frequencies = Float64.(
+            steady_state_initial_sample.node_steady_state_frequencies_hz
+        )
+        nodes = filter(!=(0), (from_node, to_node))
+        isempty(nodes) &&
+            throw(ArgumentError("nonlinear initial state requires a non-reference endpoint"))
+        all(node -> 1 <= node <= length(frequencies), nodes) ||
+            throw(ArgumentError("nonlinear initial-state node frequency is unavailable"))
+        branch_frequencies = frequencies[collect(nodes)]
+        frequency = first(branch_frequencies)
+        all(value -> value == frequency, branch_frequencies) ||
+            throw(ArgumentError("nonlinear initial-state endpoints must share one frequency"))
+        return frequency
+    end
+    return Float64(steady_state_initial_sample.steady_state_frequency_hz)
+end
+
+function _pseudo_nonlinear_inductor_initial_state_config(
     nonlinear_current_config::Union{Nothing,NamedTuple},
     steady_state_initial_sample,
 )
@@ -322,6 +348,10 @@ function _saturated_transformer_initial_nonlinear_state_config(
     count == 0 && return nonlinear_current_config
     from_nodes = Int.(get(nonlinear_current_config, :nonlinear_from_nodes, Int[]))
     to_nodes = Int.(get(nonlinear_current_config, :nonlinear_to_nodes, Int[]))
+    deck_from_nodes =
+        Int.(get(nonlinear_current_config, :nonlinear_deck_from_nodes, Int[]))
+    deck_to_nodes =
+        Int.(get(nonlinear_current_config, :nonlinear_deck_to_nodes, Int[]))
     table_start_indices =
         Int.(get(nonlinear_current_config, :nonlinear_admittance_nodes, Int[]))
     table_end_indices =
@@ -338,15 +368,16 @@ function _saturated_transformer_initial_nonlinear_state_config(
     gslope = Float64.(get(nonlinear_current_config, :gslope, Float64[]))
     length(from_nodes) == count && length(to_nodes) == count ||
         throw(ArgumentError("nonlinear initial-state node vectors must match nonlinear_types"))
+    if any(==(PSEUDO_NONLINEAR_INDUCTOR_TYPE), nonlinear_types)
+        length(deck_from_nodes) == count && length(deck_to_nodes) == count ||
+            throw(ArgumentError("public pseudo-nonlinear inductor endpoints must match nonlinear_types"))
+    end
     length(table_start_indices) == count && length(table_end_indices) == count ||
         throw(ArgumentError("nonlinear initial-state table vectors must match nonlinear_types"))
     length(current_segments) == count ||
         throw(ArgumentError("nonlinear current segment vector must match nonlinear_types"))
     length(steady_currents) == count ||
         throw(ArgumentError("nonlinear steady-state current vector must match nonlinear_types"))
-    omega = 2.0 * pi * Float64(steady_state_initial_sample.steady_state_frequency_hz)
-    omega > 0.0 ||
-        throw(ArgumentError("steady-state frequency must be positive for nonlinear initial state"))
     delta2 = Float64(get(nonlinear_current_config, :delta2, 0.0))
     delta2 > 0.0 ||
         throw(ArgumentError("delta2 must be positive for nonlinear initial state"))
@@ -365,10 +396,27 @@ function _saturated_transformer_initial_nonlinear_state_config(
         table_index <= length(gslope) ||
             throw(ArgumentError("gslope must cover nonlinear initial current segment"))
         table_indices[index] = table_index
-        nonlinear_types[index] == SATURATED_TRANSFORMER_NONLINEAR_TYPE || continue
+        _is_pseudo_nonlinear_inductor_type(nonlinear_types[index]) || continue
+        public_type_98 =
+            nonlinear_types[index] == PSEUDO_NONLINEAR_INDUCTOR_TYPE
+        from_node, to_node =
+            public_type_98 ?
+            (deck_from_nodes[index], deck_to_nodes[index]) :
+            (from_nodes[index], abs(to_nodes[index]))
         branch_phasor =
-            _node_voltage_phasor(phasors, from_nodes[index]) -
-            _node_voltage_phasor(phasors, abs(to_nodes[index]))
+            _node_voltage_phasor(phasors, from_node) -
+            _node_voltage_phasor(phasors, to_node)
+        frequency_hz =
+            public_type_98 ?
+            _nonlinear_initial_frequency_hz(
+                steady_state_initial_sample,
+                from_node,
+                to_node,
+            ) :
+            Float64(steady_state_initial_sample.steady_state_frequency_hz)
+        omega = 2.0 * pi * frequency_hz
+        omega > 0.0 ||
+            throw(ArgumentError("steady-state frequency must be positive for nonlinear initial state"))
         # OVER13 seeds VNONL as the steady-state flux minus the trapezoidal
         # half-step voltage. OVER14 then derives ANONL = GSLOPE * VNONL /
         # DELTA2 before SUBTS1 advances the nonlinear element ahead of solve.
@@ -392,7 +440,7 @@ function _saturated_transformer_initial_nonlinear_state_config(
     )
 end
 
-function _saturated_transformer_initial_companion_current_injections(
+function _pseudo_nonlinear_inductor_initial_companion_current_injections(
     nonlinear_current_config::NamedTuple,
     node_count::Int,
 )
@@ -403,16 +451,26 @@ function _saturated_transformer_initial_companion_current_injections(
     nonlinear_types = Int.(get(nonlinear_current_config, :nonlinear_types, Int[]))
     from_nodes = Int.(get(nonlinear_current_config, :nonlinear_from_nodes, Int[]))
     to_nodes = Int.(get(nonlinear_current_config, :nonlinear_to_nodes, Int[]))
+    deck_from_nodes =
+        Int.(get(nonlinear_current_config, :nonlinear_deck_from_nodes, Int[]))
+    deck_to_nodes =
+        Int.(get(nonlinear_current_config, :nonlinear_deck_to_nodes, Int[]))
     count = length(nonlinear_types)
     length(companion_currents) == count &&
         length(from_nodes) == count &&
         length(to_nodes) == count ||
         throw(ArgumentError("initial nonlinear companion current vectors must match nonlinear_types"))
+    if any(==(PSEUDO_NONLINEAR_INDUCTOR_TYPE), nonlinear_types)
+        length(deck_from_nodes) == count && length(deck_to_nodes) == count ||
+            throw(ArgumentError("public pseudo-nonlinear inductor endpoints must match nonlinear_types"))
+    end
     injections = zeros(Float64, node_count)
     for index in eachindex(nonlinear_types)
-        nonlinear_types[index] == SATURATED_TRANSFORMER_NONLINEAR_TYPE || continue
-        from_node = from_nodes[index]
-        to_node = abs(to_nodes[index])
+        _is_pseudo_nonlinear_inductor_type(nonlinear_types[index]) || continue
+        from_node, to_node =
+            nonlinear_types[index] == PSEUDO_NONLINEAR_INDUCTOR_TYPE ?
+            (deck_from_nodes[index], deck_to_nodes[index]) :
+            (from_nodes[index], abs(to_nodes[index]))
         1 <= from_node <= node_count ||
             throw(ArgumentError("initial nonlinear from-node must address RHS"))
         injections[from_node] -= companion_currents[index]
@@ -554,12 +612,11 @@ function _without_nonlinear_current_config(config::NamedTuple)
     return Base.structdiff(config, (nonlinear_current_config = nothing,))
 end
 
-function _has_saturated_transformer_nonlinear_current(
+function _has_pseudo_nonlinear_inductor_current(
     nonlinear_current_config::NamedTuple,
 )
     return any(
-        nonlinear_type ->
-            Int(nonlinear_type) == SATURATED_TRANSFORMER_NONLINEAR_TYPE,
+        _is_pseudo_nonlinear_inductor_type,
         get(nonlinear_current_config, :nonlinear_types, Int[]),
     )
 end
@@ -809,6 +866,47 @@ function _apply_dense_primary_timed_resistance_admittance_deltas!(
     return update_count
 end
 
+function _apply_dense_primary_pseudo_nonlinear_inductor_admittance_deltas!(
+    context::EMTStepContext,
+    nonlinear_current_config::NamedTuple,
+    nonlinear_current_result,
+)
+    hasproperty(nonlinear_current_result, :saturated_transformer_admittance_deltas) ||
+        return 0
+    deltas = Float64.(nonlinear_current_result.saturated_transformer_admittance_deltas)
+    types = Int.(nonlinear_current_config.nonlinear_types)
+    from_nodes = Int.(nonlinear_current_config.nonlinear_from_nodes)
+    to_nodes = abs.(Int.(nonlinear_current_config.nonlinear_to_nodes))
+    length(deltas) == length(types) == length(from_nodes) == length(to_nodes) ||
+        throw(ArgumentError("pseudo-nonlinear inductor restamp arrays must match nonlinear owners"))
+    _, reference_to_nodal = _nonlinear_reference_node_mapping(
+        nonlinear_current_config,
+        context.system.node_count,
+    )
+    update_count = 0
+    for index in eachindex(types)
+        types[index] == PSEUDO_NONLINEAR_INDUCTOR_TYPE || continue
+        delta = deltas[index]
+        delta == 0.0 && continue
+        from_node = from_nodes[index]
+        to_node = to_nodes[index]
+        from_nodal = from_node == 1 ? 0 : reference_to_nodal[from_node]
+        to_nodal = to_node == 1 ? 0 : reference_to_nodal[to_node]
+        from_node == 1 || from_nodal != 0 ||
+            throw(ArgumentError("pseudo-nonlinear inductor from-node is not a nodal unknown"))
+        to_node == 1 || to_nodal != 0 ||
+            throw(ArgumentError("pseudo-nonlinear inductor to-node is not a nodal unknown"))
+        from_nodal != 0 && (context.system.y[from_nodal, from_nodal] += delta)
+        to_nodal != 0 && (context.system.y[to_nodal, to_nodal] += delta)
+        if from_nodal != 0 && to_nodal != 0
+            context.system.y[from_nodal, to_nodal] -= delta
+            context.system.y[to_nodal, from_nodal] -= delta
+        end
+        update_count += 1
+    end
+    return update_count
+end
+
 function _apply_dense_primary_hysteretic_companion_admittance!(
     context::EMTStepContext,
     nonlinear_current_config::NamedTuple,
@@ -968,9 +1066,15 @@ function _apply_dense_primary_nonlinear_solution!(
     nonlinear_current_result,
     nonlinear_base_rhs::AbstractVector{<:Real},
     stored_injections::AbstractVector{<:Real},
+    source_voltage_constraint_result,
 )
     nonlinear_current_result === nothing &&
         throw(ArgumentError("primary nonlinear timestep did not produce a current update"))
+    _apply_dense_primary_pseudo_nonlinear_inductor_admittance_deltas!(
+        context,
+        nonlinear_current_config,
+        nonlinear_current_result,
+    )
     _apply_dense_primary_hysteretic_admittance_deltas!(
         context,
         nonlinear_current_config,
@@ -1007,6 +1111,14 @@ function _apply_dense_primary_nonlinear_solution!(
     for node in 1:context.system.node_count
         context.system.rhs[node] +=
             desired_injections[node] - Float64(stored_injections[node])
+    end
+    if get(source_voltage_constraint_result, :applied, false)
+        Nodal._apply_voltage_constraints!(
+            context.system.y,
+            context.system.rhs,
+            source_voltage_constraint_result.nodes,
+            source_voltage_constraint_result.values,
+        )
     end
     copyto!(context.system.y_factor, context.system.y)
     Nodal.solve_dense!(
@@ -1210,19 +1322,36 @@ function _sync_saturated_transformer_nonlinear_slope_branches!(
     matched_count = 0
     mutation_count = 0
     for index in eachindex(nonlinear_types)
-        Int(nonlinear_types[index]) == SATURATED_TRANSFORMER_NONLINEAR_TYPE || continue
+        _is_pseudo_nonlinear_inductor_type(nonlinear_types[index]) || continue
         segment = Int(abs(current_segments[index]))
         segment > 0 ||
-            throw(ArgumentError("saturated transformer nonlinear current segment must be nonzero"))
+            throw(ArgumentError("pseudo-nonlinear inductor current segment must be nonzero"))
         table_start_index = Int(table_start_indices[index])
         table_end_index = Int(table_end_indices[index])
         table_index = table_start_index + segment - 1
         table_start_index <= table_index <= table_end_index ||
-            throw(ArgumentError("saturated transformer nonlinear current segment must address gslope table"))
+            throw(ArgumentError("pseudo-nonlinear inductor current segment must address gslope table"))
         table_index <= length(slopes) ||
-            throw(ArgumentError("gslope must cover saturated transformer nonlinear slope branches"))
-        expected_from_node = Int(from_nodes[index])
-        expected_to_node = abs(Int(to_nodes[index]))
+            throw(ArgumentError("gslope must cover pseudo-nonlinear inductor slope branches"))
+        if Int(nonlinear_types[index]) == PSEUDO_NONLINEAR_INDUCTOR_TYPE
+            deck_from_nodes = get(
+                nonlinear_current_config,
+                :nonlinear_deck_from_nodes,
+                Int[],
+            )
+            deck_to_nodes = get(
+                nonlinear_current_config,
+                :nonlinear_deck_to_nodes,
+                Int[],
+            )
+            length(deck_from_nodes) == count == length(deck_to_nodes) ||
+                throw(ArgumentError("public pseudo-nonlinear inductor endpoints must cover nonlinear owners"))
+            expected_from_node = Int(deck_from_nodes[index])
+            expected_to_node = Int(deck_to_nodes[index])
+        else
+            expected_from_node = Int(from_nodes[index])
+            expected_to_node = abs(Int(to_nodes[index]))
+        end
         matching_branch = nothing
         match_count = 0
         for element in context.saturated_transformer_nonlinear_slope_branch_batch
@@ -1233,7 +1362,7 @@ function _sync_saturated_transformer_nonlinear_slope_branches!(
             end
         end
         match_count == 1 ||
-            throw(ArgumentError("saturated transformer nonlinear slope branch must have one live nodal owner"))
+            throw(ArgumentError("pseudo-nonlinear inductor slope branch must have one live nodal owner"))
         matched_count += 1
         mutation_count += set_saturated_transformer_nonlinear_slope!(
             matching_branch,
@@ -1367,7 +1496,7 @@ function step_with_over16_boundary!(
         over16_state.nonlinear_inverse.source_column_update_count == 0
     nonlinear_current_compensation_injections =
         use_initial_nonlinear_companion_current ?
-        _saturated_transformer_initial_companion_current_injections(
+        _pseudo_nonlinear_inductor_initial_companion_current_injections(
             nonlinear_current_config,
             context.system.node_count,
         ) :
@@ -1441,7 +1570,7 @@ function step_with_over16_boundary!(
     nonlinear_pre_solve_update = nothing
     nonlinear_slope_sync_result = (matched_count = 0, mutation_count = 0)
     if nonlinear_current_compensation_enabled &&
-       _has_saturated_transformer_nonlinear_current(nonlinear_current_config) &&
+       _has_pseudo_nonlinear_inductor_current(nonlinear_current_config) &&
        _has_live_saturated_transformer_nonlinear_slope_branch(context) &&
        get(nonlinear_current_config, :seed_initial_nonlinear_state, false) &&
        !dense_primary_nonlinear_compensation
@@ -1710,12 +1839,24 @@ function step_with_over16_boundary!(
             lean_sparse_switch_state_flow_result !== nothing
         switched_topology_applied &&
             _apply_switched_topology_admittance!(context, over16_state)
+        if any(
+            ==(PSEUDO_NONLINEAR_INDUCTOR_TYPE),
+            get(nonlinear_current_config, :nonlinear_types, Int[]),
+        ) && _has_live_saturated_transformer_nonlinear_slope_branch(context)
+            nonlinear_slope_sync_result =
+                _sync_saturated_transformer_nonlinear_slope_branches!(
+                    context,
+                    nonlinear_current_config,
+                    over16_state,
+                )
+        end
         voltage = _apply_dense_primary_nonlinear_solution!(
             context,
             nonlinear_current_config,
             over16_update.nonlinear_current_result,
             nonlinear_current_compensation_base_rhs,
             stored_nonlinear_current_compensation_injections,
+            source_voltage_constraint_result,
         )
         if switched_topology_applied
             switch_current_config = get(

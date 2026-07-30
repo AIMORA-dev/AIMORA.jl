@@ -584,7 +584,9 @@ function over16_nonlinear_source_column_assembly(
     if nonlinear_count != num99
         for index in eachindex(nonlinear_types)
             nonlinear_type = nonlinear_types[index]
-            if nonlinear_type < 0 || nonlinear_type > 920
+            if _is_pseudo_nonlinear_inductor_type(nonlinear_type) ||
+               nonlinear_type < 0 ||
+               nonlinear_type > 920
                 continue
             end
             node = nonlinear_admittance_nodes[index]
@@ -832,7 +834,9 @@ function over16_nonlinear_inverse_column_solution(
     difference_count = 0
     for index in eachindex(nonlinear_types)
         nonlinear_type = nonlinear_types[index]
-        if nonlinear_type < 0 || nonlinear_type > 920
+        if _is_pseudo_nonlinear_inductor_type(nonlinear_type) ||
+           nonlinear_type < 0 ||
+           nonlinear_type > 920
             continue
         end
         from_node = nonlinear_from_nodes[index]
@@ -1499,6 +1503,9 @@ function over16_nonlinear_current_compensation_update(
     saturated_transformer_polarity_reversal_count = 0
     saturated_transformer_finit_deltas = zeros(Float64, count)
     saturated_transformer_admittance_deltas = zeros(Float64, count)
+    pseudo_nonlinear_inductor_update_count = 0
+    pseudo_nonlinear_inductor_segment_change_count = 0
+    pseudo_nonlinear_inductor_polarity_reversal_count = 0
     saturated_transformer_sparse_ykm =
         active_sparse_config === nothing ?
         Float64[] :
@@ -2066,15 +2073,15 @@ function over16_nonlinear_current_compensation_update(
                 end
                 processed_count += 1
                 continue
-            elseif nonlinear_type == SATURATED_TRANSFORMER_NONLINEAR_TYPE
+            elseif _is_pseudo_nonlinear_inductor_type(nonlinear_type)
                 table_start = nonlinear_admittance_nodes[index]
                 table_end = abs(nonlinear_table_end_indices[index])
                 1 <= table_start <= table_end <= length(cchar_values) ||
-                    throw(ArgumentError("saturated transformer table range must address cchar"))
+                    throw(ArgumentError("pseudo-nonlinear inductor table range must address cchar"))
                 table_end <= length(vchar_values) ||
-                    throw(ArgumentError("saturated transformer table range must address vchar"))
+                    throw(ArgumentError("pseudo-nonlinear inductor table range must address vchar"))
                 table_end <= length(gslope_values) ||
-                    throw(ArgumentError("gslope must cover saturated transformer table ranges"))
+                    throw(ArgumentError("gslope must cover pseudo-nonlinear inductor table ranges"))
                 segment_update = saturated_transformer_segment_update(
                     curr[index],
                     anonl[index],
@@ -2086,6 +2093,7 @@ function over16_nonlinear_current_compensation_update(
                     gslope_values,
                     vchar_values;
                     delta2 = delta,
+                    voltage_tolerance = flux_zero,
                 )
                 curr[index] = segment_update.current_segment
                 anonl[index] = segment_update.companion_current
@@ -2104,13 +2112,23 @@ function over16_nonlinear_current_compensation_update(
                     to_node,
                     segment_update.finitial_to_delta,
                 )
-                saturated_transformer_update_count += 1
-                segment_update.segment_changed &&
-                    (saturated_transformer_segment_change_count += 1)
-                segment_update.polarity_mismatch_warning &&
-                    (saturated_transformer_polarity_warning_count += 1)
-                segment_update.polarity_reversed &&
-                    (saturated_transformer_polarity_reversal_count += 1)
+                if nonlinear_type == SATURATED_TRANSFORMER_NONLINEAR_TYPE
+                    saturated_transformer_update_count += 1
+                    segment_update.segment_changed &&
+                        (saturated_transformer_segment_change_count += 1)
+                    segment_update.polarity_mismatch_warning &&
+                        (saturated_transformer_polarity_warning_count += 1)
+                    segment_update.polarity_reversed &&
+                        (saturated_transformer_polarity_reversal_count += 1)
+                else
+                    pseudo_nonlinear_inductor_update_count += 1
+                    piecewise_nonlinear_inductor_accepted_currents[index] =
+                        segment_update.equivalent_current
+                    segment_update.segment_changed &&
+                        (pseudo_nonlinear_inductor_segment_change_count += 1)
+                    segment_update.polarity_reversed &&
+                        (pseudo_nonlinear_inductor_polarity_reversal_count += 1)
+                end
                 if segment_update.segment_changed &&
                         active_sparse_config !== nothing
                     restamp = saturated_transformer_sparse_admittance_update(
@@ -2221,7 +2239,7 @@ function over16_nonlinear_current_compensation_update(
                 ilast[index] = last
             end
 
-            if nonlinear_type != SATURATED_TRANSFORMER_NONLINEAR_TYPE
+            if !_is_pseudo_nonlinear_inductor_type(nonlinear_type)
                 cursub_index = div(head, 5) + 1
                 cursub_index <= length(cursub) ||
                     throw(ArgumentError("cursub length must cover nonlinear subsystem heads"))
@@ -2305,6 +2323,13 @@ function over16_nonlinear_current_compensation_update(
         saturated_transformer_polarity_reversal_count = saturated_transformer_polarity_reversal_count,
         saturated_transformer_finit_deltas = saturated_transformer_finit_deltas,
         saturated_transformer_admittance_deltas = saturated_transformer_admittance_deltas,
+        pseudo_nonlinear_inductor_update_count = pseudo_nonlinear_inductor_update_count,
+        pseudo_nonlinear_inductor_segment_change_count =
+            pseudo_nonlinear_inductor_segment_change_count,
+        pseudo_nonlinear_inductor_polarity_reversal_count =
+            pseudo_nonlinear_inductor_polarity_reversal_count,
+        pseudo_nonlinear_inductor_accepted_currents =
+            piecewise_nonlinear_inductor_accepted_currents,
         saturated_transformer_sparse_ykm = saturated_transformer_sparse_ykm,
         nonlinear_sparse_ykm = saturated_transformer_sparse_ykm,
         saturated_transformer_sparse_from_nodes = saturated_transformer_sparse_from_nodes,

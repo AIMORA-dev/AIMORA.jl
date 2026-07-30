@@ -1446,6 +1446,20 @@ function bpa_fixed_owner_name(result::DeckParseResult, prefix::AbstractString;
     return string(prefix, "_fixed_", next_index)
 end
 
+function bpa_fixed_nonlinear_owner_name(
+    result::DeckParseResult,
+    fallback_name::AbstractString;
+    explicit_name::Union{Nothing,AbstractString}=nothing,
+)::Symbol
+    queue = get!(result.pending_fixed_owner_names, :nonlinear, String[])
+    if explicit_name !== nothing
+        isempty(queue) || popfirst!(queue)
+        return Symbol(String(explicit_name))
+    end
+    isempty(queue) || return Symbol(popfirst!(queue))
+    return Symbol(String(fallback_name))
+end
+
 function record_fixed_card!(result::DeckParseResult, kind::Symbol, subtype::Symbol,
                             initial_issue_count::Int)
     length(result.validation.issues) == initial_issue_count || return result
@@ -2972,11 +2986,19 @@ function parse_bpa_fixed_branch_card!(
         record_card!(result, :bpa_fixed_branch_name)
         return true
     elseif uppercase(from_node) == "NONLIN" && uppercase(to_node) == "NAME:"
-        record_fixed_blocker!(result, :bpa_fixed_branch_blocked,
-                              :bpa_fixed_branch_blocked_nonlinear_moniker)
-        add_issue!(result.validation,
-                   unknown_field("line $line_no",
-                                 "Unsupported OVER2 fixed-field nonlinear moniker"))
+        if isempty(aux_1)
+            add_issue!(
+                result.validation,
+                missing_data(
+                    "line $line_no",
+                    "expected OVER2 NONLIN NAME fixed-field owner name in columns 15-20",
+                ),
+            )
+            return true
+        end
+        enqueue_fixed_owner_name!(result, :nonlinear, aux_1)
+        record_card!(result, :fixed_field)
+        record_card!(result, :bpa_fixed_nonlinear_name)
         return true
     end
     inline_name = nothing
@@ -3237,12 +3259,14 @@ function parse_bpa_fixed_branch_card!(
             inline_name = inline_name,
         )
     end
-    if itype == 93
+    if itype in (93, 98)
         if copy_reference_kind !== nothing
             reference_index = bpa_fixed_nonlinear_reference_index!(
                 result,
                 result.piecewise_nonlinear_inductor_rows,
-                "piecewise nonlinear inductor",
+                itype == 93 ?
+                    "piecewise nonlinear inductor" :
+                    "pseudo-nonlinear inductor",
                 copy_reference_kind,
                 copy_reference_name,
                 copy_reference_from_node,
@@ -3256,6 +3280,7 @@ function parse_bpa_fixed_branch_card!(
                 line_no,
                 from_node,
                 to_node,
+                itype,
                 initial_issues;
                 inline_name = inline_name,
                 reference_kind = copy_reference_kind,
@@ -3268,6 +3293,7 @@ function parse_bpa_fixed_branch_card!(
             line_no,
             from_node,
             to_node,
+            itype,
             initial_issues;
             inline_name = inline_name,
         )

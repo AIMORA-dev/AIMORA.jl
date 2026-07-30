@@ -1494,15 +1494,15 @@ function saturated_transformer_nonlinear_slope_branches(
     stamped_table_indices = Int[]
     conductances = Float64[]
     for index in eachindex(nonlinear_types)
-        nonlinear_types[index] == SATURATED_TRANSFORMER_NONLINEAR_TYPE || continue
+        _is_pseudo_nonlinear_inductor_type(nonlinear_types[index]) || continue
         segment = Int(abs(current_segments[index]))
         segment > 0 ||
-            throw(ArgumentError("saturated transformer nonlinear current segment must be nonzero"))
+            throw(ArgumentError("pseudo-nonlinear inductor current segment must be nonzero"))
         table_index = table_start_indices[index] + segment - 1
         table_start_indices[index] <= table_index <= table_end_indices[index] ||
-            throw(ArgumentError("saturated transformer nonlinear current segment must address gslope table"))
+            throw(ArgumentError("pseudo-nonlinear inductor current segment must address gslope table"))
         table_index <= length(gslope) ||
-            throw(ArgumentError("gslope must cover saturated transformer nonlinear slope branches"))
+            throw(ArgumentError("gslope must cover pseudo-nonlinear inductor slope branches"))
         conductance = gslope[table_index]
         conductance == 0.0 && continue
         to_node = abs(to_nodes[index])
@@ -1549,6 +1549,7 @@ function saturated_transformer_segment_update(
     gslope::AbstractVector{<:Real},
     vchar::AbstractVector{<:Real};
     delta2::Real=1.0,
+    voltage_tolerance::Real=0.0,
 )
     table_start_index >= 1 ||
         throw(ArgumentError("table_start_index must be positive"))
@@ -1569,11 +1570,14 @@ function saturated_transformer_segment_update(
     previous_stored = Float64(stored_voltage)
     voltage = Float64(branch_voltage)
     delta = Float64(delta2)
+    zero = Float64(voltage_tolerance)
     isfinite(previous_current) || throw(ArgumentError("current_segment must be finite"))
     isfinite(previous_companion) || throw(ArgumentError("companion_current must be finite"))
     isfinite(previous_stored) || throw(ArgumentError("stored_voltage must be finite"))
     isfinite(voltage) || throw(ArgumentError("branch_voltage must be finite"))
     isfinite(delta) && delta > 0.0 || throw(ArgumentError("delta2 must be finite and positive"))
+    isfinite(zero) && zero >= 0.0 ||
+        throw(ArgumentError("voltage_tolerance must be finite and nonnegative"))
 
     absolute_segment = Int(abs(previous_current))
     absolute_segment > 0 ||
@@ -1591,7 +1595,11 @@ function saturated_transformer_segment_update(
     polarity_warning = false
     polarity_reversed = false
 
-    if current * effective_voltage <= 0.0
+    polarity_reversal =
+        zero == 0.0 ?
+        current * effective_voltage <= 0.0 :
+        current * effective_voltage < -zero
+    if polarity_reversal
         if absolute_segment == 1
             current = -current
             polarity_reversed = true

@@ -1510,6 +1510,7 @@ struct DeckPiecewiseNonlinearInductorRow
     from_node_index::Int
     to_node_index::Int
     line_no::Int
+    nonlinear_type::Int
     steady_state_current_a::Float64
     steady_state_flux_wb::Float64
     output_code::Int
