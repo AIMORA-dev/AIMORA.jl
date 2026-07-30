@@ -743,6 +743,16 @@ function parse_deck_lines(lines; source::AbstractString="deck")
             continue
         end
         if active_section == :blank_branch &&
+           coupled_lumped_numeric_continuation_row(result, fixed_image(line))
+            append_coupled_lumped_continuation_row!(
+                result,
+                fixed_image(line),
+                line_no,
+                length(result.validation.issues),
+            )
+            continue
+        end
+        if active_section == :blank_branch &&
            fixed_miscellaneous_control_count == 2 &&
            isempty(result.elements) &&
            fixed_card_miscellaneous_control_candidate(tokens)

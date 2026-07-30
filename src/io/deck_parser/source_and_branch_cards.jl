@@ -34,12 +34,134 @@ function parse_arrester_constant_row!(
 end
 
 function fixed_card_coupled_line_descriptor(line_type::Int)
-    if 51 <= line_type <= 53
+    if 51 <= line_type <= 90
         return (kind = :mutual_source_equivalent, phase_index = line_type - 50)
     elseif -3 <= line_type <= -1
         return (kind = :distributed_transmission_line, phase_index = abs(line_type))
     end
     return nothing
+end
+
+function fixed_card_coupled_lumped_pair_values!(
+    result::DeckParseResult,
+    image::AbstractString,
+    line_no::Int,
+)
+    resistance_fields = Union{Missing,Float64}[]
+    inductance_fields = Union{Missing,Float64}[]
+    for slot in 1:3
+        first_column = 27 + 18 * (slot - 1)
+        resistance = fixed_card_optional_float_field!(
+            result,
+            image,
+            line_no,
+            first_column,
+            first_column + 5,
+            "coupled_lumped_resistance_$slot",
+        )
+        inductance = fixed_card_optional_float_field!(
+            result,
+            image,
+            line_no,
+            first_column + 6,
+            first_column + 17,
+            "coupled_lumped_inductance_$slot",
+        )
+        push!(
+            resistance_fields,
+            ismissing(resistance) ? missing : Float64(resistance),
+        )
+        push!(
+            inductance_fields,
+            ismissing(inductance) ? missing : Float64(inductance),
+        )
+    end
+    last_value_slot = findlast(eachindex(resistance_fields)) do slot
+        !ismissing(resistance_fields[slot]) ||
+            !ismissing(inductance_fields[slot])
+    end
+    last_value_slot === nothing &&
+        return (resistance_values = Float64[], inductance_values = Float64[])
+    resistance_values = Float64[
+        coalesce(resistance_fields[slot], 0.0)
+        for slot in 1:last_value_slot
+    ]
+    inductance_values = Float64[
+        coalesce(inductance_fields[slot], 0.0)
+        for slot in 1:last_value_slot
+    ]
+    return (; resistance_values, inductance_values)
+end
+
+function coupled_lumped_numeric_continuation_expected(result::DeckParseResult)
+    isempty(result.coupled_line_rows) && return false
+    row = last(result.coupled_line_rows)
+    return row.line_kind == :mutual_source_equivalent &&
+           ismissing(row.reference_from_node_value) &&
+           ismissing(row.reference_to_node_value) &&
+           length(row.triangular_resistance_values) < row.phase_index
+end
+
+function coupled_lumped_numeric_continuation_row(
+    result::DeckParseResult,
+    image::AbstractString,
+)
+    coupled_lumped_numeric_continuation_expected(result) || return false
+    isempty(fixed_field(image, 1, 26)) || return false
+    return any(
+        !isempty(fixed_field(image, first_column, first_column + 17))
+        for first_column in (27, 45, 63)
+    )
+end
+
+function append_coupled_lumped_continuation_row!(
+    result::DeckParseResult,
+    image::AbstractString,
+    line_no::Int,
+    initial_issues::Int,
+)
+    coupled_lumped_numeric_continuation_expected(result) || begin
+        add_issue!(
+            result.validation,
+            missing_data(
+                "line $line_no",
+                "coupled R-L continuation row has no incomplete owner row",
+            ),
+        )
+        return true
+    end
+    row = last(result.coupled_line_rows)
+    values = fixed_card_coupled_lumped_pair_values!(result, image, line_no)
+    isempty(values.resistance_values) && begin
+        add_issue!(
+            result.validation,
+            missing_data(
+                "line $line_no",
+                "coupled R-L continuation row requires numeric resistance/inductance pairs",
+            ),
+        )
+        return true
+    end
+    remaining = row.phase_index - length(row.triangular_resistance_values)
+    length(values.resistance_values) <= remaining || begin
+        add_issue!(
+            result.validation,
+            invalid_value(
+                "line $line_no",
+                "coupled R-L continuation supplies more than $remaining remaining triangular pairs",
+            ),
+        )
+        return true
+    end
+    append!(row.triangular_resistance_values, values.resistance_values)
+    append!(row.triangular_inductance_values, values.inductance_values)
+    record_fixed_card!(
+        result,
+        :bpa_fixed_branch,
+        :fixed_card_coupled_lumped_continuation,
+        initial_issues,
+    )
+    return true
 end
 
 function cascaded_pi_header_card(line::AbstractString)::Bool
@@ -1027,31 +1149,17 @@ function parse_fixed_card_coupled_line_row!(
     reference_to_name, reference_to_index =
         fixed_card_optional_node!(result, reference_to)
     if descriptor.kind == :mutual_source_equivalent
-        triangular_resistance_values = Float64[]
-        triangular_inductance_values = Float64[]
-        for column in 1:descriptor.phase_index
-            first_column = 27 + 18 * (column - 1)
-            resistance_value = fixed_card_optional_float_field!(
-                result,
-                image,
-                line_no,
-                first_column,
-                first_column + 5,
-                "coupled_lumped_resistance_$column",
-            )
-            inductance_value = fixed_card_optional_float_field!(
-                result,
-                image,
-                line_no,
-                first_column + 6,
-                first_column + 17,
-                "coupled_lumped_inductance_$column",
-            )
-            push!(triangular_resistance_values, ismissing(resistance_value) ? 0.0 : resistance_value)
-            push!(triangular_inductance_values, ismissing(inductance_value) ? 0.0 : inductance_value)
-        end
-        sequence_resistance = first(triangular_resistance_values)
-        sequence_inductance = first(triangular_inductance_values)
+        values = fixed_card_coupled_lumped_pair_values!(result, image, line_no)
+        triangular_resistance_values = values.resistance_values
+        triangular_inductance_values = values.inductance_values
+        sequence_resistance =
+            isempty(triangular_resistance_values) ?
+            missing :
+            first(triangular_resistance_values)
+        sequence_inductance =
+            isempty(triangular_inductance_values) ?
+            missing :
+            first(triangular_inductance_values)
         raw_resistance = sequence_resistance
         raw_inductance = sequence_inductance
         raw_capacitance = missing
@@ -1127,6 +1235,25 @@ function parse_fixed_card_coupled_line_row!(
     record_card!(result, :fixed_card_coupled_line)
     record_card!(result, Symbol("fixed_card_coupled_line_phase_", descriptor.phase_index))
     record_card!(result, Symbol("fixed_card_coupled_line_", descriptor.kind))
+    if !ismissing(reference_from_index) || !ismissing(reference_to_index)
+        if ismissing(reference_from_index) || ismissing(reference_to_index)
+            add_issue!(
+                result.validation,
+                missing_data(
+                    "line $line_no",
+                    "coupled-line COPY requires both reference terminals",
+                ),
+            )
+        else
+            record_card!(result, :fixed_card_coupled_line_copy_reference)
+            record_card!(
+                result,
+                descriptor.kind == :mutual_source_equivalent ?
+                :fixed_card_coupled_lumped_copy_reference :
+                :fixed_card_distributed_line_copy_reference,
+            )
+        end
+    end
     return true
 end
 
@@ -2809,11 +2936,19 @@ function parse_bpa_fixed_branch_card!(
     line_no::Int;
     branch_vintage_mode::Int = 0,
 )::Bool
+    image = fixed_image(line)
+    initial_issues = length(result.validation.issues)
+    if coupled_lumped_numeric_continuation_row(result, image)
+        return append_coupled_lumped_continuation_row!(
+            result,
+            image,
+            line_no,
+            initial_issues,
+        )
+    end
     if bpa_fixed_branch_free_field_row_candidate(line)
         return parse_bpa_fixed_branch_free_field_card!(result, line, line_no)
     end
-    image = fixed_image(line)
-    initial_issues = length(result.validation.issues)
     from_node, to_node = fixed_card_branch_terminal_pair!(result, image, line_no)
     aux_1 = fixed_field(image, 15, 20)
     aux_2 = fixed_field(image, 21, 26)
@@ -3475,6 +3610,8 @@ function validate_coupled_line_rows!(result::DeckParseResult)
     accepted_single_phase_distributed_index = 0
     accepted_group_index = 0
     accepted_distributed_group_index = 0
+    accepted_coupled_impedances = CoupledLumpedSequenceImpedance[]
+    accepted_distributed_constants = DistributedTransposedLineConstants[]
     while index <= length(rows)
         row = rows[index]
         if row.sampled_frequency_data_requested
@@ -3636,7 +3773,9 @@ function validate_coupled_line_rows!(result::DeckParseResult)
                     result,
                     candidate,
                     accepted_distributed_group_index,
+                    accepted_distributed_constants,
                 )
+                push!(accepted_distributed_constants, constants)
                 modal_state = distributed_transposed_line_modal_branch_state(
                     constants;
                     name = Symbol(
@@ -3712,31 +3851,15 @@ function validate_coupled_line_rows!(result::DeckParseResult)
             continue
         end
 
-        if index + 2 > length(rows)
-            record_fixed_blocker!(result, :bpa_fixed_branch_blocked,
-                                  :fixed_card_coupled_lumped_sequence_incomplete)
-            add_issue!(
-                result.validation,
-                missing_data(
-                    "line $(row.line_no)",
-                    "expected fixed-card coupled lumped sequence rows 51, 52, and 53",
-                ),
-            )
-            index += 1
-            continue
-        end
-
-        candidate = rows[index:(index + 2)]
-        if !all(candidate_row -> candidate_row.line_kind == :mutual_source_equivalent,
-                candidate) ||
-           [candidate_row.phase_index for candidate_row in candidate] != [1, 2, 3]
+        candidate = _coupled_lumped_sequence_group_at(rows, index)
+        if isempty(candidate)
             record_fixed_blocker!(result, :bpa_fixed_branch_blocked,
                                   :fixed_card_coupled_lumped_sequence_incomplete)
             add_issue!(
                 result.validation,
                 invalid_value(
                     "line $(row.line_no)",
-                    "expected contiguous fixed-card coupled lumped sequence phase rows [51, 52, 53]",
+                    "expected contiguous fixed-card coupled R-L phase rows beginning with type 51",
                 ),
             )
             index += 1
@@ -3745,7 +3868,12 @@ function validate_coupled_line_rows!(result::DeckParseResult)
 
         accepted_group_index += 1
         try
-            _coupled_lumped_sequence_impedance_from_rows(candidate, accepted_group_index)
+            impedance = _coupled_lumped_sequence_impedance_from_rows(
+                candidate,
+                accepted_group_index,
+                accepted_coupled_impedances,
+            )
+            push!(accepted_coupled_impedances, impedance)
             record_card!(result, :fixed_card_coupled_lumped_sequence_impedance)
         catch err
             record_fixed_blocker!(result, :bpa_fixed_branch_blocked,
@@ -3758,7 +3886,7 @@ function validate_coupled_line_rows!(result::DeckParseResult)
                 ),
             )
         end
-        index += 3
+        index += length(candidate)
     end
     try
         accept_kc_lee_modal_line_groups!(result)

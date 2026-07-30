@@ -633,40 +633,116 @@ function _coupled_lumped_sequence_row_groups(rows::AbstractVector{DeckCoupledLin
     groups = Vector{Vector{DeckCoupledLineRow}}()
     index = 1
     while index <= length(rows)
-        row = rows[index]
-        if row.line_kind != :mutual_source_equivalent
+        group = _coupled_lumped_sequence_group_at(rows, index)
+        if isempty(group)
             index += 1
             continue
         end
-        if index + 2 <= length(rows)
-            candidate = rows[index:(index + 2)]
-            if all(candidate_row -> candidate_row.line_kind == :mutual_source_equivalent,
-                   candidate) &&
-               [candidate_row.phase_index for candidate_row in candidate] == [1, 2, 3]
-                push!(groups, collect(candidate))
-                index += 3
-                continue
-            end
-        end
-        index += 1
+        push!(groups, group)
+        index += length(group)
     end
     return groups
+end
+
+function _coupled_lumped_sequence_group_at(
+    rows::AbstractVector{DeckCoupledLineRow},
+    index::Int,
+)
+    index <= length(rows) || return DeckCoupledLineRow[]
+    first_row = rows[index]
+    first_row.line_kind == :mutual_source_equivalent || return DeckCoupledLineRow[]
+    first_row.phase_index == 1 || return DeckCoupledLineRow[]
+    group = DeckCoupledLineRow[]
+    expected_phase = 1
+    while index <= length(rows)
+        row = rows[index]
+        row.line_kind == :mutual_source_equivalent || break
+        row.phase_index == expected_phase || break
+        push!(group, row)
+        index += 1
+        expected_phase += 1
+    end
+    return group
+end
+
+function _coupled_lumped_sequence_reference(
+    accepted::AbstractVector{CoupledLumpedSequenceImpedance},
+    row::DeckCoupledLineRow,
+)
+    ismissing(row.reference_from_node_value) && return nothing
+    ismissing(row.reference_to_node_value) && return nothing
+    for impedance in Iterators.reverse(accepted)
+        isempty(impedance.from_node_indices) && continue
+        if impedance.from_node_indices[1] == row.reference_from_node_value &&
+           impedance.to_node_indices[1] == row.reference_to_node_value
+            return impedance
+        end
+    end
+    return nothing
+end
+
+function _copy_coupled_lumped_sequence_impedance(
+    source::CoupledLumpedSequenceImpedance,
+    rows::AbstractVector{DeckCoupledLineRow},
+    group_index::Int,
+)
+    phase_count = length(rows)
+    phase_count == source.phase_count ||
+        throw(ArgumentError("coupled R-L COPY row count does not match reference group"))
+    arguments = (
+        Symbol("coupled_lumped_sequence_impedance_", group_index),
+        [row.phase_index for row in rows],
+        [row.from_node for row in rows],
+        [row.to_node for row in rows],
+        [row.from_node_value for row in rows],
+        [row.to_node_value for row in rows],
+    )
+    line_numbers = [row.line_no for row in rows]
+    if source.input_kind == :sequence_shorthand
+        return coupled_lumped_sequence_impedance(
+            arguments...,
+            source.zero_sequence_resistance,
+            source.positive_sequence_resistance,
+            source.zero_sequence_inductance,
+            source.positive_sequence_inductance;
+            line_numbers,
+        )
+    end
+    return coupled_lumped_matrix_impedance(
+        arguments...,
+        source.phase_resistance_matrix,
+        source.phase_inductance_matrix;
+        line_numbers,
+    )
 end
 
 function _coupled_lumped_sequence_impedance_from_rows(
     rows::AbstractVector{DeckCoupledLineRow},
     group_index::Int,
+    accepted::AbstractVector{CoupledLumpedSequenceImpedance}=
+        CoupledLumpedSequenceImpedance[],
 )
-    length(rows) == 3 || throw(ArgumentError("coupled lumped sequence group must contain three rows"))
-    explicit_matrix = any(
+    phase_count = length(rows)
+    phase_count > 0 || throw(ArgumentError("coupled R-L group is empty"))
+    [row.phase_index for row in rows] == collect(1:phase_count) ||
+        throw(ArgumentError("coupled R-L rows must be contiguous from phase 1"))
+    first_row = first(rows)
+    if !ismissing(first_row.reference_from_node_value) ||
+       !ismissing(first_row.reference_to_node_value)
+        source = _coupled_lumped_sequence_reference(accepted, first_row)
+        source === nothing &&
+            throw(ArgumentError("coupled R-L COPY reference does not match a prior group"))
+        return _copy_coupled_lumped_sequence_impedance(source, rows, group_index)
+    end
+    explicit_matrix = phase_count != 3 || any(
         row -> any(!=(0.0), row.triangular_resistance_values[2:end]) ||
                any(!=(0.0), row.triangular_inductance_values[2:end]),
         rows,
     ) || _sequence_numeric_value(rows[3].sequence_resistance) != 0.0 ||
          _sequence_numeric_value(rows[3].sequence_inductance) != 0.0
     if explicit_matrix
-        resistance = zeros(Float64, 3, 3)
-        inductance = zeros(Float64, 3, 3)
+        resistance = zeros(Float64, phase_count, phase_count)
+        inductance = zeros(Float64, phase_count, phase_count)
         for row in rows
             length(row.triangular_resistance_values) == row.phase_index ||
                 throw(ArgumentError("coupled R-L row is missing triangular resistance values"))
@@ -712,10 +788,14 @@ end
 
 function deck_coupled_lumped_sequence_impedances(result::DeckParseResult)
     groups = _coupled_lumped_sequence_row_groups(result.coupled_line_rows)
-    return CoupledLumpedSequenceImpedance[
-        _coupled_lumped_sequence_impedance_from_rows(group, index)
-        for (index, group) in enumerate(groups)
-    ]
+    impedances = CoupledLumpedSequenceImpedance[]
+    for (index, group) in enumerate(groups)
+        push!(
+            impedances,
+            _coupled_lumped_sequence_impedance_from_rows(group, index, impedances),
+        )
+    end
+    return impedances
 end
 
 function _distributed_transposed_line_row_groups(rows::AbstractVector{DeckCoupledLineRow})
@@ -1447,8 +1527,57 @@ function _distributed_transposed_line_constants_from_rows(
     result::DeckParseResult,
     rows::AbstractVector{DeckCoupledLineRow},
     group_index::Int,
+    accepted::AbstractVector{DistributedTransposedLineConstants}=
+        DistributedTransposedLineConstants[],
 )
     length(rows) == 3 || throw(ArgumentError("distributed transposed line group must contain three rows"))
+    first_row = first(rows)
+    if !ismissing(first_row.reference_from_node_value) ||
+       !ismissing(first_row.reference_to_node_value)
+        source = nothing
+        if !ismissing(first_row.reference_from_node_value) &&
+           !ismissing(first_row.reference_to_node_value)
+            source = findlast(accepted) do constants
+                constants.from_node_indices[1] == first_row.reference_from_node_value &&
+                    constants.to_node_indices[1] == first_row.reference_to_node_value
+            end
+        end
+        source === nothing &&
+            throw(ArgumentError("distributed-line COPY reference does not match a prior group"))
+        constants = accepted[source]
+        explicit_third_sequence =
+            length(constants.sequence_resistance_per_length) == 3
+        return distributed_transposed_line_constants(
+            Symbol("distributed_transposed_line_constants_", group_index),
+            [row.phase_index for row in rows],
+            [row.from_node for row in rows],
+            [row.to_node for row in rows],
+            [row.from_node_value for row in rows],
+            [row.to_node_value for row in rows],
+            constants.sequence_resistance_per_length[1],
+            constants.sequence_resistance_per_length[2],
+            constants.sequence_inductance_input_values[1],
+            constants.sequence_inductance_input_values[2],
+            constants.sequence_capacitance_input_values[1],
+            constants.sequence_capacitance_input_values[2],
+            constants.line_length;
+            x_frequency_hz = constants.x_frequency_hz,
+            c_frequency_hz = constants.c_frequency_hz,
+            line_numbers = [row.line_no for row in rows],
+            third_sequence_resistance_per_length =
+                explicit_third_sequence ?
+                constants.sequence_resistance_per_length[3] :
+                nothing,
+            third_sequence_inductance_input =
+                explicit_third_sequence ?
+                constants.sequence_inductance_input_values[3] :
+                nothing,
+            third_sequence_capacitance_input =
+                explicit_third_sequence ?
+                constants.sequence_capacitance_input_values[3] :
+                nothing,
+        )
+    end
     third_sequence_values = (
         rows[3].raw_resistance,
         rows[3].raw_inductance,
@@ -1497,10 +1626,19 @@ end
 
 function deck_distributed_transposed_line_constants(result::DeckParseResult)
     groups = _distributed_transposed_line_row_groups(result.coupled_line_rows)
-    return DistributedTransposedLineConstants[
-        _distributed_transposed_line_constants_from_rows(result, group, index)
-        for (index, group) in enumerate(groups)
-    ]
+    constants = DistributedTransposedLineConstants[]
+    for (index, group) in enumerate(groups)
+        push!(
+            constants,
+            _distributed_transposed_line_constants_from_rows(
+                result,
+                group,
+                index,
+                constants,
+            ),
+        )
+    end
+    return constants
 end
 
 function deck_distributed_transposed_line_modal_branch_states(result::DeckParseResult)
