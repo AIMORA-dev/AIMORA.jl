@@ -308,7 +308,7 @@ function _stamp_fixed_source_dc_admittance!(
     for row in DeckParser.deck_over2_branch_rows(parsed)
         admittance = if row.branch_kind == :conductance
             complex(Float64(row.conductance), 0.0)
-        elseif row.branch_kind == :series_rl && row.resistance > 0.0
+        elseif row.branch_kind == :series_rl && row.resistance != 0.0
             complex(inv(Float64(row.resistance)), 0.0)
         else
             continue

@@ -115,6 +115,26 @@ mutable struct SeriesRLBranch <: EMTElement
     i_prev::Float64
     v_prev::Float64
     i_last::Float64
+
+    function SeriesRLBranch(
+        a::Int,
+        b::Int,
+        r::Float64,
+        l::Float64,
+        i_prev::Float64,
+        v_prev::Float64,
+        i_last::Float64,
+    )
+        isfinite(r) ||
+            throw(ArgumentError("series R-L resistance must be finite"))
+        isfinite(l) && l >= 0.0 ||
+            throw(ArgumentError("series R-L inductance must be finite and nonnegative"))
+        l > 0.0 || r > 0.0 ||
+            throw(ArgumentError("series resistor-only branch resistance must be positive"))
+        all(isfinite, (i_prev, v_prev, i_last)) ||
+            throw(ArgumentError("series R-L accepted state must be finite"))
+        return new(a, b, r, l, i_prev, v_prev, i_last)
+    end
 end
 
 SeriesRLBranch(a::Int, b::Int, r::Float64, l::Float64) = SeriesRLBranch(a, b, r, l, 0.0, 0.0, 0.0)
@@ -426,6 +446,11 @@ end
 function branch_companion_snapshot(b::SeriesRLBranch, voltage::AbstractVector{Float64}, dt::Float64)
     g, ih = companion(b, dt)
     vb = branch_voltage(voltage, b.a, b.b)
+    isfinite(vb) ||
+        throw(ArgumentError("series R-L branch voltage must be finite"))
+    current = g * vb + ih
+    isfinite(current) ||
+        throw(ArgumentError("series R-L branch current must be finite"))
     return BranchCompanionSnapshot(
         :series_rl,
         b.a,
@@ -433,7 +458,7 @@ function branch_companion_snapshot(b::SeriesRLBranch, voltage::AbstractVector{Fl
         g,
         ih,
         vb,
-        g * vb + ih,
+        current,
         b.i_prev,
         b.v_prev,
     )
@@ -563,7 +588,9 @@ branch_current_value(
     b::SeriesRLBranch,
     ::AbstractVector{Float64},
     ::Float64,
-) = b.i_last
+) = isfinite(b.i_last) ?
+    b.i_last :
+    throw(ArgumentError("series R-L accepted current must be finite"))
 
 branch_current_value(
     b::SeriesRLCBranch,
@@ -1156,7 +1183,24 @@ function stamp_breqiv_phase_admittance!(y::AbstractMatrix{Float64}, b::BreqivHis
 end
 
 function companion(b::SeriesRLBranch, dt::Float64)
-    return series_rl_companion(b.r, b.l, b.i_prev, b.v_prev, dt)
+    isfinite(dt) && dt > 0.0 ||
+        throw(ArgumentError("series R-L timestep must be finite and positive"))
+    isfinite(b.r) ||
+        throw(ArgumentError("series R-L resistance must be finite"))
+    isfinite(b.l) && b.l >= 0.0 ||
+        throw(ArgumentError("series R-L inductance must be finite and nonnegative"))
+    b.l > 0.0 || b.r > 0.0 ||
+        throw(ArgumentError("series resistor-only branch resistance must be positive"))
+    all(isfinite, (b.i_prev, b.v_prev, b.i_last)) ||
+        throw(ArgumentError("series R-L accepted state must be finite"))
+    denominator = b.r + 2.0 * b.l / dt
+    isfinite(denominator) && denominator != 0.0 ||
+        throw(ArgumentError("series R-L companion denominator must be finite and nonzero"))
+    conductance, history_current =
+        series_rl_companion(b.r, b.l, b.i_prev, b.v_prev, dt)
+    all(isfinite, (conductance, history_current)) ||
+        throw(ArgumentError("series R-L companion values must be finite"))
+    return conductance, history_current
 end
 
 function companion(b::SeriesRLCBranch, dt::Float64)
@@ -1317,7 +1361,11 @@ end
 function update!(b::SeriesRLBranch, v, dt::Float64)
     g, ih = companion(b, dt)
     vb = branch_voltage(v, b.a, b.b)
+    isfinite(vb) ||
+        throw(ArgumentError("series R-L branch voltage must be finite"))
     i = g * vb + ih
+    isfinite(i) ||
+        throw(ArgumentError("series R-L accepted current must be finite"))
     b.v_prev = vb
     b.i_prev = i
     b.i_last = i

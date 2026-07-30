@@ -2096,15 +2096,31 @@ function _seed_steady_state_series_rl_branch!(
     sample,
     frequency_hz::Float64,
 )
+    isfinite(frequency_hz) && frequency_hz >= 0.0 ||
+        throw(ArgumentError("series R-L steady-state frequency must be finite and nonnegative"))
     branch_voltage_phasor =
         _steady_state_node_voltage_phasor(sample, branch.a) -
         _steady_state_node_voltage_phasor(sample, branch.b)
+    all(
+        isfinite,
+        (
+            real(branch_voltage_phasor),
+            imag(branch_voltage_phasor),
+        ),
+    ) || throw(ArgumentError("series R-L steady-state voltage must be finite"))
     impedance =
         branch.l <= 0.0 ?
         complex(branch.r, 0.0) :
         complex(branch.r, 2.0 * pi * frequency_hz * branch.l)
     current_phasor =
         abs(impedance) == 0.0 ? complex(0.0, 0.0) : branch_voltage_phasor / impedance
+    all(
+        isfinite,
+        (
+            real(current_phasor),
+            imag(current_phasor),
+        ),
+    ) || throw(ArgumentError("series R-L steady-state current must be finite"))
     branch.v_prev = real(branch_voltage_phasor)
     branch.i_prev = real(current_phasor)
     branch.i_last = branch.i_prev

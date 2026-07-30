@@ -975,6 +975,24 @@ function parse_series_rl!(result::DeckParseResult, tokens, line_no::Int)
     if resistance === nothing || inductance === nothing
         return result
     end
+    if !isfinite(resistance)
+        add_issue!(result.validation,
+                   invalid_value("line $line_no",
+                                 "resistance=$(String(tokens[5])): expected a finite Float64"))
+        return result
+    end
+    if !isfinite(inductance) || inductance <= 0.0
+        add_issue!(result.validation,
+                   invalid_value("line $line_no",
+                                 "inductance=$(String(tokens[6])): expected a positive finite Float64"))
+        return result
+    end
+    if !isfinite(previous_current) || !isfinite(previous_voltage)
+        add_issue!(result.validation,
+                   invalid_value("line $line_no",
+                                 "series R-L initial current and voltage must be finite"))
+        return result
+    end
     push_element!(
         result,
         tokens,

@@ -1498,6 +1498,21 @@ function push_bpa_fixed_branch_scalar_row!(
         capacitance;
         legacy_microfarad_units = branch_layout_kind != :free_field,
     )
+    if !all(
+        isfinite,
+        (
+            resistance,
+            inductance,
+            capacitance,
+            timestep_inductance,
+            timestep_capacitance,
+        ),
+    )
+        add_issue!(result.validation,
+                   invalid_value("line $line_no",
+                                 "OVER2 scalar branch R/L/C values must be finite"))
+        return true
+    end
     if resistance > 0.0 && inductance == 0.0 && capacitance == 0.0
         parse_resistor!(result, ["resistor", name, from_node, to_node, string(resistance)], line_no)
         record_fixed_card!(result, :bpa_fixed_branch, :bpa_fixed_branch_resistor, initial_issues)
@@ -1511,13 +1526,51 @@ function push_bpa_fixed_branch_scalar_row!(
             line_no,
         )
         record_fixed_card!(result, :bpa_fixed_branch, :bpa_fixed_branch_capacitor, initial_issues)
-    elseif resistance > 0.0 && inductance > 0.0 && capacitance == 0.0
-        parse_series_rl!(
-            result,
-            ["rl", name, from_node, to_node, string(resistance), string(timestep_inductance)],
-            line_no,
-        )
-        record_fixed_card!(result, :bpa_fixed_branch, :bpa_fixed_branch_rl, initial_issues)
+    elseif resistance != 0.0 && inductance > 0.0 && capacitance == 0.0
+        active_denominator_valid = true
+        if resistance < 0.0
+            timestep_s = Float64(deck_fixed_time_horizon_options(result).dt_s)
+            denominator =
+                timestep_s > 0.0 ?
+                resistance + 2.0 * timestep_inductance / timestep_s :
+                NaN
+            active_denominator_valid =
+                isfinite(timestep_s) &&
+                timestep_s > 0.0 &&
+                isfinite(denominator) &&
+                denominator != 0.0
+            active_denominator_valid || add_issue!(
+                result.validation,
+                invalid_value(
+                    "line $line_no",
+                    "active series R-L requires a positive timestep and a finite nonzero companion denominator",
+                ),
+            )
+        end
+        if active_denominator_valid
+            parse_series_rl!(
+                result,
+                [
+                    "rl",
+                    name,
+                    from_node,
+                    to_node,
+                    string(resistance),
+                    string(timestep_inductance),
+                ],
+                line_no,
+            )
+            record_fixed_card!(
+                result,
+                :bpa_fixed_branch,
+                :bpa_fixed_branch_rl,
+                initial_issues,
+            )
+            if resistance < 0.0 &&
+               length(result.validation.issues) == initial_issues
+                record_card!(result, :bpa_fixed_branch_active_rl)
+            end
+        end
     elseif resistance >= 0.0 && inductance >= 0.0 && capacitance > 0.0
         from_index = node_id!(result, from_node)
         to_index = node_id!(result, to_node)
