@@ -288,25 +288,54 @@ function _source_function_network_runtime(
     plan = deck_over16_boundary_plan(parsed)
     source_rows = DeckParser.deck_over5a_source_rows(parsed)
     source_slots = Base.RefValue{Float64}[Ref(0.0) for _ in 1:10]
+    row_slots = Base.RefValue{Float64}[Ref(0.0) for _ in source_rows]
+    dynamic_row_indices = Int[]
     source_element_count = 0
     previous_iform = 0
-    for row in source_rows
+    for (row_index, row) in enumerate(source_rows)
         source_type = abs(row.iform)
-        controlled_successor = previous_iform == 16
+        type16_successor = previous_iform == 16
+        type17_successor = previous_iform == 17
         previous_iform = row.iform
-        (1 <= source_type <= 10 && !controlled_successor) || continue
+        if 1 <= source_type <= 10 && !type16_successor && !type17_successor
+            node_index = abs(row.node_value)
+            node_index > 0 ||
+                throw(ArgumentError("source-function rows require a nonzero node"))
+            slot = source_slots[source_type]
+            element = row.node_value < 0 ?
+                CurrentInjection(node_index, _time_s -> slot[]) :
+                TheveninSource(
+                    node_index,
+                    DeckParser.BPA_FIXED_SOURCE_CONDUCTANCE,
+                    _time_s -> slot[],
+                )
+            push!(elements, element)
+            push!(element_names, Symbol("source_function_", String(row.name)))
+            source_element_count += 1
+            continue
+        end
+        dynamic_source = source_type >= 60 || type17_successor
+        dynamic_source || continue
         node_index = abs(row.node_value)
         node_index > 0 || throw(ArgumentError("source-function rows require a nonzero node"))
-        slot = source_slots[source_type]
+        if source_type in 11:15
+            element_index = findfirst(==(row.name), element_names)
+            element_index === nothing || begin
+                deleteat!(elements, element_index)
+                deleteat!(element_names, element_index)
+            end
+        end
+        slot = row_slots[row_index]
         element = row.node_value < 0 ?
             CurrentInjection(node_index, _time_s -> slot[]) :
             TheveninSource(
                 node_index,
                 DeckParser.BPA_FIXED_SOURCE_CONDUCTANCE,
                 _time_s -> slot[],
-            )
+        )
         push!(elements, element)
-        push!(element_names, Symbol("source_function_", String(row.name)))
+        push!(element_names, Symbol("source_row_", String(row.name)))
+        push!(dynamic_row_indices, row_index)
         source_element_count += 1
     end
     source_element_count > 0 || return nothing
@@ -327,6 +356,8 @@ function _source_function_network_runtime(
         ),
         plan,
         source_slots,
+        row_slots,
+        dynamic_row_indices,
         source_signal_provider,
         internal_analytic_requested,
         0,
@@ -339,6 +370,42 @@ function _source_function_network_runtime(
         -Inf,
         1,
     )
+end
+
+function _synchronize_source_function_row_slots!(
+    runtime::SourceFunctionNetworkRuntime,
+    time_s::Float64,
+    xtcs_values::AbstractVector{<:Real},
+)
+    isempty(runtime.dynamic_row_indices) && return nothing
+    plan = runtime.plan
+    node_count = maximum(abs, plan.source_node_values; init = 0)
+    row_result = over16_source_row_update!(
+        zeros(Float64, node_count),
+        zeros(Float64, node_count),
+        copy(plan.source_node_values),
+        copy(plan.source_iform_values),
+        copy(plan.source_tstart_values),
+        copy(plan.source_tstop_values),
+        runtime.state.voltbc_values,
+        time_s;
+        kconst = plan.source_row_count,
+        crest_values = copy(plan.source_crest_values),
+        time1_values = copy(plan.source_time1_values),
+        time2_values = copy(plan.source_time2_values),
+        sfreq_values = copy(plan.source_sfreq_values),
+        xtcs_values = xtcs_values,
+    )
+    unresolved_dynamic_row_indices =
+        intersect(runtime.dynamic_row_indices, row_result.deferred_row_indices)
+    isempty(unresolved_dynamic_row_indices) || throw(ArgumentError(
+        "dynamic source rows remain unresolved: " *
+        join(unresolved_dynamic_row_indices, ","),
+    ))
+    for row_index in runtime.dynamic_row_indices
+        runtime.row_slot_values[row_index][] = row_result.source_values[row_index]
+    end
+    return row_result
 end
 
 function _control_system_signal_slot_values(
@@ -375,10 +442,25 @@ function _source_function_control_signal_values(context::EMTStepContext)
     runtime = context.source_function_runtime
     runtime === nothing && return Float64[]
     plan = runtime.plan
-    plan.source_tacs_override_count == 0 && return Float64[]
+    row_indices = Int[
+        round(Int, plan.source_sfreq_values[index])
+        for index in eachindex(plan.source_iform_values)
+        if (
+            plan.source_iform_values[index] == 17 ||
+            abs(plan.source_iform_values[index]) >= 60
+        ) &&
+           isinteger(plan.source_sfreq_values[index]) &&
+           plan.source_sfreq_values[index] > 0.0
+    ]
+    override_indices =
+        plan.source_tacs_override_count == 0 ?
+        Int[] :
+        copy(plan.source_tacs_override_xtcs_indices)
+    referenced_indices = vcat(row_indices, override_indices)
+    isempty(referenced_indices) && return Float64[]
     return _control_system_signal_slot_values(
         context;
-        maximum_index = maximum(plan.source_tacs_override_xtcs_indices),
+        maximum_index = maximum(referenced_indices),
     )
 end
 
@@ -870,10 +952,14 @@ function _initialize_source_function_state!(
         )
         interpolation_applied = true
     end
-    tacs_kwargs = plan.source_tacs_override_count == 0 ? NamedTuple() : merge(
-        _deck_over16_source_tacs_override_kwargs(plan),
-        (xtcs_values = _source_function_control_signal_values(context),),
-    )
+    control_signal_values = _source_function_control_signal_values(context)
+    tacs_kwargs =
+        plan.source_tacs_override_count == 0 ?
+        (xtcs_values = control_signal_values,) :
+        merge(
+            _deck_over16_source_tacs_override_kwargs(plan),
+            (xtcs_values = control_signal_values,),
+        )
     analytic_kwargs = _deck_over16_source_analytic_kwargs(plan, context)
     analytic_assignment_indices = isempty(analytic_kwargs) ? Int[] : collect(1:10)
     if isempty(analytic_kwargs) && source_signal_analytic_active(provider)
@@ -951,10 +1037,14 @@ function _advance_source_function_network!(context::EMTStepContext)
         )
         provider_applied = true
     end
-    tacs_kwargs = plan.source_tacs_override_count == 0 ? NamedTuple() : merge(
-        _deck_over16_source_tacs_override_kwargs(plan),
-        (xtcs_values = _source_function_control_signal_values(context),),
-    )
+    control_signal_values = _source_function_control_signal_values(context)
+    tacs_kwargs =
+        plan.source_tacs_override_count == 0 ?
+        (xtcs_values = control_signal_values,) :
+        merge(
+            _deck_over16_source_tacs_override_kwargs(plan),
+            (xtcs_values = control_signal_values,),
+        )
     analytic_kwargs = _deck_over16_source_analytic_kwargs(plan, context)
     analytic_assignment_indices = Int[]
     if isempty(analytic_kwargs) &&
@@ -979,7 +1069,7 @@ function _advance_source_function_network!(context::EMTStepContext)
         runtime.state;
         merge(card_kwargs, tacs_kwargs, analytic_kwargs)...,
     )
-    return _record_source_function_update!(
+    recorded = _record_source_function_update!(
         runtime,
         update,
         context.step_index,
@@ -990,6 +1080,12 @@ function _advance_source_function_network!(context::EMTStepContext)
         analytic_assignment_indices = analytic_assignment_indices,
         record_stage_sample = _source_signal_stage_recording_active(runtime),
     )
+    _synchronize_source_function_row_slots!(
+        runtime,
+        context.t_s,
+        get(tacs_kwargs, :xtcs_values, Float64[]),
+    )
+    return recorded
 end
 
 function _append_dynamic_source_and_control_elements!(

@@ -175,6 +175,7 @@ using ..Timestep: OVER16CSUPDeviceInputTerm,
                   over16_elec_tacsto_xref1_reference_entry,
                   over16_elec_tacsto_xref1_reference_request,
                   over16_elec_tacsto_xref1_table_entry,
+                  over16_source_row_update!,
                   over16_source_row_update_preview,
                   over16_elec_tacsto_error_state,
                   over16_elec_tacsto_output_node,
@@ -545,6 +546,7 @@ struct DeckSynchronousMachineHorizon
     trace::DeckEMTTrace
     time_s::Vector{Float64}
     source_type::Int
+    terminal_source_node_values::Vector{Int}
     terminal_voltage_values::Matrix{Float64}
     terminal_current_values::Matrix{Float64}
     terminal_open_circuit_voltage_values::Matrix{Float64}
@@ -578,6 +580,7 @@ struct DeckSynchronousMachineFleetHorizon
     time_s::Vector{Float64}
     source_types::Vector{Int}
     terminal_node_indices::Matrix{Int}
+    terminal_source_node_values::Matrix{Int}
     terminal_voltage_values::Array{Float64,3}
     terminal_current_values::Array{Float64,3}
     terminal_open_circuit_voltage_values::Array{Float64,3}
@@ -913,6 +916,8 @@ mutable struct SourceFunctionNetworkRuntime
     state::OVER16SourceCardState
     plan::DeckOVER16BoundaryPlan
     slot_values::Vector{Base.RefValue{Float64}}
+    row_slot_values::Vector{Base.RefValue{Float64}}
+    dynamic_row_indices::Vector{Int}
     signal_provider::AbstractSourceSignalProvider
     internal_analytic_requested::Bool
     executed_step_count::Int

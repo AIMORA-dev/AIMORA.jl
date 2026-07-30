@@ -1232,6 +1232,18 @@ function parse_synchronous_machine_terminal_voltage_card!(
     end
     terminal_node = Symbol(node)
     terminal_node_value = node_id!(result, node)
+    secondary_control = fixed_int_or_default!(
+        result,
+        image,
+        line_no,
+        9,
+        10,
+        "source_secondary_control",
+        0,
+    )
+    secondary_control === nothing && return true
+    source_node_value =
+        secondary_control < 0 ? -terminal_node_value : terminal_node_value
     phase_index = state.terminal_phase_count + 1
     push!(
         result.synchronous_machine_terminal_voltage_rows,
@@ -1243,6 +1255,7 @@ function parse_synchronous_machine_terminal_voltage_card!(
             phase_index,
             terminal_node,
             terminal_node_value,
+            source_node_value,
             something(fixed_float_value(image, 11, 20), missing),
             something(fixed_float_value(image, 21, 30), missing),
             something(fixed_float_value(image, 31, 40), missing),
@@ -1255,6 +1268,8 @@ function parse_synchronous_machine_terminal_voltage_card!(
     record_card!(result, :bpa_fixed_source)
     record_card!(result, Symbol("synchronous_machine_source_type_", source_type))
     source_type == 59 && record_card!(result, :bpa_fixed_source_type59)
+    secondary_control < 0 &&
+        record_card!(result, :bpa_fixed_source_negative_secondary_control)
     record_card!(result, :synchronous_machine_terminal_voltage)
     record_card!(result, :synchronous_machine_data_section)
     return true
@@ -1639,6 +1654,7 @@ function finish_synchronous_machine_data!(
                 row.phase_index,
                 row.terminal_node,
                 row.terminal_node_value,
+                row.source_node_value,
                 row.peak_terminal_voltage,
                 row.frequency_hz,
                 row.angle_deg,

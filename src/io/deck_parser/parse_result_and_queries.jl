@@ -996,6 +996,7 @@ struct DeckSynchronousMachineTerminalVoltageRow
     phase_index::Int
     terminal_node::Symbol
     terminal_node_value::Int
+    source_node_value::Int
     peak_terminal_voltage::Union{Missing,Float64}
     frequency_hz::Union{Missing,Float64}
     angle_deg::Union{Missing,Float64}
@@ -2425,6 +2426,7 @@ function deck_synchronous_machine_terminal_voltage_rows(result::DeckParseResult)
             row.phase_index,
             row.terminal_node,
             row.terminal_node_value,
+            row.source_node_value,
             row.peak_terminal_voltage,
             row.frequency_hz,
             row.angle_deg,

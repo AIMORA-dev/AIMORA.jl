@@ -1298,6 +1298,18 @@ function step_with_over16_boundary!(
     solver_over16_kwargs = _without_current_source_reset(solver_over16_kwargs)
     sync_switch_base_admittance =
         get(solver_over16_kwargs, :switch_base_admittance_from_step_context, false)
+    source_function_control_values =
+        source_config === nothing ?
+        Float64[] :
+        get(get(source_config, :kwargs, NamedTuple()), :xtcs_values, Float64[])
+    source_function_row_result =
+        context.source_function_runtime === nothing ?
+        nothing :
+        _synchronize_source_function_row_slots!(
+            context.source_function_runtime,
+            context.t_s,
+            source_function_control_values,
+        )
     source_voltage_constraint_result =
         _electromagnetic_source_voltage_constraints(
             over16_state,
@@ -1785,6 +1797,10 @@ function step_with_over16_boundary!(
         source_voltage_constraint_count = source_voltage_constraint_result.count,
         source_voltage_constraints_applied =
             source_voltage_constraint_result.applied,
+        dynamic_source_row_update_count =
+            source_function_row_result === nothing ?
+            0 :
+            length(context.source_function_runtime.dynamic_row_indices),
         current_injection_count = length(current_injections),
         current_injection_nonzero_count = count(!=(0.0), current_injections),
         nonlinear_current_compensation_carry_values =

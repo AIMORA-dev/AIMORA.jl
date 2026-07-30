@@ -229,7 +229,7 @@ function _source_signal_owner_units(
     previous_type = 0
     for index in eachindex(node_values, source_types)
         source_type = abs(source_types[index])
-        controlled_successor = previous_type == 16
+        controlled_successor = previous_type in (16, 17)
         previous_type = source_types[index]
         (1 <= source_type <= 10 && !controlled_successor) || continue
         unit = node_values[index] < 0 ? :A : :V
@@ -336,7 +336,7 @@ function _source_signal_slot_units(runtime)
     previous_type = 0
     for index in eachindex(runtime.plan.source_iform_values)
         source_type = abs(runtime.plan.source_iform_values[index])
-        controlled_successor = previous_type == 16
+        controlled_successor = previous_type in (16, 17)
         previous_type = runtime.plan.source_iform_values[index]
         (1 <= source_type <= 10 && !controlled_successor) || continue
         units[source_type] =

@@ -1343,7 +1343,10 @@ function run_deck_synchronous_machine_horizon(
         "all terminal phases of a synchronous machine must use one source type",
     ))
     source_type = only(source_types)
-    terminal_nodes = Int[row.terminal_node_value for row in terminal_rows]
+    terminal_source_nodes = Int[row.source_node_value for row in terminal_rows]
+    terminal_nodes = abs.(terminal_source_nodes)
+    terminal_nodes == Int[row.terminal_node_value for row in terminal_rows] ||
+        throw(ArgumentError("synchronous-machine source routing lost its physical terminal owner"))
     all(node -> 1 <= node <= length(parsed.node_map), terminal_nodes) ||
         throw(ArgumentError("synchronous-machine terminal node is outside the deck network"))
     delta_connected = _deck_synchronous_machine_delta_connected(parsed, 1)
@@ -1625,6 +1628,7 @@ function run_deck_synchronous_machine_horizon(
         trace,
         recorded_times,
         source_type,
+        terminal_source_nodes,
         terminal_voltages,
         terminal_currents,
         terminal_open_circuit_voltages,
@@ -1717,6 +1721,7 @@ function run_deck_synchronous_machine_fleet_horizon(
     ))
 
     terminal_node_indices = zeros(Int, 3, machine_count)
+    terminal_source_node_values = zeros(Int, 3, machine_count)
     source_types = zeros(Int, machine_count)
     source_group_indices = zeros(Int, machine_count)
     for machine_index in 1:machine_count
@@ -1740,8 +1745,15 @@ function run_deck_synchronous_machine_fleet_horizon(
             "all terminal phases of a synchronous machine must use one source group",
         ))
         source_group_indices[machine_index] = only(machine_source_groups)
+        terminal_source_node_values[:, machine_index] .=
+            Int[row.source_node_value for row in rows]
         terminal_node_indices[:, machine_index] .=
-            Int[row.terminal_node_value for row in rows]
+            abs.(terminal_source_node_values[:, machine_index])
+        terminal_node_indices[:, machine_index] ==
+            Int[row.terminal_node_value for row in rows] ||
+            throw(ArgumentError(
+                "synchronous-machine fleet source routing lost its physical terminal owner",
+            ))
     end
     flat_terminal_nodes = vec(terminal_node_indices)
     unique_terminal_nodes = unique(flat_terminal_nodes)
@@ -2196,6 +2208,7 @@ function run_deck_synchronous_machine_fleet_horizon(
         recorded_times,
         source_types,
         terminal_node_indices,
+        terminal_source_node_values,
         terminal_voltages,
         terminal_currents,
         terminal_open_circuit_voltages,

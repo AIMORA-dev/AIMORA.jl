@@ -2426,9 +2426,9 @@ function push_bpa_fixed_source_row!(
     source_iform = bpa_fixed_source_effective_iform(result, node_index, source_type)
     source_name = Symbol(name)
 
-    negative_secondary_analytic =
-        secondary_control == -1 && source_type in (13, 14)
-    if secondary_control != 0 && !negative_secondary_analytic
+    signed_routing_source =
+        source_type in 1:15 || source_type == 17 || source_type >= 60
+    if secondary_control != 0 && !signed_routing_source
         push_fixed_source_table_row!(
             result,
             source_name,
@@ -2451,6 +2451,7 @@ function push_bpa_fixed_source_row!(
                                  "Unsupported OVER5A fixed-field source secondary/control field $secondary_control: secondary control requires coupled source-state ownership"))
         return true
     end
+    current_injection_routing = secondary_control < 0
 
     controlled_successor =
         !isempty(result.over5a_source_rows) && last(result.over5a_source_rows).iform == 16
@@ -2462,7 +2463,8 @@ function push_bpa_fixed_source_row!(
         source_type in BPA_FIXED_ANALYTIC_SOURCE_TYPES && !controlled_model_source &&
         !voltbc_model_source && !tacs_model_source
     source_node_value =
-        negative_secondary_analytic ? -abs(node_index) : node_index
+        current_injection_routing ? -abs(node_index) :
+        secondary_control > 0 ? abs(node_index) : node_index
     if analytic_model_source
         source_element =
             source_node_value < 0 ?
@@ -2527,7 +2529,7 @@ function push_bpa_fixed_source_row!(
         if tstop == 0.0 && isinf(source_tstop)
             record_card!(result, :bpa_fixed_source_zero_tstop_infinite)
         end
-        negative_secondary_analytic &&
+        current_injection_routing &&
             record_card!(result, :bpa_fixed_source_negative_secondary_control)
         source_iform == source_type ||
             record_card!(result, :bpa_fixed_source_duplicate_node_incremental_iform)
