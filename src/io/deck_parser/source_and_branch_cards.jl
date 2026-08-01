@@ -3069,8 +3069,8 @@ function parse_bpa_fixed_branch_card!(
             to_node,
             initial_issues,
         )
-    elseif single_terminal_capacitance_continuation_row(image, from_node, to_node, aux_1, aux_2)
-        return parse_fixed_single_terminal_capacitance_continuation_row!(
+    elseif grounded_scalar_branch_reference_row(image, from_node, to_node, aux_1, aux_2)
+        return parse_fixed_grounded_scalar_branch_reference_row!(
             result,
             image,
             line_no,

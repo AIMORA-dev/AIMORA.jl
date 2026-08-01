@@ -1409,7 +1409,6 @@ function run_deck_emt_with_over16_boundary(
     saturated_transformer_deck_lines = nothing,
     saturated_transformer_winding_number::Int = 1,
     saturated_transformer_sparse_config::Union{Nothing,NamedTuple} = nothing,
-    saturated_transformer_allow_reference_terminal::Bool = false,
     saturated_transformer_nonlinear_current_enabled::Bool = true,
     coupled_lumped_sequence_history_enabled::Bool = false,
     steady_state_initial_sample_enabled::Bool = false,
@@ -1432,8 +1431,6 @@ function run_deck_emt_with_over16_boundary(
         saturated_transformer_deck_lines = saturated_transformer_deck_lines,
         saturated_transformer_winding_number = saturated_transformer_winding_number,
         saturated_transformer_sparse_config = saturated_transformer_sparse_config,
-        saturated_transformer_allow_reference_terminal =
-            saturated_transformer_allow_reference_terminal,
         saturated_transformer_nonlinear_current_enabled =
             saturated_transformer_nonlinear_current_enabled,
         coupled_lumped_sequence_history_enabled =
@@ -1596,7 +1593,6 @@ function _prepare_dynamic_deck_runtime(
     saturated_transformer_deck_lines = nothing,
     saturated_transformer_winding_number::Int = 1,
     saturated_transformer_sparse_config::Union{Nothing,NamedTuple} = nothing,
-    saturated_transformer_allow_reference_terminal::Bool = false,
     saturated_transformer_nonlinear_current_enabled::Bool = true,
     coupled_lumped_sequence_history_enabled::Bool = false,
     steady_state_initial_sample_enabled::Bool = false,
@@ -1623,7 +1619,6 @@ function _prepare_dynamic_deck_runtime(
             delta2 = dt_s / 2.0,
             winding_number = saturated_transformer_winding_number,
             saturated_transformer_sparse_config = saturated_transformer_sparse_config,
-            allow_reference_terminal = saturated_transformer_allow_reference_terminal,
         )
     steady_state_initial_sample =
         steady_state_initial_sample_enabled ?
@@ -1863,7 +1858,6 @@ function run_deck_emt_with_over16_boundary(
     saturated_transformer_deck_lines = nothing,
     saturated_transformer_winding_number::Int = 1,
     saturated_transformer_sparse_config::Union{Nothing,NamedTuple} = nothing,
-    saturated_transformer_allow_reference_terminal::Bool = false,
     saturated_transformer_nonlinear_current_enabled::Bool = true,
     coupled_lumped_sequence_history_enabled::Bool = false,
     steady_state_initial_sample_enabled::Bool = false,
@@ -1888,8 +1882,6 @@ function run_deck_emt_with_over16_boundary(
             saturated_transformer_winding_number,
         saturated_transformer_sparse_config =
             saturated_transformer_sparse_config,
-        saturated_transformer_allow_reference_terminal =
-            saturated_transformer_allow_reference_terminal,
         saturated_transformer_nonlinear_current_enabled =
             saturated_transformer_nonlinear_current_enabled,
         coupled_lumped_sequence_history_enabled =

@@ -1359,7 +1359,6 @@ function saturated_transformer_winding_current_config(
     node_map::AbstractDict{Symbol,<:Integer};
     winding_number::Integer=1,
     reference_node_index::Integer=0,
-    allow_reference_terminal::Bool=false,
     kwargs...,
 )
     count = length(arrays.nonlinear_types)
@@ -1376,10 +1375,6 @@ function saturated_transformer_winding_current_config(
         winding_number = winding_number,
         reference_node_index = reference_node_index,
     )
-    if !allow_reference_terminal &&
-            any(==(Int(reference_node_index)), terminal_binding.terminal_node_indices)
-        throw(ArgumentError("saturated transformer reference-terminal current config is deferred"))
-    end
     base_config = saturated_transformer_nonlinear_current_config(
         arrays,
         top_nodes,

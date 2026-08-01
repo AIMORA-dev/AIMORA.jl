@@ -1356,6 +1356,36 @@ function _stamp_semlyen_line_steady_state_admittance!(
     return matrix
 end
 
+function _stamp_sampled_frequency_line_steady_state_admittance!(
+    matrix::AbstractMatrix{ComplexF64},
+    parsed::DeckParser.DeckParseResult,
+    frequency_partition::DeckParser.DeckSteadyStateFrequencyPartition=
+        DeckParser.deck_steady_state_frequency_partition(parsed),
+)
+    options = DeckParser.deck_fixed_time_horizon_options(parsed)
+    default_frequency_hz = _deck_steady_state_frequency_hz(parsed)
+    for line in DeckParser.deck_sampled_frequency_line_elements(parsed, options.dt_s)
+        nodes = line isa SampledFrequencyDependentLineGroup ?
+            vcat(line.from_nodes, line.to_nodes) :
+            [line.a, line.b]
+        frequency_hz = _steady_state_terminal_frequency_hz(
+            frequency_partition,
+            nodes,
+            default_frequency_hz,
+        )
+        terminal_admittance =
+            sampled_line_steady_state_terminal_admittance(line, frequency_hz)
+        for column in eachindex(nodes), row in eachindex(nodes)
+            row_node = nodes[row]
+            column_node = nodes[column]
+            row_node == 0 && continue
+            column_node == 0 && continue
+            matrix[row_node, column_node] += terminal_admittance[row, column]
+        end
+    end
+    return matrix
+end
+
 function _stamp_saturated_transformer_steady_state_admittance!(
     matrix::AbstractMatrix{ComplexF64},
     transformer_admittance,
@@ -1413,10 +1443,6 @@ function _deck_steady_state_nodal_equations(
     frequency_partition::DeckParser.DeckSteadyStateFrequencyPartition=
         DeckParser.deck_steady_state_frequency_partition(parsed),
 )
-    isempty(frequency_partition.unsupported_topology_kinds) || throw(ArgumentError(
-        "mixed-frequency steady state is not yet owned for topology kinds: " *
-        join(string.(frequency_partition.unsupported_topology_kinds), ", "),
-    ))
     admittance = zeros(ComplexF64, node_count, node_count)
     rhs = zeros(ComplexF64, node_count)
     _stamp_deck_branch_steady_state_admittance!(
@@ -1455,6 +1481,11 @@ function _deck_steady_state_nodal_equations(
         frequency_partition,
     )
     _stamp_distributed_line_steady_state_admittance!(
+        admittance,
+        parsed,
+        frequency_partition,
+    )
+    _stamp_sampled_frequency_line_steady_state_admittance!(
         admittance,
         parsed,
         frequency_partition,
@@ -1873,6 +1904,14 @@ function _deck_synchronous_machine_network_initial_sample(
         parsed,
     )
     Base.inferencebarrier(_stamp_distributed_line_steady_state_admittance!)(
+        admittance,
+        parsed,
+    )
+    Base.inferencebarrier(_stamp_sampled_frequency_line_steady_state_admittance!)(
+        admittance,
+        parsed,
+    )
+    Base.inferencebarrier(_stamp_semlyen_line_steady_state_admittance!)(
         admittance,
         parsed,
     )

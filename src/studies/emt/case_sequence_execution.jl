@@ -196,7 +196,7 @@ function _network_frequency_scan_partition(
         copy(base.inactive_node_indices),
         base.scalar_branch_count,
         base.initially_closed_switch_count,
-        copy(base.unsupported_topology_kinds),
+        copy(base.topology_kinds),
     )
 end
 

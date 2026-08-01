@@ -15,7 +15,7 @@ struct DeckSteadyStateFrequencyPartition
     inactive_node_indices::Vector{Int}
     scalar_branch_count::Int
     initially_closed_switch_count::Int
-    unsupported_topology_kinds::Vector{Symbol}
+    topology_kinds::Vector{Symbol}
 end
 
 struct DeckMixedSteadyStateFrequencyConflict <: Exception
@@ -369,6 +369,7 @@ function deck_steady_state_frequency_partition(result::DeckParseResult)
 
     source_groups, source_successors =
         _source_groups_and_successors!(parents, active_sources)
+    topology_kinds = unique(edge.kind for edge in edges)
     positive_source_roots = sort!(unique(Int[
         _source_group_find!(parents, source_index)
         for source_index in node_sources
@@ -403,7 +404,7 @@ function deck_steady_state_frequency_partition(result::DeckParseResult)
         inactive_nodes,
         length(result.over2_branch_rows),
         count(row -> row.initially_closed, result.over5_switch_rows),
-        Symbol[],
+        topology_kinds,
     )
 end
 
@@ -454,8 +455,6 @@ function validate_steady_state_frequency_networks!(result::DeckParseResult)
         record_card!(result, :mixed_frequency_subnetwork_scalar_branch_topology)
         partition.initially_closed_switch_count > 0 &&
             record_card!(result, :mixed_frequency_subnetwork_switch_topology)
-        isempty(partition.unsupported_topology_kinds) ||
-            record_card!(result, :mixed_frequency_subnetwork_deferred_topology)
     end
     return result
 end

@@ -950,7 +950,7 @@ function parse_bpa_free_field_output_end_sentinel!(result::DeckParseResult,
                                                    line_no::Int)::Bool
     record_bpa_fixed_output_free_field_row!(result)
     record_card!(result, :bpa_fixed_output_end_sentinel)
-    record_card!(result, :bpa_fixed_output_interpolation_deferred)
+    record_card!(result, :bpa_fixed_output_interp_compatibility_noop)
     return true
 end
 
@@ -974,7 +974,7 @@ function parse_bpa_free_field_output_all_node_voltage!(result::DeckParseResult,
            2:length(fields))
         record_card!(result, :bpa_fixed_output_all_node_extra_names_ignored)
     end
-    record_card!(result, :bpa_fixed_output_interpolation_deferred)
+    record_card!(result, :bpa_fixed_output_interp_compatibility_noop)
     for node in node_names
         name = bpa_fixed_all_node_voltage_channel_name(node)
         initial_issues = length(result.validation.issues)
@@ -1209,7 +1209,7 @@ function parse_bpa_fixed_output_all_node_voltage!(result::DeckParseResult,
     end
     isempty(bpa_fixed_output_branch_name_fields(image)) ||
         record_card!(result, :bpa_fixed_output_all_node_extra_names_ignored)
-    record_card!(result, :bpa_fixed_output_interpolation_deferred)
+    record_card!(result, :bpa_fixed_output_interp_compatibility_noop)
     for node in node_names
         name = bpa_fixed_all_node_voltage_channel_name(node)
         initial_issues = length(result.validation.issues)
@@ -1241,7 +1241,7 @@ function parse_bpa_fixed_output_i2_node_voltages!(result::DeckParseResult,
     if isempty(nodes)
         record_card!(result, :fixed_field)
         record_card!(result, :bpa_fixed_output_end_sentinel)
-        record_card!(result, :bpa_fixed_output_interpolation_deferred)
+        record_card!(result, :bpa_fixed_output_interp_compatibility_noop)
         return true
     end
     record_card!(result, :fixed_field)

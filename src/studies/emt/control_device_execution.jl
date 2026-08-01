@@ -2318,8 +2318,6 @@ function _run_deck_emt(
             saturated_transformer_intake = saturated_transformer_intake,
             saturated_transformer_nonlinear_current_enabled =
                 saturated_transformer_intake !== nothing,
-            saturated_transformer_allow_reference_terminal =
-                saturated_transformer_intake !== nothing,
             coupled_lumped_sequence_history_enabled =
                 coupled_lumped_sequence_history_enabled ||
                 !isempty(DeckParser.deck_coupled_lumped_sequence_impedances(parsed)),
@@ -2592,8 +2590,6 @@ function prepare_emt_study(
             initial_voltage_source == :steady_state,
         saturated_transformer_intake = saturated_transformer_intake,
         saturated_transformer_nonlinear_current_enabled =
-            saturated_transformer_intake !== nothing,
-        saturated_transformer_allow_reference_terminal =
             saturated_transformer_intake !== nothing,
         coupled_lumped_sequence_history_enabled =
             coupled_lumped_sequence_history_enabled ||

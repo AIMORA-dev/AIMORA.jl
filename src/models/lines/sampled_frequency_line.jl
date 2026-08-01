@@ -6,6 +6,7 @@ export LineWeightingSamples,
        sampled_line_weighting_coefficients,
        sampled_frequency_dependent_line,
        sampled_frequency_dependent_line_group,
+       sampled_line_steady_state_terminal_admittance,
        sampled_line_history_convolution,
        sampled_line_history_convolution!
 
@@ -594,6 +595,83 @@ function line_surge_admittance(line::SampledFrequencyDependentLine)::Float64
     return inv(line.coefficients.characteristic_impedance_ohm * line.coefficients.eta)
 end
 
+function _sampled_line_harmonic_weighting(
+    weights::AbstractVector{<:Real},
+    tail::NTuple{3,Float64},
+    initial_lag::Int,
+    step_rotation::ComplexF64,
+)
+    inverse_rotation = inv(step_rotation)
+    finite_response = zero(ComplexF64)
+    lag_rotation = inverse_rotation^initial_lag
+    for weight in weights
+        finite_response += Float64(weight) * lag_rotation
+        lag_rotation *= inverse_rotation
+    end
+    current_gain, previous_gain, decay = tail
+    tail_denominator = 1.0 - decay * inverse_rotation
+    abs(tail_denominator) > eps(Float64) || throw(ArgumentError(
+        "sampled-line steady-state tail recurrence is singular",
+    ))
+    tail_response = inverse_rotation^initial_lag *
+        (current_gain + previous_gain * inverse_rotation) /
+        tail_denominator
+    return finite_response + tail_response
+end
+
+"""
+    sampled_line_steady_state_terminal_admittance(line, frequency_hz)
+
+Return the exact complex terminal admittance of the sampled line's discrete
+history recurrence at `frequency_hz`. The transform follows the production
+mutation order: the current solve uses the preceding history source, then the
+current wave slot and both weighting recurrences are updated for the next
+timestep. Phasors use peak-value cosine convention.
+"""
+function sampled_line_steady_state_terminal_admittance(
+    line::SampledFrequencyDependentLine,
+    frequency_hz::Real,
+)
+    frequency = Float64(frequency_hz)
+    isfinite(frequency) && frequency >= 0.0 || throw(ArgumentError(
+        "sampled-line steady-state frequency must be finite and nonnegative",
+    ))
+    coefficients = line.coefficients
+    step_rotation = cis(2.0 * pi * frequency * coefficients.timestep_s)
+    admittance_response = _sampled_line_harmonic_weighting(
+        coefficients.admittance_weights,
+        coefficients.admittance_tail,
+        0,
+        step_rotation,
+    )
+    propagation_lag = max(coefficients.propagation_delay_steps - 1, 0)
+    propagation_response = _sampled_line_harmonic_weighting(
+        coefficients.propagation_weights,
+        coefficients.propagation_tail,
+        propagation_lag,
+        step_rotation,
+    )
+    ring_rotation = step_rotation^(-length(line.from_wave_history))
+    delayed_loss = line.loss_factor * ring_rotation
+    wave_denominator = 1.0 - delayed_loss^2
+    abs(wave_denominator) > eps(Float64) || throw(ArgumentError(
+        "sampled-line steady-state wave recurrence is singular",
+    ))
+    history_rotation = inv(step_rotation)
+    conductance = line_surge_admittance(line)
+    response_scale = conductance *
+        coefficients.characteristic_impedance_ohm *
+        history_rotation / wave_denominator
+    self_admittance = conductance - response_scale *
+        (admittance_response - delayed_loss * propagation_response)
+    mutual_admittance = -response_scale *
+        (propagation_response - delayed_loss * admittance_response)
+    return ComplexF64[
+        self_admittance mutual_admittance
+        mutual_admittance self_admittance
+    ]
+end
+
 line_terminal_voltages(line::SampledFrequencyDependentLine) =
     (from = line.terminal_voltage_from, to = line.terminal_voltage_to)
 line_terminal_currents(line::SampledFrequencyDependentLine) =
@@ -775,6 +853,28 @@ function sampled_frequency_dependent_line_group(
         copy(zeros_phase),
         0,
     )
+end
+
+function sampled_line_steady_state_terminal_admittance(
+    line::SampledFrequencyDependentLineGroup,
+    frequency_hz::Real,
+)
+    modal_terminal_admittances = [
+        sampled_line_steady_state_terminal_admittance(modal_line, frequency_hz)
+        for modal_line in line.modal_lines
+    ]
+    modal_self = Diagonal([
+        admittance[1, 1] for admittance in modal_terminal_admittances
+    ])
+    modal_mutual = Diagonal([
+        admittance[1, 2] for admittance in modal_terminal_admittances
+    ])
+    phase_self = line.modal_to_phase * modal_self * line.phase_to_modal
+    phase_mutual = line.modal_to_phase * modal_mutual * line.phase_to_modal
+    return ComplexF64[
+        phase_self phase_mutual
+        phase_mutual phase_self
+    ]
 end
 
 line_terminal_voltages(line::SampledFrequencyDependentLineGroup) =

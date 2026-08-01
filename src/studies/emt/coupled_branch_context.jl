@@ -59,7 +59,6 @@ function deck_saturated_transformer_nonlinear_current_config(
     delta2::Real = 1.0,
     winding_number::Int = 1,
     saturated_transformer_sparse_config::Union{Nothing,NamedTuple} = nothing,
-    allow_reference_terminal::Bool = false,
 )
     DeckParser.assert_deck_valid!(parsed)
     arrays = saturated_transformer_nonlinear_arrays(saturated_transformer_intake)
@@ -91,7 +90,6 @@ function deck_saturated_transformer_nonlinear_current_config(
         delta2 = delta2,
         winding_number = winding_number,
         saturated_transformer_sparse_config = resolved_sparse_config,
-        allow_reference_terminal = allow_reference_terminal,
     )
     required_node_count = maximum(
         vcat(

@@ -767,11 +767,11 @@ function single_terminal_capacitance_row(image::AbstractString,
     return true
 end
 
-function single_terminal_capacitance_continuation_row(image::AbstractString,
-                                                      from_node::AbstractString,
-                                                      to_node::AbstractString,
-                                                      aux_1::AbstractString,
-                                                      aux_2::AbstractString)::Bool
+function grounded_scalar_branch_reference_row(image::AbstractString,
+                                              from_node::AbstractString,
+                                              to_node::AbstractString,
+                                              aux_1::AbstractString,
+                                              aux_2::AbstractString)::Bool
     !isempty(from_node) || return false
     ground_terminal_text(to_node) || return false
     isempty(aux_1) && return false
@@ -787,13 +787,7 @@ function single_terminal_capacitance_continuation_row(image::AbstractString,
     )
 end
 
-function defer_single_terminal_capacitance_row!(result::DeckParseResult)::Bool
-    record_card!(result, :fixed_field)
-    record_card!(result, :deferred_single_terminal_capacitance_group)
-    return true
-end
-
-function parse_fixed_single_terminal_capacitance_continuation_row!(
+function parse_fixed_grounded_scalar_branch_reference_row!(
     result::DeckParseResult,
     image::AbstractString,
     line_no::Int,
@@ -804,11 +798,27 @@ function parse_fixed_single_terminal_capacitance_continuation_row!(
 )::Bool
     reference_index =
         fixed_branch_reference_by_existing_node_pair(result, reference_node, "0")
-    if reference_index === nothing || !(result.elements[reference_index] isa CapacitorBranch)
-        return defer_single_terminal_capacitance_row!(result)
+    if reference_index === nothing
+        record_fixed_blocker!(
+            result,
+            :bpa_fixed_branch_blocked,
+            :bpa_fixed_branch_missing_copy_reference,
+        )
+        add_issue!(
+            result.validation,
+            invalid_value(
+                "line $line_no",
+                "grounded scalar branch reference $(String(reference_node))-0 does not match a prior accepted scalar branch owner",
+            ),
+        )
+        return true
     end
     branch_type = fixed_card_branch_type!(result, image, line_no, from_node, to_node)
     branch_type === nothing && return true
+    reference_kind =
+        result.elements[reference_index] isa CapacitorBranch ?
+        :fixed_single_terminal_capacitance_reference :
+        :fixed_grounded_scalar_branch_reference
     return parse_bpa_fixed_branch_copy_reference!(
         result,
         image,
@@ -817,9 +827,9 @@ function parse_fixed_single_terminal_capacitance_continuation_row!(
         to_node,
         branch_type,
         reference_index,
-        :fixed_single_terminal_capacitance_reference,
+        reference_kind,
         initial_issues;
-        branch_layout_kind = :fixed_single_terminal_capacitance_reference,
+        branch_layout_kind = reference_kind,
     )
 end
 

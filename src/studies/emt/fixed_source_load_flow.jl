@@ -115,6 +115,8 @@ function _fixed_source_network_topology_kinds(parsed::DeckParser.DeckParseResult
         push!(kinds, :frequency_dependent_generator_equivalent)
     isempty(DeckParser.deck_distributed_transposed_line_modal_branch_states(parsed)) ||
         push!(kinds, :distributed_transposed_line)
+    isempty(DeckParser.deck_sampled_frequency_line_rows(parsed)) ||
+        push!(kinds, :sampled_frequency_dependent_line)
     isempty(DeckParser.deck_semlyen_line_groups(parsed)) ||
         push!(kinds, :semlyen_frequency_dependent_line)
     isempty(DeckParser.deck_rational_frequency_line_groups(parsed)) ||
@@ -336,9 +338,6 @@ function _fixed_source_network_admittance(parsed::DeckParser.DeckParseResult)
     node_count = maximum(values(parsed.node_map); init = 0)
     matrix = zeros(ComplexF64, node_count, node_count)
     frequency_partition = DeckParser.deck_steady_state_frequency_partition(parsed)
-    isempty(frequency_partition.unsupported_topology_kinds) || throw(ArgumentError(
-        "FIX SOURCE load flow found unsupported steady-state topology",
-    ))
     constant_source_domain = _fixed_source_constant_source_domain(parsed)
     if constant_source_domain
         isempty(DeckParser.deck_coupled_lumped_sequence_impedances(parsed)) &&
@@ -346,6 +345,7 @@ function _fixed_source_network_admittance(parsed::DeckParser.DeckParseResult)
         isempty(DeckParser.deck_cascaded_phase_pi_equivalents(parsed)) &&
         isempty(DeckParser.deck_generator_equivalent_rows(parsed)) &&
         isempty(DeckParser.deck_distributed_transposed_line_modal_branch_states(parsed)) &&
+        isempty(DeckParser.deck_sampled_frequency_line_rows(parsed)) &&
         isempty(DeckParser.deck_semlyen_line_groups(parsed)) &&
         isempty(DeckParser.deck_rational_frequency_line_groups(parsed)) &&
         !any(
@@ -396,6 +396,11 @@ function _fixed_source_network_admittance(parsed::DeckParser.DeckParseResult)
             frequency_partition,
         )
         _stamp_distributed_line_steady_state_admittance!(
+            matrix,
+            parsed,
+            frequency_partition,
+        )
+        _stamp_sampled_frequency_line_steady_state_admittance!(
             matrix,
             parsed,
             frequency_partition,
@@ -898,6 +903,9 @@ end
 
 function apply_deck_fixed_source_load_flow(parsed::DeckParser.DeckParseResult)
     result = deck_fixed_source_load_flow(parsed)
+    result.converged || throw(ArgumentError(
+        "cannot apply a nonconverged FIX SOURCE solution to an EMT runtime",
+    ))
     runtime_deck = deepcopy(parsed)
     source_rows = runtime_deck.over5a_source_rows
     constrained_source_indices = Set(Iterators.flatten(result.constraint_source_row_indices))
