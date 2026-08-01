@@ -35,78 +35,80 @@ end
     @test :emt in (study.id for study in AIMORA.StudyCatalog.available_studies())
 end
 
-@testset "grounded scalar branch references" begin
-    fixed_control = [
-        "BEGIN NEW DATA CASE",
-        "POWER FREQUENCY                     60.0",
-        "ABSOLUTE U.M. DIMENSIONS              20       2      50      60",
-        "C PRINTED NUMBER WIDTH  13  2",
-        " .000200    .100",
-        "       1       1       1       1       1      -1                               1",
-        "       5       5      20      20     100     100",
-        "C BRANCHES",
-    ]
-    fixed_terminators = [
-        "BLANK card ending branch cards",
-        "BLANK card ending nonexistent switch cards",
-        "BLANK card ending all electric-network sources",
-        "BLANK card terminating output variable requests",
-        "BLANK card terminating plot cards",
-        "BEGIN NEW DATA CASE",
-    ]
-    parsed = AIMORA.DeckParser.parse_deck_lines(
-        vcat(
-            fixed_control,
-            [
-                "  BUSAS2                  1.0E+6",
-                "  BUSBS2      BUSAS2",
-                "  BUSCS2      BUSAS2",
-            ],
-            fixed_terminators,
-        );
-        source = "grounded-scalar-reference-contract",
-    )
-    @test AIMORA.ValidationCore.is_valid(parsed.validation)
-    @test length(parsed.elements) == 3
-    @test all(element -> element isa AIMORA.Branches.ConductanceBranch, parsed.elements)
-    @test getfield.(parsed.elements, :g) == fill(1.0e-6, 3)
-    @test get(
-        parsed.card_counts,
-        :fixed_grounded_scalar_branch_reference,
-        0,
-    ) == 2
-    @test get(
-        parsed.card_counts,
-        :deferred_single_terminal_capacitance_group,
-        0,
-    ) == 0
-    @test getfield.(parsed.over2_branch_rows, :layout_kind) == [
-        :fixed_sparse_numeric,
-        :fixed_grounded_scalar_branch_reference,
-        :fixed_grounded_scalar_branch_reference,
-    ]
-    @test getfield.(parsed.over2_branch_rows, :reference_name) == [
-        :none,
-        :branch_fixed_1,
-        :branch_fixed_1,
-    ]
+if AIMORA.solver_available()
+    @testset "grounded scalar branch references" begin
+        fixed_control = [
+            "BEGIN NEW DATA CASE",
+            "POWER FREQUENCY                     60.0",
+            "ABSOLUTE U.M. DIMENSIONS              20       2      50      60",
+            "C PRINTED NUMBER WIDTH  13  2",
+            " .000200    .100",
+            "       1       1       1       1       1      -1                               1",
+            "       5       5      20      20     100     100",
+            "C BRANCHES",
+        ]
+        fixed_terminators = [
+            "BLANK card ending branch cards",
+            "BLANK card ending nonexistent switch cards",
+            "BLANK card ending all electric-network sources",
+            "BLANK card terminating output variable requests",
+            "BLANK card terminating plot cards",
+            "BEGIN NEW DATA CASE",
+        ]
+        parsed = AIMORA.DeckParser.parse_deck_lines(
+            vcat(
+                fixed_control,
+                [
+                    "  BUSAS2                  1.0E+6",
+                    "  BUSBS2      BUSAS2",
+                    "  BUSCS2      BUSAS2",
+                ],
+                fixed_terminators,
+            );
+            source = "grounded-scalar-reference-contract",
+        )
+        @test AIMORA.ValidationCore.is_valid(parsed.validation)
+        @test length(parsed.elements) == 3
+        @test all(element -> element isa AIMORA.Branches.ConductanceBranch, parsed.elements)
+        @test getfield.(parsed.elements, :g) == fill(1.0e-6, 3)
+        @test get(
+            parsed.card_counts,
+            :fixed_grounded_scalar_branch_reference,
+            0,
+        ) == 2
+        @test get(
+            parsed.card_counts,
+            :deferred_single_terminal_capacitance_group,
+            0,
+        ) == 0
+        @test getfield.(parsed.over2_branch_rows, :layout_kind) == [
+            :fixed_sparse_numeric,
+            :fixed_grounded_scalar_branch_reference,
+            :fixed_grounded_scalar_branch_reference,
+        ]
+        @test getfield.(parsed.over2_branch_rows, :reference_name) == [
+            :none,
+            :branch_fixed_1,
+            :branch_fixed_1,
+        ]
 
-    missing_reference = AIMORA.DeckParser.parse_deck_lines(
-        vcat(
-            fixed_control,
-            ["  BUSBS2      ABSENT"],
-            fixed_terminators,
-        );
-        source = "missing-grounded-scalar-reference-contract",
-    )
-    @test !AIMORA.ValidationCore.is_valid(missing_reference.validation)
-    @test any(
-        issue -> occursin(
-            "does not match a prior accepted scalar branch owner",
-            issue.message,
-        ),
-        missing_reference.validation.issues,
-    )
+        missing_reference = AIMORA.DeckParser.parse_deck_lines(
+            vcat(
+                fixed_control,
+                ["  BUSBS2      ABSENT"],
+                fixed_terminators,
+            );
+            source = "missing-grounded-scalar-reference-contract",
+        )
+        @test !AIMORA.ValidationCore.is_valid(missing_reference.validation)
+        @test any(
+            issue -> occursin(
+                "does not match a prior accepted scalar branch owner",
+                issue.message,
+            ),
+            missing_reference.validation.issues,
+        )
+    end
 end
 
 @testset "public inverter model" begin
