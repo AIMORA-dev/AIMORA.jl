@@ -441,6 +441,7 @@ export DeckParseResult,
        deck_over16_source_interpolation_provided_value_counts,
        deck_over16_source_tacs_override_line_numbers,
        node_count,
+       deck_source_path,
        parse_deck_file,
        parse_deck_lines,
        parse_deck_case_sequence,
@@ -1646,6 +1647,7 @@ end
 
 struct DeckParseResult
     source::String
+    source_path::Union{Nothing,String}
     elements::Vector{Any}
     element_line_numbers::Vector{Int}
     node_map::Dict{Symbol,Int}
@@ -1735,6 +1737,9 @@ struct DeckParseResult
     pending_fixed_owner_names::Dict{Symbol,Vector{String}}
     validation::ValidationResult
 end
+
+"""Return the backing deck file path when parsing originated from a file."""
+deck_source_path(result::DeckParseResult) = result.source_path
 
 struct DeckModelSummary
     source::String

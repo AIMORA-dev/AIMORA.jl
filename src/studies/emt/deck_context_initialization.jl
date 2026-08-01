@@ -2011,8 +2011,10 @@ function _deck_runtime_saturated_transformer_intake(
 )
     get(parsed.card_counts, :fixed_card_saturated_transformer_intake, 0) > 0 ||
         return nothing
-    isfile(parsed.source) || return nothing
-    intake = DeckParser.parse_saturated_transformer_branch_section_intake_file(parsed.source)
+    source_path = DeckParser.deck_source_path(parsed)
+    source_path === nothing && return nothing
+    isfile(source_path) || return nothing
+    intake = DeckParser.parse_saturated_transformer_branch_section_intake_file(source_path)
     assert_valid!(intake.validation)
     return intake
 end

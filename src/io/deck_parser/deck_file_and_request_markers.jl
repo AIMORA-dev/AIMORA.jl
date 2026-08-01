@@ -1,10 +1,20 @@
 
 function parse_deck_file(path::AbstractString)
-    return parse_deck_lines(readlines(path); source=String(path))
+    return parse_deck_lines(
+        readlines(path);
+        source = String(path),
+        source_path = abspath(path),
+    )
 end
 
-function parse_deck_lines(lines; source::AbstractString="deck")
-    result = DeckParseResult(String(source), Any[], Int[], Dict{Symbol,Int}(), Symbol[],
+function parse_deck_lines(
+    lines;
+    source::AbstractString="deck",
+    source_path::Union{Nothing,AbstractString}=nothing,
+)
+    backing_path = source_path === nothing ? nothing : abspath(source_path)
+    result = DeckParseResult(String(source), backing_path,
+                             Any[], Int[], Dict{Symbol,Int}(), Symbol[],
                              DeckBergeronLineRow[],
                              DeckCoupledLineRow[],
                              DeckLineModalTransformRow[],

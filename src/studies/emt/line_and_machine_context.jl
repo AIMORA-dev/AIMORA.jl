@@ -2794,9 +2794,12 @@ function _deck_transformer_branch_shunt_capacitance_rows(
             source = parsed.source,
         )
     end
-    isfile(parsed.source) || return DeckParser.DeckTransformerBranchShuntCapacitanceRow[]
+    source_path = DeckParser.deck_source_path(parsed)
+    source_path === nothing &&
+        return DeckParser.DeckTransformerBranchShuntCapacitanceRow[]
+    isfile(source_path) || return DeckParser.DeckTransformerBranchShuntCapacitanceRow[]
     return DeckParser.parse_saturated_transformer_branch_section_shunt_capacitance_rows(
-        readlines(parsed.source);
+        readlines(source_path);
         source = parsed.source,
     )
 end
