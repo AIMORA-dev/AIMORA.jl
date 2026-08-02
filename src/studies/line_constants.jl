@@ -124,7 +124,7 @@ function _write_conductor_table(io::IO, result::LineConstantsStudyResult)
     for (index, row) in enumerate(result.physical_conductors)
         @printf(
             io,
-            "%3d %5d %6d %11.6f %12.6f %10.4f %10.4f %s\n",
+            "%3d %5d %6d %11.6f %12.6f %10.4f %10.4f",
             index,
             row.phase_number,
             row.bundle_ordinal,
@@ -132,8 +132,8 @@ function _write_conductor_table(io::IO, result::LineConstantsStudyResult)
             row.diameter_inches,
             row.horizontal_ft,
             row.average_height_ft,
-            row.conductor_name,
         )
+        isempty(row.conductor_name) ? println(io) : println(io, ' ', row.conductor_name)
     end
     return nothing
 end

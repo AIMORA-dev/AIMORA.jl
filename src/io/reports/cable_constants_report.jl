@@ -198,7 +198,10 @@ function _write_cable_constants_report(io, artifact::CableConstantsReportArtifac
         end
     end
     println(io, "physical_checks_passed ", result.physical_checks_passed)
-    println(io, "deferred_effects ", join(string.(result.deferred_effects), ","))
+    print(io, "deferred_effects")
+    isempty(result.deferred_effects) ||
+        print(io, ' ', join(string.(result.deferred_effects), ","))
+    println(io)
     println(io, "END CABLE CONSTANTS")
     return io
 end
@@ -289,7 +292,10 @@ function _write_nested_cable_transient_report(
         artifact.real_current_projection_max_imag_abs_a,
     )
     println(io, "physical_checks_passed ", artifact.physical_checks_passed)
-    println(io, "deferred_effects ", join(string.(artifact.deferred_effects), ","))
+    print(io, "deferred_effects")
+    isempty(artifact.deferred_effects) ||
+        print(io, ' ', join(string.(artifact.deferred_effects), ","))
+    println(io)
     println(io, "END NESTED CABLE TRANSIENT")
     return io
 end
