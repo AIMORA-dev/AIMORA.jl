@@ -1,9 +1,19 @@
 module Inverter
 
 using Printf
+using ..StudyCore: AverageValue,
+                   ContractQuantity,
+                   DynamicStateInventory,
+                   ModelFidelity,
+                   ModelValidityDomain,
+                   NumericDomainBound,
+                   ScientificModelContract,
+                   assess_validity,
+                   assert_validity
 
 export InverterParams,
        InverterState,
+       inverter_contract,
        initial_inverter_state,
        step_inverter,
        inverter_row,
@@ -26,6 +36,75 @@ Base.@kwdef struct InverterParams
     q_ref_pu::Float64 = 0.10
     step_time_s::Float64 = 0.050
 end
+
+const AVERAGE_VALUE_INVERTER_CONTRACT = ScientificModelContract(
+    :average_value_grid_following_inverter,
+    :dq_average_current_control;
+    owner = "AIMORA.Inverter",
+    maturity = :prototype,
+    fidelity = AverageValue,
+    validity_domain = ModelValidityDomain(
+        :positive_finite_fixed_step;
+        description = "Balanced positive-sequence dq average-value current controller with a stiff sinusoidal grid, constant DC voltage, lumped series R-L filter, fixed-step RK4 integration, and no switching or network-coupled event state.",
+        bounds = (
+            NumericDomainBound(:frequency_hz; unit = "Hz", lower = 0.0, lower_inclusive = false),
+            NumericDomainBound(:base_power_va; unit = "VA", lower = 0.0, lower_inclusive = false),
+            NumericDomainBound(:line_voltage_rms_v; unit = "V", lower = 0.0, lower_inclusive = false),
+            NumericDomainBound(:filter_resistance_ohm; unit = "ohm", lower = 0.0),
+            NumericDomainBound(:filter_inductance_h; unit = "H", lower = 0.0, lower_inclusive = false),
+            NumericDomainBound(:dc_voltage_v; unit = "V", lower = 0.0, lower_inclusive = false),
+            NumericDomainBound(:proportional_gain; unit = "V/A", lower = 0.0),
+            NumericDomainBound(:integral_gain; unit = "V/(A*s)", lower = 0.0),
+            NumericDomainBound(:initial_active_power_pu; unit = "pu"),
+            NumericDomainBound(:final_active_power_pu; unit = "pu"),
+            NumericDomainBound(:reactive_power_pu; unit = "pu"),
+            NumericDomainBound(:reference_step_time_s; unit = "s"),
+            NumericDomainBound(:timestep_s; unit = "s", lower = 0.0, lower_inclusive = false),
+            NumericDomainBound(:end_time_s; unit = "s", lower = 0.0),
+        ),
+        unsupported_phenomena = (
+            :individual_semiconductor_state,
+            :switching_ripple,
+            :dc_link_energy_dynamics,
+            :sampled_control_delay,
+            :network_coupled_events,
+            :within_step_rollback,
+            :unbalanced_sequence_dynamics,
+            :fault_blocking_and_restart,
+            :device_loss_or_thermal_state,
+        ),
+    ),
+    state_inventory = DynamicStateInventory(
+        differential = (:id_a, :iq_a, :xid, :xiq),
+    ),
+    inputs = (
+        ContractQuantity(:time_s; unit = "s"),
+        ContractQuantity(:active_power_reference_pu; unit = "pu", base = "s_base_va", orientation = "positive_grid_injection"),
+        ContractQuantity(:reactive_power_reference_pu; unit = "pu", base = "s_base_va", orientation = "positive_grid_injection"),
+        ContractQuantity(:grid_d_axis_voltage_v; unit = "V", orientation = "grid_to_converter_reference"),
+    ),
+    outputs = (
+        ContractQuantity(:d_axis_current_pu; unit = "pu", base = "peak_current_base", orientation = "positive_grid_injection"),
+        ContractQuantity(:q_axis_current_pu; unit = "pu", base = "peak_current_base", orientation = "positive_grid_injection"),
+        ContractQuantity(:active_power_pu; unit = "pu", base = "s_base_va", orientation = "positive_grid_injection"),
+        ContractQuantity(:reactive_power_pu; unit = "pu", base = "s_base_va", orientation = "positive_grid_injection"),
+    ),
+    assumptions = (
+        "The grid voltage is a stiff balanced positive-sequence sinusoid aligned with the d axis.",
+        "The DC voltage is constant and only limits the commanded dq voltage magnitude.",
+        "The requested end time is represented by the nearest integer number of fixed timesteps.",
+        "This prototype is not a switching-detailed converter and cannot satisfy a switching-detailed request.",
+    ),
+    mutation_order = (
+        :sample_outputs,
+        :read_power_references,
+        :evaluate_rk4_stages,
+        :apply_voltage_limit,
+        :commit_state,
+    ),
+)
+
+inverter_contract() = AVERAGE_VALUE_INVERTER_CONTRACT
 
 struct InverterState
     id_a::Float64
@@ -123,7 +202,34 @@ function inverter_row(x::InverterState, t::Float64, p::InverterParams)
     )
 end
 
-function simulate_inverter(; t_end::Float64 = 0.150, dt::Float64 = 20e-6, p::InverterParams = InverterParams())
+function simulate_inverter(;
+    t_end::Float64 = 0.150,
+    dt::Float64 = 20e-6,
+    p::InverterParams = InverterParams(),
+    fidelity::ModelFidelity = AverageValue,
+)
+    contract = inverter_contract()
+    assessment = assess_validity(
+        contract,
+        (
+            frequency_hz = p.f_hz,
+            base_power_va = p.s_base_va,
+            line_voltage_rms_v = p.v_ll_rms_v,
+            filter_resistance_ohm = p.r_filter_ohm,
+            filter_inductance_h = p.l_filter_h,
+            dc_voltage_v = p.v_dc_v,
+            proportional_gain = p.kp_i,
+            integral_gain = p.ki_i,
+            initial_active_power_pu = p.p_ref_0_pu,
+            final_active_power_pu = p.p_ref_1_pu,
+            reactive_power_pu = p.q_ref_pu,
+            reference_step_time_s = p.step_time_s,
+            timestep_s = dt,
+            end_time_s = t_end,
+        );
+        requested_fidelity = fidelity,
+    )
+    assert_validity(assessment)
     steps = Int(round(t_end / dt))
     x = initial_inverter_state(p)
 

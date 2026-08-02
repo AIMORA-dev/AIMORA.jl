@@ -112,10 +112,34 @@ if AIMORA.solver_available()
 end
 
 @testset "public inverter model" begin
+    contract = AIMORA.Inverter.inverter_contract()
+    @test contract.id == :average_value_grid_following_inverter
+    @test contract.maturity == :prototype
+    @test contract.fidelity == AIMORA.StudyCore.AverageValue
+    @test :switching_ripple in contract.validity_domain.unsupported_phenomena
+    @test contract.state_inventory.differential == (:id_a, :iq_a, :xid, :xiq)
+    @test contract.mutation_order == (
+        :sample_outputs,
+        :read_power_references,
+        :evaluate_rk4_stages,
+        :apply_voltage_limit,
+        :commit_state,
+    )
     rows = AIMORA.Inverter.simulate_inverter(t_end = 2.0e-4, dt = 20.0e-6)
     summary = AIMORA.Inverter.inverter_summary(rows)
     @test summary.samples == 11
     @test all(isfinite, rows[end])
+    @test rows == AIMORA.Inverter.simulate_inverter(t_end = 2.0e-4, dt = 20.0e-6)
+    @test_throws AIMORA.StudyCore.ValidityDomainError AIMORA.Inverter.simulate_inverter(
+        t_end = 2.0e-4,
+        dt = 20.0e-6,
+        fidelity = AIMORA.StudyCore.SwitchingDetailed,
+    )
+    @test_throws AIMORA.StudyCore.ValidityDomainError AIMORA.Inverter.simulate_inverter(
+        t_end = 2.0e-4,
+        dt = 20.0e-6,
+        p = AIMORA.Inverter.InverterParams(f_hz = 0.0),
+    )
 end
 
 @testset "transformer parameter studies" begin
