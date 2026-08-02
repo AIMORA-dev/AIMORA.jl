@@ -1,6 +1,11 @@
 const EMTHybridEventSurface = HybridEventSurface
 const EMTHybridEventPolicy = HybridEventPolicy
 const EMTExactSampledTask = ExactSampledTask
+const EMTExactSampledControlTask = ExactSampledControlTask
+const EMTExactPWMTask = ExactPWMTask
+const EMTExactSampledTaskScheduler = ExactSampledTaskScheduler
+const next_emt_sampled_task_time = next_sampled_task_time
+const run_due_emt_sampled_tasks! = run_due_sampled_tasks!
 
 struct EMTHybridCallbackOwner{R}
     runtime::R
@@ -589,25 +594,10 @@ function _emt_hybrid_has_due_tasks(
         abs(task_time - time_s) <= integrator.policy.simultaneity_tolerance_s
 end
 
-function _emt_hybrid_due_tasks_invalidate_power(
-    integrator::EMTHybridStepIntegrator,
-    time_s::Float64,
-)
-    tolerance = integrator.policy.simultaneity_tolerance_s
-    return any(integrator.scheduler.tasks) do abstract_task
-        task = abstract_task::ExactSampledTask
-        task_time = integrator.scheduler.origin_s +
-            task.next_tick * integrator.scheduler.tick_s
-        task.power_history_invalidating && abs(task_time - time_s) <= tolerance
-    end
-end
-
 function _emt_hybrid_task_states(integrator::EMTHybridStepIntegrator)
     return [
-        begin
-            task = abstract_task::ExactSampledTask
-            (task.next_tick, task.execution_count, task.last_execution_tick)
-        end for abstract_task in integrator.scheduler.tasks
+        sampled_task_checkpoint(abstract_task)
+        for abstract_task in integrator.scheduler.tasks
     ]
 end
 
@@ -616,10 +606,7 @@ function _restore_emt_hybrid_task_states!(integrator, states)
         "hybrid sampled-task state count changed during a boundary action",
     ))
     for (abstract_task, state) in zip(integrator.scheduler.tasks, states)
-        task = abstract_task::ExactSampledTask
-        task.next_tick = state[1]
-        task.execution_count = state[2]
-        task.last_execution_tick = state[3]
+        restore_sampled_task_checkpoint!(abstract_task, state)
     end
     return integrator
 end
@@ -635,13 +622,13 @@ function _emt_hybrid_apply_boundary_actions!(
     fired_before = copy(integrator.surface_fired)
     occurrence_count_before = length(integrator.occurrences)
     scheduler_occurrence_count_before = length(integrator.scheduler.occurrences)
+    scheduler_invalidation_before =
+        integrator.scheduler.last_run_power_history_invalidating
     task_states_before = _emt_hybrid_task_states(integrator)
     topology_count_before = integrator.topology_invalidation_count
     step_event_count_before = integrator.last_global_step_event_count
     workspace_ready_before = integrator.workspace.ready
     evaluation_count_before = integrator.workspace.evaluation_count
-    task_invalidates_power = tasks_due &&
-        _emt_hybrid_due_tasks_invalidate_power(integrator, time_s)
     begin_emt_step_transaction!(integrator.transaction)
     try
         event_count = _emt_hybrid_apply_events!(integrator, indices, time_s, roots)
@@ -651,7 +638,8 @@ function _emt_hybrid_apply_boundary_actions!(
             time_s;
             tolerance_s = integrator.policy.simultaneity_tolerance_s,
         )
-        task_count > 0 && task_invalidates_power &&
+        task_count > 0 &&
+            sampled_task_scheduler_last_run_invalidated_power(integrator.scheduler) &&
             _invalidate_emt_hybrid_power_history!(integrator.workspace.runtime.context)
         commit_emt_step_transaction!(integrator.transaction)
         return (event_count = event_count, task_count = task_count)
@@ -660,6 +648,8 @@ function _emt_hybrid_apply_boundary_actions!(
         copyto!(integrator.surface_fired, fired_before)
         resize!(integrator.occurrences, occurrence_count_before)
         resize!(integrator.scheduler.occurrences, scheduler_occurrence_count_before)
+        integrator.scheduler.last_run_power_history_invalidating =
+            scheduler_invalidation_before
         _restore_emt_hybrid_task_states!(integrator, task_states_before)
         integrator.topology_invalidation_count = topology_count_before
         integrator.last_global_step_event_count = step_event_count_before
@@ -964,6 +954,14 @@ end
 
 function emt_hybrid_execution_status(integrator::EMTHybridStepIntegrator)
     transaction = emt_step_transaction_status(integrator.transaction)
+    sampled_controls = [
+        task for task in integrator.scheduler.tasks
+        if task isa ExactSampledControlTask
+    ]
+    pwm_tasks = [
+        task for task in integrator.scheduler.tasks
+        if task isa ExactPWMTask
+    ]
     return (
         initialized = integrator.initialized,
         completed = integrator.completed,
@@ -973,6 +971,19 @@ function emt_hybrid_execution_status(integrator::EMTHybridStepIntegrator)
         localized_root_count = integrator.localized_root_count,
         event_count = length(integrator.occurrences),
         sampled_task_execution_count = length(integrator.scheduler.occurrences),
+        sampled_control_sample_count = sum(
+            task -> task.sample_count,
+            sampled_controls;
+            init = 0,
+        ),
+        sampled_control_write_count = sum(
+            task -> task.write_count,
+            sampled_controls;
+            init = 0,
+        ),
+        pwm_cycle_count = sum(task -> task.cycle_count, pwm_tasks; init = 0),
+        pwm_edge_count = sum(task -> task.edge_count, pwm_tasks; init = 0),
+        boundary_action_order = (:events, :sampled_tasks),
         topology_invalidation_count = integrator.topology_invalidation_count,
         completed_global_step_count = integrator.completed_global_step_count,
         last_global_step_event_count = integrator.last_global_step_event_count,

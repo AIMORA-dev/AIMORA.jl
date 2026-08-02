@@ -486,18 +486,66 @@ if AIMORA.solver_available()
             tick_s = 1.0e-6,
             first_time_s = 0.0,
         )
-        scheduler = AIMORA.OVER16TimestepIntegration.ExactSampledTaskScheduler(
+        scheduler = AIMORA.EMTStudy.EMTExactSampledTaskScheduler(
             1.0e-6;
             tasks = [task],
         )
         for tick in 0:9
-            AIMORA.OVER16TimestepIntegration.run_due_sampled_tasks!(
+            AIMORA.EMTStudy.run_due_emt_sampled_tasks!(
                 scheduler,
                 nothing,
                 tick * 1.0e-6,
             )
         end
         @test task_times == [0.0, 3.0e-6, 6.0e-6, 9.0e-6]
+
+        sampled_owner = (
+            input = Ref(0.4),
+            output = Ref(0.0),
+            gate = Ref(false),
+            edges = Tuple{Bool,Float64,Int}[],
+        )
+        sampled_control = AIMORA.EMTStudy.EMTExactSampledControlTask(
+            :public_sampled_control,
+            10.0e-6,
+            (owner, _time_s, _sample_index) -> owner.input[],
+            (_owner, input, _time_s, _sample_index) -> input,
+            (owner, output, _time_s, _sample_index) -> (owner.output[] = output);
+            tick_s = 1.0e-6,
+            computational_delay_s = 2.0e-6,
+            initial_output = 0.0,
+            priority = -1,
+        )
+        pwm = AIMORA.EMTStudy.EMTExactPWMTask(
+            :public_pwm,
+            10.0e-6,
+            (owner, _time_s, _cycle_index) -> owner.output[],
+            (owner, high, time_s, edge_index) -> begin
+                owner.gate[] = high
+                push!(owner.edges, (high, time_s, edge_index))
+            end;
+            tick_s = 1.0e-6,
+            priority = 1,
+            power_history_invalidating = false,
+        )
+        multirate_scheduler = AIMORA.EMTStudy.EMTExactSampledTaskScheduler(
+            1.0e-6;
+            tasks = [pwm, sampled_control],
+        )
+        for tick in 0:25
+            AIMORA.EMTStudy.run_due_emt_sampled_tasks!(
+                multirate_scheduler,
+                sampled_owner,
+                tick * 1.0e-6,
+            )
+        end
+        @test sampled_control.sample_count == 3
+        @test sampled_control.write_count == 3
+        @test sampled_control.held_output == 0.4
+        @test pwm.cycle_count == 3
+        @test getindex.(sampled_owner.edges, 1) == [true, false, true, false]
+        @test getfield.(pwm.occurrences, :tick) == [10, 14, 20, 24]
+        @test !sampled_owner.gate[]
 
         arc = AIMORA.TACS.ControlledSwitchDelayedArcState(1.0, 1.0, 1.0, 0.0)
         arc.opening_requested = true
