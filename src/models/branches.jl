@@ -506,7 +506,7 @@ function branch_companion_snapshot(
         b.a,
         b.b,
     )
-    mul!(b.current_workspace, conductance, branch_voltages)
+    _coupled_matrix_vector_mul!(b.current_workspace, conductance, branch_voltages)
     @inbounds for index in eachindex(b.current_workspace, history_current)
         b.current_workspace[index] += history_current[index]
     end
@@ -545,7 +545,7 @@ function branch_companion_snapshot(
         b.a,
         b.b,
     )
-    mul!(b.current_workspace, conductance, branch_voltages)
+    _coupled_matrix_vector_mul!(b.current_workspace, conductance, branch_voltages)
     b.current_workspace .+= history_current
     return BranchCompanionSnapshot(
         :coupled_series_rl,
@@ -1046,7 +1046,7 @@ function _coupled_inductive_history_current!(
     length(destination) == length(b.previous_current) || throw(ArgumentError(
         "coupled inductive history-current workspace size must match ports",
     ))
-    mul!(destination, conductance, b.previous_voltage)
+    _coupled_matrix_vector_mul!(destination, conductance, b.previous_voltage)
     if b.series_resistance == 0.0
         @inbounds @simd for index in eachindex(destination, b.previous_current)
             destination[index] = b.previous_current[index] + destination[index]
@@ -1095,7 +1095,7 @@ function _coupled_series_rl_history_current!(
         b.previous_voltage .+
         ((2.0 / dt) .* b.inductance_matrix .- b.resistance_matrix) *
         b.previous_current
-    mul!(destination, conductance, companion_history)
+    _coupled_matrix_vector_mul!(destination, conductance, companion_history)
     return destination
 end
 
@@ -1118,6 +1118,27 @@ function _coupled_branch_port_voltages!(
     ))
     @inbounds @simd for index in eachindex(destination, a, b)
         destination[index] = branch_voltage(voltage, a[index], b[index])
+    end
+    return destination
+end
+
+function _coupled_matrix_vector_mul!(
+    destination::Vector{Float64},
+    matrix::Matrix{Float64},
+    source::Vector{Float64},
+)
+    size(matrix, 1) == length(destination) || throw(DimensionMismatch(
+        "coupled matrix row count must match the destination length",
+    ))
+    size(matrix, 2) == length(source) || throw(DimensionMismatch(
+        "coupled matrix column count must match the source length",
+    ))
+    @inbounds for row in axes(matrix, 1)
+        value = 0.0
+        for column in axes(matrix, 2)
+            value += matrix[row, column] * source[column]
+        end
+        destination[row] = value
     end
     return destination
 end
@@ -1406,7 +1427,7 @@ function update!(b::CoupledInductiveBranch, v, dt::Float64)
         b.a,
         b.b,
     )
-    mul!(b.last_current, conductance, voltage)
+    _coupled_matrix_vector_mul!(b.last_current, conductance, voltage)
     @inbounds @simd for index in eachindex(b.last_current, history_current)
         b.last_current[index] += history_current[index]
     end
@@ -1433,7 +1454,7 @@ function update!(b::CoupledSeriesRLBranch, v, dt::Float64)
         b.a,
         b.b,
     )
-    mul!(b.last_current, conductance, voltage)
+    _coupled_matrix_vector_mul!(b.last_current, conductance, voltage)
     b.last_current .+= history_current
     copyto!(b.previous_voltage, voltage)
     copyto!(b.previous_current, b.last_current)
