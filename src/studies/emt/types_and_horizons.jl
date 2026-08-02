@@ -106,6 +106,14 @@ using ..Nonlinear: SaturatedTransformerNonlinearArrays,
                    saturated_transformer_winding_branch_assembly,
                    saturated_transformer_winding_current_config
 using ..OVER16TimestepIntegration: OVER16AcceptedTimestepState,
+                                  TimestepTransaction,
+                                  TimestepStateRestorer,
+                                  begin_timestep_transaction!,
+                                  restore_timestep_transaction!,
+                                  commit_timestep_transaction!,
+                                  timestep_transaction_active,
+                                  timestep_transaction_status,
+                                  restore_timestep_state!,
                                   _over16_sparse_switch_state_flow_update_lean!,
                                   over16_accepted_timestep_update!,
                                   over16_sparse_switch_state_flow_update!
@@ -211,6 +219,7 @@ export UnifiedEMTConfig,
        DeckEMTExecution,
        PreparedEMTStudy,
        EMTStudyWorkspace,
+       EMTStepTransaction,
        EMTRestartMutationRecord,
        EMTRestartRun,
        EMTStudyBatch,
@@ -226,6 +235,11 @@ export UnifiedEMTConfig,
        EMTOutputPeakReducer,
        prepare_emt_study,
        reset_emt_study!,
+       begin_emt_step_transaction!,
+       provisional_emt_step!,
+       restore_emt_step_transaction!,
+       commit_emt_step_transaction!,
+       emt_step_transaction_status,
        emt_candidate_parameter_names,
        apply_emt_parameter!,
        apply_emt_candidate!,
@@ -1061,6 +1075,7 @@ mutable struct EMTStudyWorkspace{R,P}
     evaluation_count::Int
     reset_count::Int
     ready::Bool
+    reset_restorer::TimestepStateRestorer
 end
 
 abstract type AbstractEMTStudyCandidate end

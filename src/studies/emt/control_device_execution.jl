@@ -2607,6 +2607,22 @@ function prepare_emt_study(
     return PreparedEMTStudy(runtime, parsed)
 end
 
+@generated function _tuple_element_alias(
+    elements::T,
+    element_index::Int,
+    expected,
+) where {T<:Tuple}
+    comparisons = [
+        :(element_index == $index && elements[$index] === expected)
+        for index in 1:fieldcount(T)
+    ]
+    return foldl(
+        (left, right) -> :($left || $right),
+        comparisons;
+        init = :(false),
+    )
+end
+
 function _check_prepared_runtime_aliases(runtime::PreparedDynamicDeckRuntime)
     step_configs = runtime.step_configs
     if step_configs isa DynamicDeckStepConfigProvider
@@ -2615,125 +2631,79 @@ function _check_prepared_runtime_aliases(runtime::PreparedDynamicDeckRuntime)
         step_configs.plan === runtime.plan ||
             throw(ArgumentError("prepared timestep config must own the workspace boundary plan"))
     end
+    context = runtime.context
+    elements = context.system.elements
+    history_plan = context.electromagnetic_history_plan
+    for index in eachindex(history_plan.element_indices)
+        element_index = history_plan.element_indices[index]
+        kind = history_plan.kinds[index]
+        batch_index = history_plan.batch_indices[index]
+        batch = if kind == SERIES_RL_HISTORY
+            history_plan.series_rl_branches
+        elseif kind == SERIES_RLC_HISTORY
+            history_plan.series_rlc_branches
+        elseif kind == CAPACITOR_HISTORY
+            history_plan.capacitor_branches
+        elseif kind == COUPLED_INDUCTIVE_HISTORY
+            history_plan.coupled_inductive_branches
+        elseif kind == COUPLED_SERIES_RL_HISTORY
+            history_plan.coupled_series_rl_branches
+        elseif kind == BREQIV_HISTORY
+            history_plan.breqiv_injections
+        else
+            throw(ArgumentError(
+                "prepared electromagnetic history kind has no alias owner",
+            ))
+        end
+        _tuple_element_alias(elements, element_index, batch[batch_index]) ||
+            throw(ArgumentError(
+                "prepared electromagnetic history plan must alias the nodal element",
+            ))
+    end
+    for branch in context.saturated_transformer_nonlinear_slope_branch_batch
+        any(element -> element === branch, elements) || throw(ArgumentError(
+            "prepared nonlinear slope batch must alias the nodal element",
+        ))
+    end
+    for signal in context.analytic_source_signals
+        any(elements) do element
+            hasproperty(element, :value) && getproperty(element, :value) === signal
+        end || throw(ArgumentError(
+            "prepared analytic source list must alias the nodal source signal",
+        ))
+    end
+    source_runtime = context.source_function_runtime
+    if source_runtime !== nothing
+        source_runtime.plan === runtime.plan || throw(ArgumentError(
+            "prepared source-function runtime must alias the boundary plan",
+        ))
+    end
+    control_runtime = context.control_system_runtime
+    if control_runtime !== nothing
+        for observation in control_runtime.switch_observations
+            any(element -> element === observation.switch, elements) ||
+                throw(ArgumentError(
+                    "prepared control observation must alias the nodal switch",
+                ))
+        end
+        for switch in control_runtime.switch_elements
+            any(element -> element === switch, elements) || throw(ArgumentError(
+                "prepared control switch runtime must alias the nodal switch",
+            ))
+        end
+    end
     return runtime
 end
-
-function _restore_runtime_field!(
-    destination::Array{T,N},
-    source::Array{T,N},
-) where {T,N}
-    axes(destination) == axes(source) || throw(ArgumentError(
-        "prepared runtime array shape changed and cannot be reset in place",
-    ))
-    if isbitstype(T) || T <: Union{Symbol,String}
-        copyto!(destination, source)
-    else
-        for index in eachindex(destination, source)
-            destination[index] =
-                _restore_runtime_field!(destination[index], source[index])
-        end
-    end
-    return destination
-end
-
-function _restore_runtime_field!(
-    destination::Vector{T},
-    source::Vector{T},
-) where {T}
-    previous_length = length(destination)
-    resize!(destination, length(source))
-    if isbitstype(T) || T <: Union{Symbol,String}
-        copyto!(destination, source)
-    else
-        for index in eachindex(destination, source)
-            destination[index] = index <= previous_length ?
-                _restore_runtime_field!(destination[index], source[index]) :
-                deepcopy(source[index])
-        end
-    end
-    return destination
-end
-
-function _restore_runtime_field!(
-    destination::Dict{K,V},
-    source::Dict{K,V},
-) where {K,V}
-    empty!(destination)
-    sizehint!(destination, length(source))
-    for (key, value) in source
-        destination[key] = value
-    end
-    return destination
-end
-
-function _restore_runtime_field!(
-    destination::Set{T},
-    source::Set{T},
-) where {T}
-    empty!(destination)
-    sizehint!(destination, length(source))
-    union!(destination, source)
-    return destination
-end
-
-@generated function _restore_runtime_field!(
-    destination::T,
-    source::T,
-) where {T<:Tuple}
-    restores = [
-        :(_restore_runtime_field!(destination[$index], source[$index]))
-        for index in 1:fieldcount(T)
-    ]
-    return quote
-        $(restores...)
-        destination
-    end
-end
-
-@generated function _restore_runtime_field!(destination::T, source::T) where {T}
-    field_count = fieldcount(T)
-    if field_count == 0
-        return :(source)
-    elseif ismutabletype(T)
-        restores = [
-            :(setfield!(
-                destination,
-                $index,
-                _restore_runtime_field!(
-                    getfield(destination, $index),
-                    getfield(source, $index),
-                ),
-            ))
-            for index in 1:field_count
-        ]
-        return quote
-            $(restores...)
-            destination
-        end
-    end
-    restores = [
-        :(_restore_runtime_field!(
-            getfield(destination, $index),
-            getfield(source, $index),
-        ))
-        for index in 1:field_count
-    ]
-    return quote
-        $(restores...)
-        destination
-    end
-end
-
-_restore_runtime_field!(destination, source) = source
 
 function _restore_prepared_dynamic_runtime!(
     runtime::PreparedDynamicDeckRuntime,
     template::PreparedDynamicDeckRuntime,
+    restorer::TimestepStateRestorer,
 )
     typeof(runtime) === typeof(template) || throw(ArgumentError(
         "prepared runtime and workspace types must match for in-place reset",
     ))
-    _restore_runtime_field!(runtime, template)
+    restore_timestep_state!(runtime, template, restorer)
     return _check_prepared_runtime_aliases(runtime)
 end
 
@@ -2781,6 +2751,7 @@ function EMTStudyWorkspace(prepared::PreparedEMTStudy{R,P}) where {R,P}
         0,
         0,
         true,
+        TimestepStateRestorer(),
     )
 end
 
@@ -2791,6 +2762,7 @@ function reset_emt_study!(
     _restore_prepared_dynamic_runtime!(
         workspace.runtime,
         prepared.runtime_template,
+        workspace.reset_restorer,
     )
     workspace.parsed = prepared.parsed
     workspace.reset_count += 1

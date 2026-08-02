@@ -1553,6 +1553,82 @@ function _step_with_over16_config!(
     )
 end
 
+function _advance_prepared_emt_step!(
+    context::EMTStepContext,
+    timestep_state::OVER16AcceptedTimestepState,
+    step_configs,
+    collect_step_diagnostics::Bool,
+)
+    context.step_index <= context.step_count || throw(ArgumentError(
+        "prepared EMT runtime has no remaining timestep to advance",
+    ))
+    _apply_due_series_rlc_alterations!(context)
+    over16_kwargs = _over16_step_kwargs(step_configs, context)
+    return _step_with_over16_config!(
+        context,
+        timestep_state,
+        over16_kwargs,
+        collect_step_diagnostics,
+    )
+end
+
+function _advance_prepared_emt_step!(
+    runtime::PreparedDynamicDeckRuntime;
+    collect_step_diagnostics::Bool=false,
+)
+    return _advance_prepared_emt_step!(
+        runtime.context,
+        runtime.timestep_state,
+        runtime.step_configs,
+        collect_step_diagnostics,
+    )
+end
+
+struct EMTStepTransaction{R,T}
+    runtime::R
+    transaction::T
+end
+
+function EMTStepTransaction(workspace::EMTStudyWorkspace)
+    workspace.ready || throw(ArgumentError(
+        "EMT study workspace must be ready before creating a step transaction",
+    ))
+    runtime = _check_prepared_runtime_aliases(workspace.runtime)
+    return EMTStepTransaction(runtime, TimestepTransaction(runtime))
+end
+
+function begin_emt_step_transaction!(transaction::EMTStepTransaction)
+    begin_timestep_transaction!(transaction.transaction)
+    return transaction
+end
+
+function provisional_emt_step!(
+    transaction::EMTStepTransaction;
+    collect_step_diagnostics::Bool=false,
+)
+    timestep_transaction_active(transaction.transaction) ||
+        throw(ArgumentError("EMT step transaction must be active before advance"))
+    return _advance_prepared_emt_step!(
+        transaction.runtime;
+        collect_step_diagnostics = collect_step_diagnostics,
+    )
+end
+
+function restore_emt_step_transaction!(transaction::EMTStepTransaction)
+    restore_timestep_transaction!(transaction.transaction)
+    _check_prepared_runtime_aliases(transaction.runtime)
+    return transaction
+end
+
+function commit_emt_step_transaction!(transaction::EMTStepTransaction)
+    commit_timestep_transaction!(transaction.transaction)
+    _check_prepared_runtime_aliases(transaction.runtime)
+    return transaction
+end
+
+emt_step_transaction_status(transaction::EMTStepTransaction) =
+    timestep_transaction_status(transaction.transaction)
+
 function _run_prepared_dynamic_deck!(
     runtime::PreparedDynamicDeckRuntime;
     collect_run_diagnostics::Bool=true,
@@ -1738,6 +1814,9 @@ function _prepare_dynamic_deck_runtime(
             current_zero_switching = current_zero_switching,
             source_signal_provider = source_signal_provider,
         )
+    if context.source_function_runtime !== nothing
+        context.source_function_runtime.plan = plan
+    end
     configure_series_rlc_alterations!(context, series_rlc_alterations)
     if distributed_transposed_line_config !== nothing &&
        haskey(distributed_transposed_line_config, :current_injection_values)
@@ -1924,12 +2003,10 @@ function run_deck_emt_with_over16_boundary(
         context.t_s = min(context.step_index, context.step_count) * context.dt_s
     end
     while context.step_index <= context.step_count
-        _apply_due_series_rlc_alterations!(context)
-        over16_kwargs = _over16_step_kwargs(over16_step_configs, context)
-        update = _step_with_over16_config!(
+        update = _advance_prepared_emt_step!(
             context,
             over16_state,
-            over16_kwargs,
+            over16_step_configs,
             store_step_updates,
         )
         store_step_updates && collect_run_diagnostics && push!(updates, update)

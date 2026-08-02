@@ -405,6 +405,42 @@ if AIMORA.solver_available()
         @test voltage[2] ≈ 0.5 atol = 1.0e-6
         @test AIMORA.solver_status().mode == :full_engine
     end
+
+    @testset "reversible timestep transaction foundation" begin
+        shared_history = [1.0, 2.0]
+        owner = (
+            primary_history = shared_history,
+            aliased_history = shared_history,
+            cursor = Ref(3),
+        )
+        transaction = AIMORA.OVER16TimestepIntegration.TimestepTransaction(owner)
+        AIMORA.OVER16TimestepIntegration.begin_timestep_transaction!(transaction)
+        push!(owner.primary_history, 4.0)
+        owner.cursor[] = 9
+        @test_throws ArgumentError AIMORA.OVER16TimestepIntegration.
+            begin_timestep_transaction!(transaction)
+        AIMORA.OVER16TimestepIntegration.restore_timestep_transaction!(transaction)
+        @test owner.primary_history == [1.0, 2.0]
+        @test owner.primary_history === owner.aliased_history
+        @test owner.cursor[] == 3
+
+        AIMORA.OVER16TimestepIntegration.begin_timestep_transaction!(transaction)
+        owner.primary_history[1] = 7.0
+        AIMORA.OVER16TimestepIntegration.commit_timestep_transaction!(transaction)
+        @test owner.aliased_history[1] == 7.0
+        AIMORA.OVER16TimestepIntegration.begin_timestep_transaction!(transaction)
+        owner.primary_history[1] = 11.0
+        AIMORA.OVER16TimestepIntegration.restore_timestep_transaction!(transaction)
+        @test owner.primary_history[1] == 7.0
+        @test AIMORA.OVER16TimestepIntegration.timestep_transaction_status(
+            transaction,
+        ) == (
+            active = false,
+            capture_count = 3,
+            restore_count = 2,
+            commit_count = 1,
+        )
+    end
 else
     @testset "public checkout has no solver source" begin
         @test AIMORA.solver_status().mode == :open_core
