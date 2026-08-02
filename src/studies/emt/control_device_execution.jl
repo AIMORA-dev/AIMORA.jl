@@ -816,6 +816,8 @@ function _accept_source_function_boundary_update!(
     accepted_state::OVER16AcceptedTimestepState,
     source_config,
     over16_update,
+    ;
+    idempotent_same_time::Bool = false,
 )
     runtime = context.source_function_runtime
     (runtime === nothing || source_config === nothing) && return nothing
@@ -856,6 +858,11 @@ function _accept_source_function_boundary_update!(
     runtime.state.nfrfld = accepted_state.source.source_card.nfrfld
     for index in eachindex(runtime.slot_values)
         runtime.slot_values[index][] = runtime.state.voltbc_values[index]
+    end
+    if idempotent_same_time &&
+       abs(source_time - runtime.last_accepted_time_s) <=
+       16.0 * eps(Float64) * max(1.0, abs(source_time))
+        return source_result
     end
     if source_result === nothing ||
        !hasproperty(source_result, :source_card_result)

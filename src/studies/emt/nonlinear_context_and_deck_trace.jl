@@ -1171,6 +1171,7 @@ function _prepare_output_report_branch_output_config!(
     over16_state::OVER16AcceptedTimestepState,
     config::NamedTuple,
     voltage::AbstractVector{Float64},
+    report_step_s::Float64 = context.dt_s,
 )
     has_voltage_config = haskey(config, :deck_branch_voltage_output_config)
     has_current_config = haskey(config, :deck_branch_current_output_config)
@@ -1230,12 +1231,12 @@ function _prepare_output_report_branch_output_config!(
             branch_output_count = length(bvalue_branch_indices),
             voltage_selectors = power_voltage_selectors,
             current_selectors = power_current_selectors,
-            delta2 = context.dt_s / 2.0,
+            delta2 = report_step_s / 2.0,
         ),
     )
     prepared = (
         t = config.t,
-        deltat = config.deltat,
+        deltat = report_step_s,
         istep = config.istep,
         kwargs = output_kwargs,
     )
@@ -1246,10 +1247,11 @@ function _prepare_over16_post_extrema_config!(
     context::EMTStepContext,
     over16_state::OVER16AcceptedTimestepState,
     config::NamedTuple,
+    report_step_s::Float64 = context.dt_s,
 )
     post_extrema = over16_state.post_extrema
     post_extrema.t = context.t_s
-    post_extrema.deltat = context.dt_s
+    post_extrema.deltat = report_step_s
     post_extrema.istep = context.step_index
     base_kwargs = haskey(config, :kwargs) ? config.kwargs : NamedTuple()
     base_kwargs isa NamedTuple ||
@@ -1340,6 +1342,8 @@ function _prepare_over16_step_kwargs!(
     over16_state::OVER16AcceptedTimestepState,
     voltage::AbstractVector{Float64},
     kwargs::NamedTuple,
+    ;
+    report_step_s::Float64 = context.dt_s,
 )
     prepared = kwargs
     if haskey(prepared, :nonlinear_current_config)
@@ -1383,6 +1387,7 @@ function _prepare_over16_step_kwargs!(
             over16_state,
             prepared.output_report_config,
             voltage,
+            report_step_s,
         )
         prepared = merge(prepared, (output_report_config = output_report_config,))
     end
@@ -1391,6 +1396,7 @@ function _prepare_over16_step_kwargs!(
             context,
             over16_state,
             prepared.post_extrema_config,
+            report_step_s,
         )
         prepared = merge(prepared, (post_extrema_config = post_extrema_config,))
     end

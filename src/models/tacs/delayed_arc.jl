@@ -15,6 +15,7 @@ mutable struct ControlledSwitchDelayedArcState
     tail_time_constant_s::Float64
     scheduled_open_time_s::Float64
     opening_requested::Bool
+    transition_deferred::Bool
     tail_active::Bool
     tail_current_a::Float64
     decay_factor::Float64
@@ -49,6 +50,7 @@ function ControlledSwitchDelayedArcState(
         0.0,
         1.0,
         Inf,
+        false,
         false,
         false,
         0.0,
@@ -94,13 +96,33 @@ function _advance_controlled_switch_delayed_arc!(
     arc.tail_amplitude_a = update.shape_current
     arc.tail_time_constant_s = update.shape_delay
     arc.scheduled_open_time_s = update.scheduled_open_time
-    if update.opens
-        switch.closed = false
-        arc.opening_requested = false
-        arc.tail_active = true
-        arc.transition_count += 1
+    if update.opens && !arc.transition_deferred
+        apply_controlled_switch_delayed_arc_transition!(
+            switch,
+            arc.scheduled_open_time_s,
+        )
     end
     return update
+end
+
+function apply_controlled_switch_delayed_arc_transition!(switch, time_s::Real)
+    arc = switch.delayed_arc
+    arc === nothing && throw(ArgumentError(
+        "controlled switch has no delayed-arc transition owner",
+    ))
+    time = Float64(time_s)
+    isfinite(time) || throw(ArgumentError(
+        "controlled-switch delayed-arc transition time must be finite",
+    ))
+    if switch.closed && arc.opening_requested
+        switch.closed = false
+        arc.opening_requested = false
+        arc.transition_deferred = false
+        arc.tail_active = true
+        arc.scheduled_open_time_s = time
+        arc.transition_count += 1
+    end
+    return switch
 end
 
 function _stamp_controlled_switch_arc_tail!(

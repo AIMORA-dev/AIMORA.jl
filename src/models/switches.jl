@@ -22,6 +22,7 @@ export IdealSwitch,
        configure_current_extinction!,
        current_extinction_enabled,
        prepare_current_zero_switch!,
+       apply_current_zero_transition!,
        update_current_zero_switch!,
        over16_switch_margin_history,
        over16_switch_close_critical_current,
@@ -726,6 +727,52 @@ function prepare_current_zero_switch!(switch::TimeSwitch, time_s::Real)
     return switch
 end
 
+function _check_current_zero_transition_reason(reason::Symbol)
+    reason in (:current_reversal, :critical_current) || throw(ArgumentError(
+        "current-zero transition reason must be :current_reversal or :critical_current",
+    ))
+    return reason
+end
+
+function apply_current_zero_transition!(
+    switch::CurrentZeroSwitch,
+    reason::Symbol,
+    time_s::Real,
+)
+    _check_current_zero_transition_reason(reason)
+    time = Float64(time_s)
+    isfinite(time) || throw(ArgumentError("current-zero transition time must be finite"))
+    if switch.closed
+        switch.closed = false
+        switch.opened = true
+        switch.operation_count += 1
+        switch.open_reason = reason
+    end
+    return switch
+end
+
+function apply_current_zero_transition!(
+    switch::TimeSwitch,
+    reason::Symbol,
+    time_s::Real,
+)
+    state = switch.current_extinction
+    state === nothing && throw(ArgumentError(
+        "time switch has no current-extinction transition owner",
+    ))
+    _check_current_zero_transition_reason(reason)
+    time = Float64(time_s)
+    isfinite(time) || throw(ArgumentError("current-zero transition time must be finite"))
+    if state.closed
+        state.closed = false
+        state.opened = true
+        state.operation_count += 1
+        state.open_reason = reason
+        state.opened_time_s = time
+    end
+    return switch
+end
+
 function update_current_zero_switch!(
     switch::CurrentZeroSwitch,
     current::Real,
@@ -744,11 +791,11 @@ function update_current_zero_switch!(
        time >= switch.open_request_time_s &&
        time >= switch.open_delay_time_s &&
        (current_reversed || critical_reached)
-        switch.closed = false
-        switch.opened = true
-        switch.operation_count += 1
-        switch.open_reason =
-            critical_reached ? :critical_current : :current_reversal
+        apply_current_zero_transition!(
+            switch,
+            critical_reached ? :critical_current : :current_reversal,
+            time,
+        )
     end
     switch.previous_current = current_value
     switch.current_initialized = true
@@ -775,12 +822,11 @@ function update_current_zero_switch!(
        time >= switch.open_time_s &&
        time >= state.not_before_time_s &&
        (current_reversed || critical_reached)
-        state.closed = false
-        state.opened = true
-        state.operation_count += 1
-        state.open_reason =
-            critical_reached ? :critical_current : :current_reversal
-        state.opened_time_s = time
+        apply_current_zero_transition!(
+            switch,
+            critical_reached ? :critical_current : :current_reversal,
+            time,
+        )
     end
     state.previous_current = current_value
     state.current_initialized = true

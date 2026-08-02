@@ -376,8 +376,10 @@ function initialize_step_context(
         zeros(Float64, time_switch_count),
         zeros(Float64, time_switch_count),
         zeros(Float64, length(system.elements)),
+        falses(length(system.elements)),
         zeros(Float64, length(system.elements)),
         zeros(Float64, time_switch_count),
+        falses(time_switch_count),
         zeros(Float64, time_switch_count),
         Matrix{Float64}(undef, length(output_channel_names), sample_count),
         Matrix{Float64}(undef, length(output_channel_names), 1),
@@ -463,12 +465,16 @@ function _update_context_extrema!(
     return context
 end
 
-function record_step!(context::EMTStepContext, voltage::AbstractVector{Float64})
+function record_step!(
+    context::EMTStepContext,
+    voltage::AbstractVector{Float64};
+    update_power_energy::Bool = true,
+)
     context.step_index <= context.step_count ||
         throw(ArgumentError("fixed-step EMT context is already complete"))
     length(voltage) == context.system.node_count ||
         throw(ArgumentError("voltage length must match context node count"))
-    _update_deck_power_energy_state!(context, voltage)
+    update_power_energy && _update_deck_power_energy_state!(context, voltage)
     output_values = @view context.output_step_values[:, 1]
     isempty(output_values) ||
         _record_context_outputs!(context.output_step_values, 1, context, voltage)

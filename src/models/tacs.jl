@@ -8,6 +8,7 @@ import ..Branches: EMTElement, stamp!, stamp_conductance!, update!
 
 export TACSControlledSwitch,
        ControlledSwitchDelayedArcState,
+       apply_controlled_switch_delayed_arc_transition!,
        AlgebraicControlAssignment,
        ControlTransferFunction,
        ConstantControlSignal,

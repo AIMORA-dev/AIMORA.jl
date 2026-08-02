@@ -1383,6 +1383,22 @@ function step_with_over16_boundary!(
     step_before = context.step_index
     t_before = context.t_s
     raw_over16_kwargs = (; over16_kwargs...)
+    hybrid_substep = get(raw_over16_kwargs, :hybrid_substep, false)
+    raw_over16_kwargs = Base.structdiff(
+        raw_over16_kwargs,
+        (hybrid_substep = nothing,),
+    )
+    hybrid_report_step_s = Float64(get(
+        raw_over16_kwargs,
+        :hybrid_report_step_s,
+        context.dt_s,
+    ))
+    hybrid_report_step_s > 0.0 && isfinite(hybrid_report_step_s) ||
+        throw(ArgumentError("hybrid report step must be finite and positive"))
+    raw_over16_kwargs = Base.structdiff(
+        raw_over16_kwargs,
+        (hybrid_report_step_s = nothing,),
+    )
     record_presolve_voltage_state =
         get(raw_over16_kwargs, :record_presolve_voltage_state, false)
     presolve_voltage =
@@ -1597,6 +1613,7 @@ function step_with_over16_boundary!(
                     ),
                 ),
             ),
+            report_step_s = hybrid_report_step_s,
         )
         nonlinear_pre_solve_update = over16_accepted_timestep_update!(
             over16_state,
@@ -1752,6 +1769,7 @@ function step_with_over16_boundary!(
             over16_state,
             voltage,
             solver_over16_kwargs,
+            report_step_s = hybrid_report_step_s,
         )
     if nonlinear_current_compensation_enabled &&
        haskey(prepared_over16_kwargs, :nonlinear_current_config)
@@ -1906,9 +1924,14 @@ function step_with_over16_boundary!(
         over16_state,
         source_config,
         over16_update,
+        idempotent_same_time = hybrid_substep,
     )
     trace_voltage = record_presolve_voltage_state ? presolve_voltage : voltage
-    record_step!(context, voltage)
+    if hybrid_substep
+        _update_deck_power_energy_state!(context, voltage)
+    else
+        record_step!(context, voltage)
+    end
     collect_step_diagnostics || return nothing
     return (
         source = :emt_step_context_over16_boundary,
@@ -1923,7 +1946,7 @@ function step_with_over16_boundary!(
         over16_sparse_switch_state_flow_result = sparse_switch_state_flow_result,
         over16_sparse_switch_state_flow_applied =
             sparse_switch_state_flow_result !== nothing,
-        step_context_recorded = true,
+        step_context_recorded = !hybrid_substep,
         step_context_step_after = context.step_index,
         step_context_time_after = context.t_s,
         over16_state_mutated = over16_state_mutated,

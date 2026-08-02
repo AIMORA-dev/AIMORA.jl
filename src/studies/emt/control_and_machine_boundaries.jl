@@ -1102,11 +1102,15 @@ function _update_deck_power_energy_state!(
         power = snapshot.branch_voltage *
                 _deck_branch_current_value(context, branch_index, voltage)
         if context.step_index > 0
-            context.branch_energy_values[branch_index] +=
+            context.branch_energy_values[branch_index] += if context.branch_power_history_valid[branch_index]
                 0.5 * context.dt_s *
                 (context.branch_previous_power_values[branch_index] + power)
+            else
+                context.dt_s * power
+            end
         end
         context.branch_previous_power_values[branch_index] = power
+        context.branch_power_history_valid[branch_index] = true
     end
     if any(>(3), context.deck_over5_switch_output_codes)
         switch_currents =
@@ -1117,11 +1121,15 @@ function _update_deck_power_energy_state!(
             context.deck_over5_switch_output_codes[switch_index] > 3 || continue
             power = switch_powers[switch_index]
             if context.step_index > 0
-                context.switch_energy_values[switch_index] +=
+                context.switch_energy_values[switch_index] += if context.switch_power_history_valid[switch_index]
                     0.5 * context.dt_s *
                     (context.switch_previous_power_values[switch_index] + power)
+                else
+                    context.dt_s * power
+                end
             end
             context.switch_previous_power_values[switch_index] = power
+            context.switch_power_history_valid[switch_index] = true
         end
     end
     return context

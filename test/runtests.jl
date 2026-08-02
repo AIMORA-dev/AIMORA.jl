@@ -441,6 +441,87 @@ if AIMORA.solver_available()
             commit_count = 1,
         )
     end
+
+    @testset "hybrid event and sampled-task public surface" begin
+        policy = AIMORA.EMTStudy.EMTHybridEventPolicy(
+            root_time_tolerance_s = 1.0e-10,
+            root_value_tolerance = 1.0e-12,
+            simultaneity_tolerance_s = 1.0e-10,
+        )
+        surface = AIMORA.EMTStudy.EMTHybridEventSurface(
+            :public_rising_root,
+            owner -> owner.value,
+            (owner, time_s) -> begin
+                owner.transition_time_s[] = time_s
+                owner.transition_count[] += 1
+            end;
+            direction = :rising,
+            priority = -1,
+            repeatable = false,
+        )
+        owner = (value = -1.0, transition_time_s = Ref(Inf), transition_count = Ref(0))
+        mutable_owner = (
+            value = owner.value,
+            transition_time_s = owner.transition_time_s,
+            transition_count = owner.transition_count,
+        )
+        AIMORA.OVER16TimestepIntegration.apply_hybrid_event!(
+            surface,
+            (
+                value = mutable_owner.value,
+                transition_time_s = mutable_owner.transition_time_s,
+                transition_count = mutable_owner.transition_count,
+            ),
+            0.25,
+        )
+        @test policy.maximum_events_per_step == 64
+        @test mutable_owner.transition_time_s[] == 0.25
+        @test mutable_owner.transition_count[] == 1
+
+        task_times = Float64[]
+        task = AIMORA.EMTStudy.EMTExactSampledTask(
+            :public_task,
+            3.0e-6,
+            (_owner, time_s, _execution_index) -> push!(task_times, time_s);
+            tick_s = 1.0e-6,
+            first_time_s = 0.0,
+        )
+        scheduler = AIMORA.OVER16TimestepIntegration.ExactSampledTaskScheduler(
+            1.0e-6;
+            tasks = [task],
+        )
+        for tick in 0:9
+            AIMORA.OVER16TimestepIntegration.run_due_sampled_tasks!(
+                scheduler,
+                nothing,
+                tick * 1.0e-6,
+            )
+        end
+        @test task_times == [0.0, 3.0e-6, 6.0e-6, 9.0e-6]
+
+        arc = AIMORA.TACS.ControlledSwitchDelayedArcState(1.0, 1.0, 1.0, 0.0)
+        arc.opening_requested = true
+        controlled = AIMORA.TACS.TACSControlledSwitch(
+            1,
+            0,
+            Ref(1.0);
+            initially_closed = true,
+            delayed_arc = arc,
+        )
+        AIMORA.TACS.apply_controlled_switch_delayed_arc_transition!(
+            controlled,
+            2.0e-6,
+        )
+        @test !controlled.closed
+        @test controlled.delayed_arc.tail_active
+        @test controlled.delayed_arc.scheduled_open_time_s == 2.0e-6
+        @test controlled.delayed_arc.transition_count == 1
+        AIMORA.TACS.apply_controlled_switch_delayed_arc_transition!(
+            controlled,
+            2.0e-6,
+        )
+        @test controlled.delayed_arc.transition_count == 1
+    end
 else
     @testset "public checkout has no solver source" begin
         @test AIMORA.solver_status().mode == :open_core
