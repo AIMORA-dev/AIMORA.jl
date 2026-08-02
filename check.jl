@@ -27,6 +27,9 @@ get(project, "name", nothing) == "AIMORA" || fail("Project.toml name is not AIMO
 for forbidden_path in (
     "AGENTS.md",
     "MEMORY.md",
+    "MAP.md",
+    "LEDGER.md",
+    "LEDGER",
     "TRANSLATION_MAP.md",
     "TRANSLATION_LEDGER.md",
     ".codex",
