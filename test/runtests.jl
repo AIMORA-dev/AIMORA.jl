@@ -388,3 +388,7 @@ else
         @test_throws ErrorException AIMORA.require_solver()
     end
 end
+
+if AIMORA.solver_available()
+    include("performance.jl")
+end
