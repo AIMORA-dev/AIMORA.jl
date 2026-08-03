@@ -23,6 +23,7 @@ export ConductanceBranch,
        seed_breqiv_frequency_histories!,
        trace_output_channel_count,
        trace_output_channel_names!,
+       trace_output_is_public,
        trace_output_values!,
        advance_breqiv_history_current!,
        stamp!,
@@ -628,6 +629,8 @@ function branch_current_value(
 end
 
 trace_output_channel_count(::EMTElement) = 0
+
+trace_output_is_public(::EMTElement) = false
 
 trace_output_channel_count(::IdealTransformerVoltageConstraint) = 1
 

@@ -11,6 +11,30 @@ struct EMTHybridCallbackOwner{R}
     runtime::R
 end
 
+"""A scheduler callback that routes an exact gate edge to one named power-semiconductor owner in the active EMT runtime."""
+struct PowerSemiconductorGateCommand
+    element_name::Symbol
+end
+
+function (command::PowerSemiconductorGateCommand)(
+    owner::EMTHybridCallbackOwner,
+    commanded_on::Bool,
+    time_s::Real,
+    _edge_index::Int,
+)
+    context = owner.runtime.context
+    element_index = findfirst(==(command.element_name), context.element_names)
+    element_index === nothing && throw(ArgumentError(
+        "power-semiconductor gate target $(command.element_name) is absent from the EMT runtime",
+    ))
+    device = context.system.elements[element_index]
+    device isa PowerSemiconductorSwitch || throw(ArgumentError(
+        "gate target $(command.element_name) is not a power-semiconductor device",
+    ))
+    request_power_semiconductor_gate!(device, commanded_on, time_s)
+    return nothing
+end
+
 mutable struct EMTHybridStepIntegrator{W,O,T,S}
     workspace::W
     callback_owner::O
@@ -74,6 +98,18 @@ function _emt_hybrid_current_extinction_direction(element)
         HYBRID_EVENT_FALLING : HYBRID_EVENT_ANY
 end
 
+function _emt_hybrid_positive_surface_candidate_time(owner, value)
+    value === nothing && return nothing
+    Float64(value) > 0.0 || return nothing
+    return owner.runtime.context.t_s
+end
+
+function _emt_hybrid_negative_surface_candidate_time(owner, value)
+    value === nothing && return nothing
+    Float64(value) < 0.0 || return nothing
+    return owner.runtime.context.t_s
+end
+
 function _emt_hybrid_time_surface(
     name::Symbol,
     element_index::Int,
@@ -101,6 +137,117 @@ function _emt_hybrid_device_surfaces(workspace::EMTStudyWorkspace)
     for index in eachindex(context.system.elements)
         element = context.system.elements[index]
         owner_name = context.element_names[index]
+        if element isa PowerSemiconductorSwitch
+            power_semiconductor_event_localization!(element)
+            if element.gate_driver !== nothing
+                push!(
+                    surfaces,
+                    HybridEventSurface(
+                        Symbol(owner_name, :_gate_transition),
+                        _owner -> nothing,
+                        (owner, time_s) -> apply_power_semiconductor_gate_transition!(
+                            _emt_hybrid_element(owner, index),
+                            time_s,
+                        );
+                        direction = HYBRID_EVENT_RISING,
+                        priority = -15,
+                        topology_invalidating = true,
+                        repeatable = true,
+                        candidate_time = owner -> power_semiconductor_gate_transition_time(
+                            _emt_hybrid_element(owner, index),
+                        ),
+                    ),
+                )
+            end
+            push!(
+                surfaces,
+                HybridEventSurface(
+                    Symbol(owner_name, :_forward_turn_on),
+                    owner -> power_semiconductor_forward_turn_on_residual(
+                        _emt_hybrid_element(owner, index),
+                    ),
+                    (owner, time_s) -> apply_power_semiconductor_forward_turn_on!(
+                        _emt_hybrid_element(owner, index),
+                        time_s,
+                    );
+                    direction = HYBRID_EVENT_RISING,
+                    priority = -8,
+                    topology_invalidating = true,
+                    repeatable = true,
+                    candidate_time = owner -> _emt_hybrid_positive_surface_candidate_time(
+                        owner,
+                        power_semiconductor_forward_turn_on_residual(
+                            _emt_hybrid_element(owner, index),
+                        ),
+                    ),
+                ),
+                HybridEventSurface(
+                    Symbol(owner_name, :_forward_extinction),
+                    owner -> power_semiconductor_forward_extinction_residual(
+                        _emt_hybrid_element(owner, index),
+                    ),
+                    (owner, time_s) -> apply_power_semiconductor_forward_extinction!(
+                        _emt_hybrid_element(owner, index),
+                        time_s,
+                    );
+                    direction = HYBRID_EVENT_FALLING,
+                    priority = -7,
+                    topology_invalidating = true,
+                    repeatable = true,
+                    candidate_time = owner -> _emt_hybrid_negative_surface_candidate_time(
+                        owner,
+                        power_semiconductor_forward_extinction_residual(
+                            _emt_hybrid_element(owner, index),
+                        ),
+                    ),
+                ),
+            )
+            if element.antiparallel_diode !== nothing
+                push!(
+                    surfaces,
+                    HybridEventSurface(
+                        Symbol(owner_name, :_reverse_diode_turn_on),
+                        owner -> power_semiconductor_reverse_turn_on_residual(
+                            _emt_hybrid_element(owner, index),
+                        ),
+                        (owner, time_s) -> apply_power_semiconductor_reverse_turn_on!(
+                            _emt_hybrid_element(owner, index),
+                            time_s,
+                        );
+                        direction = HYBRID_EVENT_RISING,
+                        priority = -8,
+                        topology_invalidating = true,
+                        repeatable = true,
+                        candidate_time = owner -> _emt_hybrid_positive_surface_candidate_time(
+                            owner,
+                            power_semiconductor_reverse_turn_on_residual(
+                                _emt_hybrid_element(owner, index),
+                            ),
+                        ),
+                    ),
+                    HybridEventSurface(
+                        Symbol(owner_name, :_reverse_diode_extinction),
+                        owner -> power_semiconductor_reverse_extinction_residual(
+                            _emt_hybrid_element(owner, index),
+                        ),
+                        (owner, time_s) -> apply_power_semiconductor_reverse_extinction!(
+                            _emt_hybrid_element(owner, index),
+                            time_s,
+                        );
+                        direction = HYBRID_EVENT_FALLING,
+                        priority = -7,
+                        topology_invalidating = true,
+                        repeatable = true,
+                        candidate_time = owner -> _emt_hybrid_negative_surface_candidate_time(
+                            owner,
+                            power_semiconductor_reverse_extinction_residual(
+                                _emt_hybrid_element(owner, index),
+                            ),
+                        ),
+                    ),
+                )
+            end
+        end
         if element isa TimeSwitch
             if isfinite(element.close_time_s)
                 push!(

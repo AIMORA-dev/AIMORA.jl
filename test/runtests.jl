@@ -339,6 +339,40 @@ end
 end
 
 if AIMORA.solver_available()
+    @testset "power-semiconductor public model and gate surface" begin
+        driver = AIMORA.Nonlinear.PowerSemiconductorGateDriver(
+            turn_on_delay_s = 2.0e-6,
+            minimum_pulse_width_s = 3.0e-6,
+        )
+        device = AIMORA.Nonlinear.IGBTSwitch(
+            1,
+            0;
+            gate_driver = driver,
+            forward_voltage_drop_v = 0.7,
+            on_conductance = 5.0,
+            antiparallel_diode = AIMORA.Nonlinear.AntiparallelDiodeParameters(
+                forward_voltage_v = 0.6,
+                on_conductance_s = 5.0,
+            ),
+            snubber = AIMORA.Nonlinear.SeriesRCSnubber(10.0, 1.0e-6),
+        )
+        device.last_voltage = 2.0
+        @test !AIMORA.Nonlinear.request_power_semiconductor_gate!(device, true, 0.0)
+        @test AIMORA.Nonlinear.power_semiconductor_gate_transition_time(device) == 2.0e-6
+        @test AIMORA.Nonlinear.apply_power_semiconductor_gate_transition!(
+            device,
+            2.0e-6,
+        )
+        @test device.closed
+        terminal = AIMORA.Nonlinear.power_semiconductor_terminal_state(device)
+        @test terminal.device_kind == :igbt
+        @test terminal.gate_applied_on
+        @test AIMORA.Branches.trace_output_channel_count(device) == 10
+        @test AIMORA.Branches.trace_output_is_public(device)
+        @test AIMORA.EMTStudy.PowerSemiconductorGateCommand(:main_valve).element_name ==
+            :main_valve
+    end
+
     @testset "sampled line steady-state terminal admittance" begin
         propagation = AIMORA.Lines.line_weighting_samples(
             (2:7) .* 1.0e-6,

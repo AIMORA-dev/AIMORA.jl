@@ -1940,7 +1940,13 @@ function _deck_requested_electrical_trace(
     parsed::DeckParser.DeckParseResult,
     trace::DeckEMTTrace,
 )
-    output_names = _deck_requested_electrical_output_names(parsed)
+    output_names = Symbol[]
+    for (element_name, element) in zip(parsed.element_names, parsed.elements)
+        trace_output_is_public(element) || continue
+        trace_output_channel_names!(output_names, element_name, element)
+    end
+    append!(output_names, _deck_requested_electrical_output_names(parsed))
+    unique!(output_names)
     output_indices = Int[]
     for name in output_names
         index = findfirst(==(name), trace.output_channel_names)
@@ -2572,6 +2578,7 @@ function prepare_emt_study(
         ideal_transformer_source_runtime ||
         _deck_uses_dynamic_nonlinear_runtime(parsed) ||
         _deck_uses_control_system_feedback_runtime(parsed) ||
+        any(element -> element isa PowerSemiconductorSwitch, parsed.elements) ||
         !isempty(series_rlc_alterations)
     dynamic_network_runtime || throw(ArgumentError(
         "prepared EMT execution currently requires the production dynamic network runtime",
