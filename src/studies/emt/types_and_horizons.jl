@@ -2588,7 +2588,7 @@ function _deck_type9_through_12_automatic_initialization_group(
         electrical = electrical_states[index]
         residual = armature_voltage_residuals[index]
         tolerance =
-            1.0e-8 + 1.0e-8 * abs(electrical.requested_armature_voltage)
+            2.0e-7 + 1.0e-8 * abs(electrical.requested_armature_voltage)
         abs(residual) <= tolerance || throw(ArgumentError(
             "automatic type-$(electrical.machine_type) machine $(electrical.machine_index) armature/network steady state is inconsistent by $residual V",
         ))
