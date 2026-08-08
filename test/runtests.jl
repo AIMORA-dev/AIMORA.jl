@@ -35,50 +35,50 @@ end
     @test :emt in (study.id for study in AIMORA.StudyCatalog.available_studies())
 end
 
-@testset "complementary power-semiconductor bridge public contract" begin
-    upper = AIMORA.Nonlinear.MOSFETSwitch(
-        1,
-        2;
-        gate_driver = AIMORA.Nonlinear.PowerSemiconductorGateDriver(),
-        antiparallel_diode = AIMORA.Nonlinear.AntiparallelDiodeParameters(),
-    )
-    lower = AIMORA.Nonlinear.MOSFETSwitch(
-        2,
-        0;
-        gate_driver = AIMORA.Nonlinear.PowerSemiconductorGateDriver(),
-        antiparallel_diode = AIMORA.Nonlinear.AntiparallelDiodeParameters(),
-    )
-    bridge = AIMORA.Nonlinear.PowerSemiconductorBridgeLeg(
-        upper,
-        lower;
-        commutation_dead_time_s = 1.0e-6,
-    )
-    @test AIMORA.Nonlinear.request_power_semiconductor_bridge_pole!(
-        bridge,
-        true,
-        0.0,
-    ) == AIMORA.Nonlinear.BRIDGE_GATE_ACCEPTED
-    @test AIMORA.Nonlinear.power_semiconductor_bridge_gate_transition_time(bridge) ==
-        1.0e-6
-    @test AIMORA.Nonlinear.apply_power_semiconductor_bridge_gate_transitions!(
-        bridge,
-        1.0e-6,
-    ) == 1
-    @test upper.gate_driver.applied_on
-    @test !lower.gate_driver.applied_on
-    @test AIMORA.Nonlinear.request_power_semiconductor_bridge_gates!(
-        bridge,
-        true,
-        true,
-        2.0e-6,
-    ) == AIMORA.Nonlinear.BRIDGE_GATE_SHOOT_THROUGH_REJECTED
-    @test AIMORA.Branches.trace_output_channel_count(bridge) == 24
-    @test AIMORA.Branches.trace_output_is_public(bridge)
-    @test AIMORA.EMTStudy.PowerSemiconductorBridgePoleCommand(:main_bridge).element_name ==
-        :main_bridge
-end
-
 if AIMORA.solver_available()
+    @testset "complementary power-semiconductor bridge public contract" begin
+        upper = AIMORA.Nonlinear.MOSFETSwitch(
+            1,
+            2;
+            gate_driver = AIMORA.Nonlinear.PowerSemiconductorGateDriver(),
+            antiparallel_diode = AIMORA.Nonlinear.AntiparallelDiodeParameters(),
+        )
+        lower = AIMORA.Nonlinear.MOSFETSwitch(
+            2,
+            0;
+            gate_driver = AIMORA.Nonlinear.PowerSemiconductorGateDriver(),
+            antiparallel_diode = AIMORA.Nonlinear.AntiparallelDiodeParameters(),
+        )
+        bridge = AIMORA.Nonlinear.PowerSemiconductorBridgeLeg(
+            upper,
+            lower;
+            commutation_dead_time_s = 1.0e-6,
+        )
+        @test AIMORA.Nonlinear.request_power_semiconductor_bridge_pole!(
+            bridge,
+            true,
+            0.0,
+        ) == AIMORA.Nonlinear.BRIDGE_GATE_ACCEPTED
+        @test AIMORA.Nonlinear.power_semiconductor_bridge_gate_transition_time(bridge) ==
+            1.0e-6
+        @test AIMORA.Nonlinear.apply_power_semiconductor_bridge_gate_transitions!(
+            bridge,
+            1.0e-6,
+        ) == 1
+        @test upper.gate_driver.applied_on
+        @test !lower.gate_driver.applied_on
+        @test AIMORA.Nonlinear.request_power_semiconductor_bridge_gates!(
+            bridge,
+            true,
+            true,
+            2.0e-6,
+        ) == AIMORA.Nonlinear.BRIDGE_GATE_SHOOT_THROUGH_REJECTED
+        @test AIMORA.Branches.trace_output_channel_count(bridge) == 24
+        @test AIMORA.Branches.trace_output_is_public(bridge)
+        @test AIMORA.EMTStudy.PowerSemiconductorBridgePoleCommand(:main_bridge).element_name ==
+            :main_bridge
+    end
+
     @testset "grounded scalar branch references" begin
         fixed_control = [
             "BEGIN NEW DATA CASE",
@@ -651,6 +651,7 @@ else
     @testset "public checkout has no solver source" begin
         @test AIMORA.solver_status().mode == :open_core
         @test !isdefined(AIMORA, :Nodal)
+        @test !isdefined(AIMORA, :Nonlinear)
         @test_throws ErrorException AIMORA.require_solver()
     end
 end
