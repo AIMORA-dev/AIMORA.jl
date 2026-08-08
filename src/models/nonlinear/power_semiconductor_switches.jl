@@ -494,6 +494,8 @@ function request_power_semiconductor_gate!(
     device::PowerSemiconductorSwitch,
     commanded_on::Bool,
     time_s::Real,
+    ;
+    earliest_transition_time_s::Union{Nothing,Real}=nothing,
 )
     driver = device.gate_driver
     driver === nothing && throw(ArgumentError("a diode junction has no gate command"))
@@ -501,6 +503,15 @@ function request_power_semiconductor_gate!(
     isfinite(command_time) && command_time >= 0.0 || throw(ArgumentError(
         "gate command time must be finite and nonnegative",
     ))
+    earliest_transition_time = if earliest_transition_time_s === nothing
+        nothing
+    else
+        boundary = Float64(earliest_transition_time_s)
+        isfinite(boundary) && boundary >= command_time || throw(ArgumentError(
+            "earliest gate-transition time must be finite and no earlier than the command",
+        ))
+        boundary
+    end
     commanded_on == driver.commanded_on && return false
     driver.commanded_on = commanded_on
     driver.last_command_time_s = command_time
@@ -521,6 +532,9 @@ function request_power_semiconductor_gate!(
             command_time + driver.turn_off_delay_s,
             driver.last_turn_on_time_s + driver.minimum_pulse_width_s,
         )
+    end
+    if earliest_transition_time !== nothing
+        transition_time = max(transition_time, earliest_transition_time)
     end
     driver.pending_state = commanded_on
     driver.pending_transition_time_s = transition_time

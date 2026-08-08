@@ -2578,7 +2578,11 @@ function prepare_emt_study(
         ideal_transformer_source_runtime ||
         _deck_uses_dynamic_nonlinear_runtime(parsed) ||
         _deck_uses_control_system_feedback_runtime(parsed) ||
-        any(element -> element isa PowerSemiconductorSwitch, parsed.elements) ||
+        any(
+            element -> element isa PowerSemiconductorSwitch ||
+                element isa PowerSemiconductorBridgeLeg,
+            parsed.elements,
+        ) ||
         !isempty(series_rlc_alterations)
     dynamic_network_runtime || throw(ArgumentError(
         "prepared EMT execution currently requires the production dynamic network runtime",
