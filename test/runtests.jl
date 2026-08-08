@@ -79,6 +79,58 @@ if AIMORA.solver_available()
             :main_bridge
     end
 
+    @testset "floating Thevenin source and coupled VSC runtime" begin
+        floating_source = AIMORA.Branches.TwoTerminalTheveninSource(
+            1,
+            2,
+            2.0,
+            _time_s -> 10.0,
+        )
+        source_system = AIMORA.Nodal.NodalSystem(
+            2,
+            Any[
+                floating_source,
+                AIMORA.Branches.ConductanceBranch(1, 2, 1.0),
+                AIMORA.Branches.ConductanceBranch(2, 0, 1.0e3),
+            ],
+        )
+        AIMORA.Nodal.solve_algebraic_state!(source_system, 0.0, 1.0e-6)
+        @test source_system.v[1] - source_system.v[2] ≈ 20.0 / 3.0 atol = 2.0e-12
+        @test source_system.v[2] ≈ 0.0 atol = 2.0e-12
+        @test AIMORA.Nodal.accept_algebraic_state!(source_system, 1.0e-6) ===
+            source_system.v
+
+        parameters = AIMORA.SwitchDetailedVSC.ThreePhaseTwoLevelVSCParameters(
+            end_time_s = 20.0e-3,
+            sag_start_s = 1.0e-3,
+            sag_end_s = 2.0e-3,
+            fault_start_s = 8.0e-3,
+            block_time_s = 9.0e-3,
+            fault_end_s = 10.0e-3,
+            restart_time_s = 11.0e-3,
+            harmonic_window_start_s = 0.0,
+            harmonic_window_end_s = 20.0e-3,
+        )
+        trace = AIMORA.EMTStudy.simulate_three_phase_vsc(parameters)
+        metrics = trace.metrics
+        @test length(trace.time_s) == 20_001
+        @test metrics.finite_output
+        @test metrics.exact_boundary_alignment
+        @test metrics.boundary_count == 6
+        @test metrics.block_count == 1
+        @test metrics.restart_count == 1
+        @test metrics.commutation_count > 0
+        @test metrics.maximum_topology_iterations <= 12
+        @test metrics.maximum_nodal_kcl_residual_a <= 1.0e-7
+        @test metrics.relative_energy_residual <= 1.0e-5
+        @test metrics.relative_dc_ac_energy_residual <= 1.0e-5
+        @test minimum(trace.dc_link_voltage_v) >= 650.0
+        @test maximum(abs, trace.filter_current_a) <= parameters.current_limit_a
+        @test maximum(abs, vec(sum(trace.filter_current_a; dims = 1))) <= 1.0e-7
+        @test any(trace.upper_antiparallel_diode_conducting .> 0.5) ||
+            any(trace.lower_antiparallel_diode_conducting .> 0.5)
+    end
+
     @testset "grounded scalar branch references" begin
         fixed_control = [
             "BEGIN NEW DATA CASE",
@@ -182,6 +234,52 @@ end
         t_end = 2.0e-4,
         dt = 20.0e-6,
         p = AIMORA.Inverter.InverterParams(f_hz = 0.0),
+    )
+end
+
+@testset "switch-detailed three-phase VSC public model" begin
+    contract = AIMORA.SwitchDetailedVSC.switch_detailed_vsc_contract()
+    @test contract.id == :three_phase_two_level_switch_detailed_vsc
+    @test contract.maturity == :implemented
+    @test contract.fidelity == AIMORA.StudyCore.SwitchingDetailed
+    @test Set(quantity.key for quantity in contract.outputs) >= Set((
+        :dc_source_energy_j,
+        :ac_terminal_energy_j,
+        :dc_ac_energy_residual_j,
+    ))
+    @test :phase_locked_loop_dynamics in contract.validity_domain.unsupported_phenomena
+    @test :transformer_magnetizing_saturation in
+        contract.validity_domain.unsupported_phenomena
+
+    phase = (310.0, -122.0, -188.0)
+    angle = 0.37
+    stationary = AIMORA.SwitchDetailedVSC.clarke_transform(phase)
+    synchronous = AIMORA.SwitchDetailedVSC.park_transform(stationary, angle)
+    recovered = AIMORA.SwitchDetailedVSC.inverse_clarke_transform(
+        AIMORA.SwitchDetailedVSC.inverse_park_transform(synchronous, angle),
+    )
+    @test collect(recovered) ≈ collect(phase) atol = 2.0e-13
+    @test AIMORA.SwitchDetailedVSC.instantaneous_three_phase_power(
+        (100.0, -50.0, -50.0),
+        (10.0, -5.0, -5.0),
+        0.0,
+    ) == (active_w = 1500.0, reactive_var = 0.0)
+    sinusoidal = AIMORA.SwitchDetailedVSC.modulation_duties(
+        (240.0, -120.0, -120.0),
+        800.0,
+        AIMORA.SwitchDetailedVSC.SinusoidalPulseWidthModulation,
+    )
+    injected = AIMORA.SwitchDetailedVSC.modulation_duties(
+        (240.0, -120.0, -120.0),
+        800.0,
+        AIMORA.SwitchDetailedVSC.ZeroSequenceInjectedPulseWidthModulation,
+    )
+    @test collect(sinusoidal) ≈ [0.8, 0.35, 0.35] atol = 2.0e-16
+    @test collect(injected) ≈ [0.725, 0.275, 0.275] atol = 2.0e-16
+    @test_throws ArgumentError AIMORA.SwitchDetailedVSC.validate_three_phase_vsc_parameters(
+        AIMORA.SwitchDetailedVSC.ThreePhaseTwoLevelVSCParameters(
+            scheduler_tick_s = 3.0e-6,
+        ),
     )
 end
 

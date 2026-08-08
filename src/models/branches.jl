@@ -14,6 +14,7 @@ export ConductanceBranch,
        BreqivHistoryInjection,
        BranchCompanionSnapshot,
        TheveninSource,
+       TwoTerminalTheveninSource,
        CurrentInjection,
        branch_companion_snapshot,
        branch_current_value,
@@ -401,6 +402,32 @@ struct TheveninSource{F} <: EMTElement
     node::Int
     g::Float64
     value::F
+end
+
+"""A finite Thevenin source between two nonidentical terminals, with positive source voltage and delivered current oriented from `b` to `a`."""
+struct TwoTerminalTheveninSource{F} <: EMTElement
+    a::Int
+    b::Int
+    g::Float64
+    value::F
+
+    function TwoTerminalTheveninSource(
+        a::Integer,
+        b::Integer,
+        conductance::Real,
+        value::F,
+    ) where {F}
+        from_node = Int(a)
+        to_node = Int(b)
+        from_node >= 0 && to_node >= 0 && from_node != to_node || throw(ArgumentError(
+            "two-terminal Thevenin source nodes must be nonnegative and distinct",
+        ))
+        g = Float64(conductance)
+        isfinite(g) && g > 0.0 || throw(ArgumentError(
+            "two-terminal Thevenin source conductance must be finite and positive",
+        ))
+        return new{F}(from_node, to_node, g, value)
+    end
 end
 
 struct CurrentInjection{F} <: EMTElement
@@ -1359,6 +1386,16 @@ function stamp!(y, rhs, s::TheveninSource, t::Float64, dt::Float64)
     rhs[s.node] += s.g * s.value(t)
 end
 
+function stamp!(y, rhs, s::TwoTerminalTheveninSource, t::Float64, dt::Float64)
+    source_voltage = Float64(s.value(t))
+    isfinite(source_voltage) || throw(ArgumentError(
+        "two-terminal Thevenin source voltage must be finite",
+    ))
+    stamp_conductance!(y, s.a, s.b, s.g)
+    stamp_history_current!(rhs, s.a, s.b, -s.g * source_voltage)
+    return nothing
+end
+
 function stamp!(y, rhs, s::CurrentInjection, t::Float64, dt::Float64)
     rhs[s.node] += s.value(t)
 end
@@ -1366,6 +1403,7 @@ end
 update!(b::ConductanceBranch, v, dt::Float64) = nothing
 update!(::IdealTransformerVoltageConstraint, _v, _dt::Float64) = nothing
 update!(s::TheveninSource, v, dt::Float64) = nothing
+update!(s::TwoTerminalTheveninSource, v, dt::Float64) = nothing
 update!(s::CurrentInjection, v, dt::Float64) = nothing
 
 function update!(b::BreqivHistoryInjection, v, dt::Float64)
