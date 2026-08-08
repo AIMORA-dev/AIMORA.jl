@@ -2,6 +2,7 @@ name = "AIMORA"
 uuid = "bb4e3f50-0ac0-4ed3-9c38-7355ab8ea495"
 authors = ["AIMORA contributors"]
 version = "0.1.0"
+license = "PolyForm-Noncommercial-1.0.0"
 
 [compat]
 CUDA = "5, 6"

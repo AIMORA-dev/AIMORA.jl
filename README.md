@@ -2,10 +2,7 @@
 
 **Analytical Integration for Multiphase Overvoltage and Response Analysis**
 
-AIMORA is a Julia-native power-system engineering platform. The public package
-owns study contracts, project and asset schemas, validation, model metadata,
-reporting utilities, and open engineering models. Production numerical
-capabilities are supplied through separately licensed distributions.
+AIMORA is a Julia-native power-system engineering platform. The public package owns study contracts, project and asset schemas, validation, model metadata, reporting utilities, and open engineering models. Production numerical capabilities are supplied through separately licensed distributions.
 
 ## Installation
 
@@ -17,25 +14,18 @@ using AIMORA
 AIMORA.solver_status()
 ```
 
-The public package loads independently. Project data, study input profiles,
-asset tables, validation, inverter examples, and future study interfaces
-remain available. Installation instructions for licensed capabilities are
-provided with the corresponding distribution.
+The public package loads independently. Project data, study input profiles, asset tables, validation, inverter examples, and future study interfaces remain available. Installation instructions for licensed capabilities are provided with the corresponding distribution.
 
 ## Current scientific scope
 
-- Julia-only electromagnetic-transient execution for the accepted
-  `aimora_bpa_emtp_replacement_v1` target set in the production distribution
+- Julia-only electromagnetic-transient execution for the accepted `aimora_bpa_emtp_replacement_v1` target set in the production distribution
 - Typed project, scenario, study, result, validation, and asset-table APIs
 - Open inverter model and fixed-step demonstration
 - Overhead and cable line-constants implementations in the full engine
-- Explicit architecture contracts for power flow, short circuit, protection,
-  and arc flash; these studies are not yet claimed as implemented
-- Optional CUDA fixed-admittance batching when the numerical backend and a
-  functional CUDA device are present
+- Explicit architecture contracts for power flow, short circuit, protection, and arc flash; these studies are not yet claimed as implemented
+- Optional CUDA fixed-admittance batching when the numerical backend and a functional CUDA device are present
 
-CPU remains the default. Backend-neutral support for AMD, Intel, and other GPU
-families is an architectural target, not a current compatibility claim.
+CPU remains the default. Backend-neutral support for AMD, Intel, and other GPU families is an architectural target, not a current compatibility claim.
 
 ## Package layout
 
@@ -53,17 +43,13 @@ Makefile                   test and check commands
 
 ## Related repositories
 
-- [BPAEMTPReference.jl](https://github.com/AIMORA-dev/BPAEMTPReference.jl):
-  compiled historical reference and Julia wrapper
+- [BPAEMTPReference.jl](https://github.com/AIMORA-dev/BPAEMTPReference.jl): compiled historical reference and Julia wrapper
 - [AIMORADocs](https://github.com/AIMORA-dev/AIMORADocs): unified documentation
-- [AIMORACases.jl](https://github.com/AIMORA-dev/AIMORACases.jl): example and benchmark
-  cases plus runnable examples grouped by study
-- [AIMORACatalogs.jl](https://github.com/AIMORA-dev/AIMORACatalogs.jl): open
-  catalog schemas and distributable model data
+- [AIMORACases.jl](https://github.com/AIMORA-dev/AIMORACases.jl): example and benchmark cases plus runnable examples grouped by study
+- [AIMORACatalogs.jl](https://github.com/AIMORA-dev/AIMORACatalogs.jl): open catalog schemas and distributable model data
 
 ## Licence
 
-Public AIMORA code is available under the MIT licence. Separately distributed
-components are governed by their own licences. Historical BPA source and
-compiled-reference tooling live in their own repository with preserved
-provenance.
+This repository's AIMORA-authored content is distributed under the PolyForm Noncommercial License 1.0.0. Research, education, personal study, public-interest noncommercial use, and other purposes permitted by that licence are free; commercial use requires a separate written agreement with Ahmed Elkholy <ahmed_elkholy@f-eng.tanta.edu.eg>. There is no licence key, activation, telemetry, or technical feature restriction. Clearly identified third-party material retains its own terms, and copies received under an earlier licence retain those prior grants.
+
+The private `src/solvers` submodule is proprietary and grants no public distribution or use right.
