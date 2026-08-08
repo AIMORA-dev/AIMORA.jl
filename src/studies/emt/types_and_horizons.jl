@@ -2358,6 +2358,12 @@ function _deck_type9_through_12_automatic_initialization(
             steady_state = group.steady_state,
             solved_armature_voltage = solved_voltage,
             armature_voltage_residual = voltage_residual,
+            runtime_group_fixed_point_iteration_count =
+                group.runtime_group_fixed_point_iteration_count,
+            runtime_group_current_residual =
+                group.runtime_group_current_residual,
+            runtime_group_maximum_current_residual =
+                group.runtime_group_maximum_current_residual,
         ),
     )
 end
@@ -2366,8 +2372,8 @@ function _deck_direct_machine_group_runtime_fixed_points(
     parsed::DeckParser.DeckParseResult,
     electrical_states::AbstractVector;
     maximum_iterations::Int = 12,
-    absolute_tolerance::Float64 = 1.0e-9,
-    relative_tolerance::Float64 = 1.0e-9,
+    absolute_tolerance::Float64 = 1.0e-10,
+    relative_tolerance::Float64 = 1.0e-10,
 )
     machine_count = length(electrical_states)
     machine_count > 0 ||
@@ -2504,9 +2510,6 @@ function _deck_direct_machine_group_runtime_fixed_points(
     converged || throw(ArgumentError(
         "automatic direct-machine runtime group did not converge after $maximum_iterations iterations",
     ))
-    mapped, fixed_points, open_circuit_voltages = evaluate(currents)
-    residual = mapped - currents
-    currents .= mapped
     updated_electrical_states = [
         merge(
             electrical_states[index],
