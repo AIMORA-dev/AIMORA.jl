@@ -3,6 +3,8 @@ using AIMORA
 using LinearAlgebra
 using Printf
 
+include("nonlinear_network.jl")
+
 @testset "public package isolation" begin
     for module_name in (
         :LegacyEMTP,

@@ -6,6 +6,7 @@ const _SOLVER_SOURCE_DIR = joinpath(@__DIR__, "solvers")
 const _REQUIRED_SOLVER_FILES = (
     "companion.jl",
     "nodal.jl",
+    "nonlinear_nodal.jl",
     "timestep.jl",
     "over16_timestep_integration.jl",
 )
@@ -63,6 +64,7 @@ include("core/project.jl")
 include("io/project_io.jl")
 include("models/inverter.jl")
 include("models/switch_detailed_vsc.jl")
+include("models/nonlinear_network.jl")
 include("models/inverter_assets.jl")
 include("models/transformer_parameters.jl")
 include("io/transformer_parameter_input.jl")
@@ -91,6 +93,7 @@ if solver_available()
     include("models/machines.jl")
     include("solvers/over16_timestep_integration.jl")
     include("solvers/nodal.jl")
+    include("solvers/nonlinear_nodal.jl")
     include("io/deck_parser.jl")
     include("studies/cable_constants.jl")
     include("studies/line_constants.jl")

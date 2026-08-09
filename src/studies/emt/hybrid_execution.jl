@@ -1,5 +1,7 @@
 const EMTHybridEventSurface = HybridEventSurface
 const EMTHybridEventPolicy = HybridEventPolicy
+const EMTHybridEventOccurrence = HybridEventOccurrence
+const EMTSampledTaskOccurrence = SampledTaskOccurrence
 const EMTExactSampledTask = ExactSampledTask
 const EMTExactSampledControlTask = ExactSampledControlTask
 const EMTExactPWMTask = ExactPWMTask

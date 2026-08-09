@@ -6,6 +6,7 @@ using ..Sources: AnalyticSourceSignal
 
 include(joinpath(@__DIR__, "emt", "source_signal_program.jl"))
 include(joinpath(@__DIR__, "emt", "types_and_horizons.jl"))
+include(joinpath(@__DIR__, "emt", "nonlinear_network_execution.jl"))
 include(joinpath(@__DIR__, "emt", "control_and_machine_boundaries.jl"))
 include(joinpath(@__DIR__, "emt", "direct_machine_fleet.jl"))
 include(joinpath(@__DIR__, "emt", "deck_context_initialization.jl"))

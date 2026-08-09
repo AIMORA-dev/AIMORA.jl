@@ -59,6 +59,10 @@ using ..Lines: distributed_transposed_line_modal_timestep_update!,
                line_step_response_exponential_fit,
                pole_residue_transfer_value
 using ..Nodal
+using ..NonlinearNetwork: NonlinearChatterDecision, NonlinearSolveDiagnostics
+using ..NonlinearNodal: NonlinearNodalSystem,
+                        advance_nonlinear_step!,
+                        nonlinear_linear_system
 using ..Sources: AnalyticSourceSignal
 using ..Machines: MachineNetworkCouplingState,
                   MachineTerminalCurrentState,
@@ -133,6 +137,7 @@ using ..OVER16TimestepIntegration: OVER16AcceptedTimestepState,
                                   AbstractHybridEventSurface,
                                   HybridEventSurface,
                                   HybridEventOccurrence,
+                                  SampledTaskOccurrence,
                                   hybrid_event_value,
                                   hybrid_event_candidate_time,
                                   hybrid_event_candidate_is_event,
@@ -256,6 +261,10 @@ using ..LineConstantsStudy:
 using ..ValidationCore: assert_valid!, validation_result
 
 export UnifiedEMTConfig,
+       NonlinearEMTDiscontinuity,
+       NonlinearEMTStudySchedule,
+       NonlinearEMTStudyTrace,
+       evaluate_nonlinear_emt_network!,
        EMTStepContext,
        EMTTerminalNodeState,
        EMTTerminalBranchState,
@@ -270,6 +279,8 @@ export UnifiedEMTConfig,
        EMTStepTransaction,
        EMTHybridEventSurface,
        EMTHybridEventPolicy,
+       EMTHybridEventOccurrence,
+       EMTSampledTaskOccurrence,
        EMTExactSampledTask,
        EMTExactSampledControlTask,
        EMTExactPWMTask,

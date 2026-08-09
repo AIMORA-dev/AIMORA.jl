@@ -1,6 +1,10 @@
 module Switches
 
-import ..Branches: EMTElement, stamp!, stamp_conductance!, update!
+import ..Branches: EMTElement,
+                   backward_euler_companion_supported,
+                   stamp!,
+                   stamp_conductance!,
+                   update!
 
 export IdealSwitch,
        TimeSwitch,
@@ -4559,6 +4563,10 @@ function stamp!(y::AbstractMatrix{Float64}, _rhs::AbstractVector{Float64},
     stamp_conductance!(y, s.a, s.b, switch_conductance(s, t))
     return nothing
 end
+
+backward_euler_companion_supported(
+    ::Union{IdealSwitch,TimeSwitch,CurrentZeroSwitch},
+) = true
 
 update!(::Union{IdealSwitch,TimeSwitch}, _voltages::AbstractVector{Float64},
         _dt::Float64) = nothing

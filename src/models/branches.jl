@@ -4,6 +4,9 @@ using ..Companion
 using LinearAlgebra: I, Symmetric, cholesky, isposdef, mul!
 
 export ConductanceBranch,
+       CompanionIntegrationMethod,
+       TrapezoidalCompanion,
+       BackwardEulerCompanion,
        IdealTransformerVoltageConstraint,
        SeriesRLBranch,
        SeriesRLCBranch,
@@ -31,6 +34,11 @@ export ConductanceBranch,
        update!
 
 abstract type EMTElement end
+
+@enum CompanionIntegrationMethod begin
+    TrapezoidalCompanion
+    BackwardEulerCompanion
+end
 
 struct ConductanceBranch <: EMTElement
     a::Int
@@ -434,6 +442,21 @@ struct CurrentInjection{F} <: EMTElement
     node::Int
     value::F
 end
+
+backward_euler_companion_supported(::EMTElement) = false
+
+backward_euler_companion_supported(
+    ::Union{
+        ConductanceBranch,
+        IdealTransformerVoltageConstraint,
+        SeriesRLBranch,
+        SeriesRLCBranch,
+        CapacitorBranch,
+        TheveninSource,
+        TwoTerminalTheveninSource,
+        CurrentInjection,
+    },
+) = true
 
 function stamp_conductance!(y::AbstractMatrix{Float64}, a::Int, b::Int, g::Float64)
     if a != 0
@@ -1270,6 +1293,80 @@ function companion(b::CapacitorBranch, dt::Float64)
     return capacitor_companion(b.c, b.i_prev, b.v_prev, dt)
 end
 
+companion(b::SeriesRLBranch, dt::Float64, ::Val{TrapezoidalCompanion}) =
+    companion(b, dt)
+
+function companion(b::SeriesRLBranch, dt::Float64, ::Val{BackwardEulerCompanion})
+    isfinite(dt) && dt > 0.0 || throw(ArgumentError(
+        "series R-L backward-Euler timestep must be finite and positive",
+    ))
+    isfinite(b.r) || throw(ArgumentError("series R-L resistance must be finite"))
+    isfinite(b.l) && b.l >= 0.0 || throw(ArgumentError(
+        "series R-L inductance must be finite and nonnegative",
+    ))
+    b.l > 0.0 || b.r > 0.0 || throw(ArgumentError(
+        "series resistor-only branch resistance must be positive",
+    ))
+    all(isfinite, (b.i_prev, b.v_prev, b.i_last)) || throw(ArgumentError(
+        "series R-L accepted state must be finite",
+    ))
+    conductance, history_current = series_rl_backward_euler_companion(
+        b.r,
+        b.l,
+        b.i_prev,
+        dt,
+    )
+    all(isfinite, (conductance, history_current)) || throw(ArgumentError(
+        "series R-L backward-Euler companion values must be finite",
+    ))
+    return conductance, history_current
+end
+
+companion(b::SeriesRLCBranch, dt::Float64, ::Val{TrapezoidalCompanion}) =
+    companion(b, dt)
+
+function companion(b::SeriesRLCBranch, dt::Float64, ::Val{BackwardEulerCompanion})
+    isfinite(dt) && dt > 0.0 || throw(ArgumentError(
+        "series RLC backward-Euler timestep must be finite and positive",
+    ))
+    conductance, history_current = series_rlc_backward_euler_companion(
+        b.r,
+        b.l,
+        b.c,
+        b.i_prev,
+        b.capacitor_voltage_prev,
+        dt,
+    )
+    all(isfinite, (conductance, history_current)) || throw(ArgumentError(
+        "series RLC backward-Euler companion values must be finite",
+    ))
+    return conductance, history_current
+end
+
+companion(b::CapacitorBranch, dt::Float64, ::Val{TrapezoidalCompanion}) =
+    companion(b, dt)
+
+function companion(b::CapacitorBranch, dt::Float64, ::Val{BackwardEulerCompanion})
+    isfinite(dt) && dt > 0.0 || throw(ArgumentError(
+        "capacitor backward-Euler timestep must be finite and positive",
+    ))
+    isfinite(b.c) && b.c > 0.0 || throw(ArgumentError(
+        "capacitor capacitance must be finite and positive",
+    ))
+    all(isfinite, (b.i_prev, b.v_prev, b.i_last)) || throw(ArgumentError(
+        "capacitor accepted state must be finite",
+    ))
+    conductance, history_current = capacitor_backward_euler_companion(
+        b.c,
+        b.v_prev,
+        dt,
+    )
+    all(isfinite, (conductance, history_current)) || throw(ArgumentError(
+        "capacitor backward-Euler companion values must be finite",
+    ))
+    return conductance, history_current
+end
+
 function stamp!(y, rhs, b::ConductanceBranch, t::Float64, dt::Float64)
     stamp_conductance!(y, b.a, b.b, b.g)
 end
@@ -1366,6 +1463,63 @@ function stamp!(y, rhs, b::CapacitorBranch, t::Float64, dt::Float64)
     stamp_conductance!(y, b.a, b.b, g)
     stamp_history_current!(rhs, b.a, b.b, ih)
 end
+
+function stamp!(
+    y,
+    rhs,
+    element::EMTElement,
+    t::Float64,
+    dt::Float64,
+    ::Val{TrapezoidalCompanion},
+)
+    return stamp!(y, rhs, element, t, dt)
+end
+
+function stamp!(
+    y,
+    rhs,
+    element::EMTElement,
+    t::Float64,
+    dt::Float64,
+    ::Val{BackwardEulerCompanion},
+)
+    backward_euler_companion_supported(element) || throw(ArgumentError(
+        "backward-Euler companion treatment is not declared for $(typeof(element))",
+    ))
+    return stamp!(y, rhs, element, t, dt)
+end
+
+function _stamp_scalar_companion!(
+    y,
+    rhs,
+    branch::Union{SeriesRLBranch,SeriesRLCBranch,CapacitorBranch},
+    t::Float64,
+    dt::Float64,
+    method,
+)
+    conductance, history_current = companion(branch, dt, method)
+    stamp_conductance!(y, branch.a, branch.b, conductance)
+    stamp_history_current!(rhs, branch.a, branch.b, history_current)
+    return nothing
+end
+
+stamp!(
+    y,
+    rhs,
+    branch::Union{SeriesRLBranch,SeriesRLCBranch,CapacitorBranch},
+    t::Float64,
+    dt::Float64,
+    method::Val{TrapezoidalCompanion},
+) = _stamp_scalar_companion!(y, rhs, branch, t, dt, method)
+
+stamp!(
+    y,
+    rhs,
+    branch::Union{SeriesRLBranch,SeriesRLCBranch,CapacitorBranch},
+    t::Float64,
+    dt::Float64,
+    method::Val{BackwardEulerCompanion},
+) = _stamp_scalar_companion!(y, rhs, branch, t, dt, method)
 
 function stamp!(y, rhs, b::BreqivHistoryInjection, t::Float64, dt::Float64)
     initialize_breqiv_history_injection!(b, dt)
@@ -1511,5 +1665,99 @@ function update!(b::CapacitorBranch, v, dt::Float64)
     b.i_last = i
     return nothing
 end
+
+function update!(
+    element::EMTElement,
+    voltage,
+    dt::Float64,
+    ::Val{TrapezoidalCompanion},
+)
+    return update!(element, voltage, dt)
+end
+
+function update!(
+    element::EMTElement,
+    voltage,
+    dt::Float64,
+    ::Val{BackwardEulerCompanion},
+)
+    backward_euler_companion_supported(element) || throw(ArgumentError(
+        "backward-Euler companion acceptance is not declared for $(typeof(element))",
+    ))
+    return update!(element, voltage, dt)
+end
+
+function _update_scalar_companion!(
+    branch::Union{SeriesRLBranch,CapacitorBranch},
+    voltage,
+    dt::Float64,
+    method,
+)
+    conductance, history_current = companion(branch, dt, method)
+    branch_voltage_v = branch_voltage(voltage, branch.a, branch.b)
+    branch_current_a = conductance * branch_voltage_v + history_current
+    all(isfinite, (branch_voltage_v, branch_current_a)) || throw(ArgumentError(
+        "accepted backward-Euler branch voltage and current must be finite",
+    ))
+    branch.v_prev = branch_voltage_v
+    branch.i_prev = branch_current_a
+    branch.i_last = branch_current_a
+    return nothing
+end
+
+
+update!(
+    branch::Union{SeriesRLBranch,CapacitorBranch},
+    voltage,
+    dt::Float64,
+    method::Val{BackwardEulerCompanion},
+) = _update_scalar_companion!(branch, voltage, dt, method)
+
+update!(
+    branch::Union{SeriesRLBranch,CapacitorBranch},
+    voltage,
+    dt::Float64,
+    ::Val{TrapezoidalCompanion},
+) = update!(branch, voltage, dt)
+
+function update!(
+    branch::SeriesRLCBranch,
+    voltage,
+    dt::Float64,
+    ::Val{BackwardEulerCompanion},
+)
+    conductance, history_current = companion(
+        branch,
+        dt,
+        Val(BackwardEulerCompanion),
+    )
+    branch_voltage_v = branch_voltage(voltage, branch.a, branch.b)
+    branch_current_a = conductance * branch_voltage_v + history_current
+    capacitor_voltage_v = branch.capacitor_voltage_prev +
+        dt * branch_current_a / branch.c
+    inductor_voltage_v = branch_voltage_v -
+        branch.r * branch_current_a - capacitor_voltage_v
+    all(isfinite, (
+        branch_voltage_v,
+        branch_current_a,
+        capacitor_voltage_v,
+        inductor_voltage_v,
+    )) || throw(ArgumentError(
+        "accepted backward-Euler series RLC state must be finite",
+    ))
+    branch.inductor_voltage_prev = inductor_voltage_v
+    branch.capacitor_voltage_prev = capacitor_voltage_v
+    branch.v_prev = branch_voltage_v
+    branch.i_prev = branch_current_a
+    branch.i_last = branch_current_a
+    return nothing
+end
+
+update!(
+    branch::SeriesRLCBranch,
+    voltage,
+    dt::Float64,
+    ::Val{TrapezoidalCompanion},
+) = update!(branch, voltage, dt)
 
 end
