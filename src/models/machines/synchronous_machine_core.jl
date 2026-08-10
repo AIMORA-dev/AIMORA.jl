@@ -1706,70 +1706,166 @@ function _synchronous_machine_steady_state_initialization(
         q_threshold = physical_elp[24]
         q_slope = physical_elp[25]
         armature_to_field_ratio = physical_elp[21]
-        previous_rotor_angle = rotor_angle
-        previous_field_current = field_current
-        convergence_confirmed = false
-        iteration = 0
-        while true
-            flux_magnitude = hypot(
-                d_current / armature_to_field_ratio + field_current,
-                (q_current / armature_to_field_ratio) * q_to_d_ratio,
+        max_iterations > 0 || throw(ArgumentError(
+            "synchronous-machine saturation initialization requires a positive iteration limit",
+        ))
+
+        function operating_point_from_saturation_factors(
+            d_factor::Float64,
+            q_factor::Float64,
+        )
+            isfinite(d_factor) && d_factor > 0.0 || throw(ArgumentError(
+                "synchronous-machine d-axis saturation factor must be finite and positive",
+            ))
+            isfinite(q_factor) && q_factor > 0.0 || throw(ArgumentError(
+                "synchronous-machine q-axis saturation factor must be finite and positive",
+            ))
+            d_mutual = ds * d_factor
+            d_synchronous = d_main * d_factor + leakage
+            q_synchronous = q_main * q_factor + leakage
+            d_mutual != 0.0 || throw(ArgumentError(
+                "synchronous-machine saturated d-axis mutual reactance is zero",
+            ))
+            angle_value = angle(
+                terminal_voltage +
+                complex(resistance, q_synchronous) * positive_current,
             )
-            if iteration == 0
-                d_saturation_factor = flux_magnitude <= d_threshold ? 1.0 :
-                    (1.0 - d_slope * flux_magnitude) /
-                    (1.0 - d_slope * d_threshold)
-                q_saturation_factor = flux_magnitude <= q_threshold ? 1.0 :
-                    (1.0 - q_slope * flux_magnitude) /
-                    (1.0 - q_slope * q_threshold)
-            else
-                d_saturation_factor = _synchronous_machine_saturation_factor(
-                    flux_magnitude,
+            relative_current = current_angle - angle_value
+            d_current_value =
+                scaled_current_magnitude * sin(relative_current)
+            q_current_value =
+                scaled_current_magnitude * cos(relative_current)
+            relative_voltage = voltage_angle - angle_value
+            q_voltage_value =
+                scaled_voltage_magnitude * cos(relative_voltage)
+            field_current_value = (
+                q_voltage_value + resistance * q_current_value -
+                d_synchronous * d_current_value
+            ) / d_mutual
+            flux_value = hypot(
+                d_current_value / armature_to_field_ratio +
+                field_current_value,
+                (q_current_value / armature_to_field_ratio) * q_to_d_ratio,
+            )
+            all(isfinite, (
+                angle_value,
+                d_current_value,
+                q_current_value,
+                field_current_value,
+                flux_value,
+            )) || throw(ArgumentError(
+                "synchronous-machine saturated operating point is nonfinite",
+            ))
+            return (;
+                d_saturation_factor=d_factor,
+                q_saturation_factor=q_factor,
+                effective_d_mutual=d_mutual,
+                effective_d_synchronous=d_synchronous,
+                effective_q_synchronous=q_synchronous,
+                rotor_angle=angle_value,
+                d_current=d_current_value,
+                q_current=q_current_value,
+                field_current=field_current_value,
+                flux_magnitude=flux_value,
+            )
+        end
+
+        function saturated_operating_point(flux_value::Float64)
+            isfinite(flux_value) && flux_value >= 0.0 || throw(ArgumentError(
+                "synchronous-machine saturation flux must be finite and nonnegative",
+            ))
+            return operating_point_from_saturation_factors(
+                _synchronous_machine_saturation_factor(
+                    flux_value,
                     d_threshold,
                     d_slope,
-                )
-                q_saturation_factor = _synchronous_machine_saturation_factor(
-                    flux_magnitude,
+                ),
+                _synchronous_machine_saturation_factor(
+                    flux_value,
                     q_threshold,
                     q_slope,
-                )
-            end
-            effective_d_mutual = ds * d_saturation_factor
-            effective_d_synchronous = d_main * d_saturation_factor + leakage
-            effective_q_synchronous = q_main * q_saturation_factor + leakage
-            rotor_angle = angle(
-                terminal_voltage +
-                complex(resistance, effective_q_synchronous) * positive_current,
+                ),
             )
-            relative_current_angle = current_angle - rotor_angle
-            d_current = scaled_current_magnitude * sin(relative_current_angle)
-            q_current = scaled_current_magnitude * cos(relative_current_angle)
-            relative_voltage_angle = voltage_angle - rotor_angle
-            q_voltage = scaled_voltage_magnitude * cos(relative_voltage_angle)
-            field_current = (
-                q_voltage + resistance * q_current -
-                effective_d_synchronous * d_current
-            ) / effective_d_mutual
-            iteration += 1
-            convergence_confirmed && break
-            if iteration > 1
-                angle_change = previous_rotor_angle == 0.0 ?
-                    (rotor_angle == 0.0 ? 0.0 : Inf) :
-                    abs((rotor_angle - previous_rotor_angle) / previous_rotor_angle)
-                field_change = previous_field_current == 0.0 ?
-                    (field_current == 0.0 ? 0.0 : Inf) :
-                    abs((previous_field_current - field_current) /
-                        previous_field_current)
-                convergence_confirmed =
-                    angle_change + field_change <= initialization_tolerance
-                !convergence_confirmed && iteration >= max_iterations + 2 &&
-                    throw(ArgumentError(
-                        "synchronous-machine saturation initialization did not converge",
-                    ))
-            end
-            previous_rotor_angle = rotor_angle
-            previous_field_current = field_current
         end
+
+        initial_flux_magnitude = hypot(
+            d_current / armature_to_field_ratio + field_current,
+            (q_current / armature_to_field_ratio) * q_to_d_ratio,
+        )
+        predictor = operating_point_from_saturation_factors(
+            initial_flux_magnitude <= d_threshold ? 1.0 :
+                (1.0 - d_slope * initial_flux_magnitude) /
+                (1.0 - d_slope * d_threshold),
+            initial_flux_magnitude <= q_threshold ? 1.0 :
+                (1.0 - q_slope * initial_flux_magnitude) /
+                (1.0 - q_slope * q_threshold),
+        )
+        trial_flux_magnitude = predictor.flux_magnitude
+        converged_point = nothing
+        last_residual = Inf
+        for _ in 1:max_iterations
+            point = saturated_operating_point(trial_flux_magnitude)
+            residual = point.flux_magnitude - trial_flux_magnitude
+            flux_scale = max(
+                abs(point.flux_magnitude),
+                abs(trial_flux_magnitude),
+                d_threshold,
+                q_threshold,
+                1.0,
+            )
+            last_residual = residual
+            if abs(residual) <= initialization_tolerance * flux_scale
+                converged_point = point
+                break
+            end
+
+            derivative_interval = sqrt(eps(Float64)) * flux_scale
+            perturbed_flux = trial_flux_magnitude + derivative_interval
+            perturbed_point = saturated_operating_point(perturbed_flux)
+            perturbed_residual = perturbed_point.flux_magnitude - perturbed_flux
+            residual_derivative =
+                (perturbed_residual - residual) / derivative_interval
+            newton_flux = if isfinite(residual_derivative) &&
+                             abs(residual_derivative) > sqrt(eps(Float64))
+                trial_flux_magnitude - residual / residual_derivative
+            else
+                point.flux_magnitude
+            end
+            if !isfinite(newton_flux) || newton_flux < 0.0
+                newton_flux = point.flux_magnitude
+            end
+            newton_point = saturated_operating_point(newton_flux)
+            newton_residual = newton_point.flux_magnitude - newton_flux
+            newton_flux_scale = max(
+                abs(newton_point.flux_magnitude),
+                abs(newton_flux),
+                d_threshold,
+                q_threshold,
+                1.0,
+            )
+            if abs(newton_residual) <=
+               initialization_tolerance * newton_flux_scale
+                last_residual = newton_residual
+                converged_point = newton_point
+                break
+            end
+            trial_flux_magnitude =
+                abs(newton_residual) < abs(residual) ?
+                newton_flux : point.flux_magnitude
+        end
+        converged_point === nothing && throw(ArgumentError(
+            "synchronous-machine saturation initialization did not converge; " *
+            "flux residual $(last_residual)",
+        ))
+        d_saturation_factor = converged_point.d_saturation_factor
+        q_saturation_factor = converged_point.q_saturation_factor
+        effective_d_mutual = converged_point.effective_d_mutual
+        effective_d_synchronous = converged_point.effective_d_synchronous
+        effective_q_synchronous = converged_point.effective_q_synchronous
+        rotor_angle = converged_point.rotor_angle
+        d_current = converged_point.d_current
+        q_current = converged_point.q_current
+        field_current = converged_point.field_current
     end
 
     zero_current = real(current_sequence.zero) * sqrt(3.0)

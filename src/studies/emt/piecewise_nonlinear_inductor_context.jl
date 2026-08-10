@@ -204,6 +204,7 @@ function deck_piecewise_nonlinear_inductor_current_config(
         initialize_nonlinear_state = true,
         initial_companion_current_values = zeros(Float64, count),
         nonlinear_steady_state_current_values = initial_currents,
+        nonlinear_steady_state_flux_values = initial_fluxes,
         initial_characteristic_current_values = initial_characteristic_values,
         initial_stored_voltage_values = runtime_stored_fluxes,
         initial_runtime_voltage_values = copy(runtime_stored_fluxes),

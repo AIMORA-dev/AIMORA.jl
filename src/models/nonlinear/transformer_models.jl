@@ -1388,6 +1388,13 @@ function saturated_transformer_nonlinear_current_config(
         gslope = table.gslope,
         nonlinear_current_segments = Float64.(arrays.current_seeds),
         nonlinear_steady_state_current_values = Float64.(arrays.steady_state_currents),
+        nonlinear_steady_state_flux_values = Float64.(arrays.steady_state_fluxes),
+        nonlinear_characteristic_current_values = Float64.(
+            arrays.characteristic_currents,
+        ),
+        nonlinear_characteristic_flux_values = Float64.(
+            arrays.characteristic_fluxes,
+        ),
         delta2 = table.delta2,
     )
     return saturated_transformer_sparse_config === nothing ?

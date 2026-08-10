@@ -103,6 +103,197 @@ function _hysteretic_inductor_table(
     return cchar, vchar, gslope, state_start, major_loop_start
 end
 
+function _hysteretic_inductor_major_loop_trace_index(
+    cchar::Vector{Float64},
+    major_loop_start::Int,
+    active_point_count::Int,
+    current_a::Float64,
+)
+    major_loop_stop = major_loop_start + active_point_count - 1
+    for index in major_loop_start:major_loop_stop
+        current_a <= cchar[index] && return index
+    end
+    return major_loop_stop + 1
+end
+
+function _hysteretic_inductor_major_loop_flux_bounds(
+    cchar::Vector{Float64},
+    vchar::Vector{Float64},
+    state_start::Int,
+    major_loop_start::Int,
+    current_a::Float64,
+)
+    active_point_count = round(Int, cchar[state_start])
+    upper_trace = _hysteretic_inductor_major_loop_trace_index(
+        cchar,
+        major_loop_start,
+        active_point_count,
+        current_a,
+    )
+    lower_trace = _hysteretic_inductor_major_loop_trace_index(
+        cchar,
+        major_loop_start,
+        active_point_count,
+        -current_a,
+    )
+    upper_extension = upper_trace + active_point_count + 1
+    lower_extension = lower_trace + active_point_count + 1
+    upper_flux_wb =
+        vchar[upper_extension] * current_a + cchar[upper_extension]
+    lower_flux_wb =
+        vchar[lower_extension] * current_a - cchar[lower_extension]
+    return (
+        lower_wb=min(lower_flux_wb, upper_flux_wb),
+        upper_wb=max(lower_flux_wb, upper_flux_wb),
+    )
+end
+
+function _hysteretic_inductor_steady_state_table(
+    cchar::AbstractVector{<:Real},
+    vchar::AbstractVector{<:Real},
+    gslope::AbstractVector{<:Real};
+    state_start_index::Int,
+    major_loop_start_index::Int,
+    branch_current_a::Real,
+    branch_flux_wb::Real,
+    branch_voltage_v::Real,
+    residual_flux_wb::Real,
+    half_timestep_s::Real,
+    flux_tolerance_wb::Real,
+)
+    cchar_values = Float64.(cchar)
+    vchar_values = Float64.(vchar)
+    gslope_values = Float64.(gslope)
+    state_start = state_start_index
+    major_loop_start = major_loop_start_index
+    current_a = Float64(branch_current_a)
+    harmonic_flux_wb = Float64(branch_flux_wb)
+    voltage_v = Float64(branch_voltage_v)
+    residual_flux = Float64(residual_flux_wb)
+    delta2 = Float64(half_timestep_s)
+    tolerance = Float64(flux_tolerance_wb)
+    all(isfinite, (current_a, harmonic_flux_wb, voltage_v, residual_flux, delta2, tolerance)) ||
+        throw(ArgumentError("hysteretic-inductor initialization values must be finite"))
+    delta2 > 0.0 || throw(ArgumentError(
+        "hysteretic-inductor initialization half timestep must be positive",
+    ))
+    tolerance >= 0.0 || throw(ArgumentError(
+        "hysteretic-inductor initialization flux tolerance must be nonnegative",
+    ))
+    state_start >= 1 && state_start + 5 <= length(cchar_values) ||
+        throw(ArgumentError("hysteretic-inductor state table is incomplete"))
+    active_point_count = round(Int, cchar_values[state_start])
+    active_point_count > 0 || throw(ArgumentError(
+        "hysteretic-inductor active major-loop point count must be positive",
+    ))
+    major_loop_stop = major_loop_start + active_point_count - 1
+    final_extension = major_loop_stop + active_point_count + 2
+    final_extension <= length(cchar_values) &&
+        final_extension <= length(vchar_values) &&
+        final_extension <= length(gslope_values) ||
+        throw(ArgumentError("hysteretic-inductor major-loop table is incomplete"))
+
+    flux_wb = abs(harmonic_flux_wb) <= tolerance ? residual_flux : harmonic_flux_wb
+    bounds = _hysteretic_inductor_major_loop_flux_bounds(
+        cchar_values,
+        vchar_values,
+        state_start,
+        major_loop_start,
+        current_a,
+    )
+    bounds.lower_wb - tolerance <= flux_wb <= bounds.upper_wb + tolerance ||
+        throw(ArgumentError(
+            "hysteretic-inductor harmonic flux-current point lies outside the major loop",
+        ))
+    flux_wb = clamp(flux_wb, bounds.lower_wb, bounds.upper_wb)
+
+    trace_slot = state_start + 2
+    cchar_values[state_start + 3] = current_a
+    cchar_values[state_start + 4] = -1.0
+    vchar_values[state_start + 4] = flux_wb
+    gslope_values[state_start + 4] = current_a
+    direction = voltage_v < 0.0 ? -1.0 : 1.0
+    cchar_values[state_start + 1] = direction
+    boundary_index = direction > 0.0 ? major_loop_stop : major_loop_start
+    boundary_flux_wb = vchar_values[boundary_index]
+    boundary_current_a = cchar_values[boundary_index]
+    vchar_values[state_start + 5] = boundary_flux_wb
+    gslope_values[state_start + 5] = boundary_current_a
+
+    trace_index = if abs(boundary_flux_wb - flux_wb) <= tolerance
+        vchar_values[state_start] = 0.0
+        vchar_values[state_start + 1] = 0.0
+        major_loop_stop + 1
+    else
+        candidate = _hysteretic_inductor_major_loop_trace_index(
+            cchar_values,
+            major_loop_start,
+            active_point_count,
+            direction > 0.0 ? current_a : -current_a,
+        )
+        extension = candidate + active_point_count + 1
+        major_flux_wb = if direction > 0.0
+            vchar_values[extension] * current_a + cchar_values[extension]
+        else
+            vchar_values[extension] * current_a - cchar_values[extension]
+        end
+        trajectory_offset = direction > 0.0 ?
+            flux_wb - major_flux_wb :
+            major_flux_wb - flux_wb
+        trajectory_denominator = flux_wb - boundary_flux_wb
+        abs(trajectory_denominator) > tolerance || throw(ArgumentError(
+            "hysteretic-inductor initial trajectory denominator is zero",
+        ))
+        vchar_values[state_start] =
+            trajectory_offset / trajectory_denominator
+        vchar_values[state_start + 1] =
+            trajectory_offset - vchar_values[state_start] * flux_wb
+        candidate
+    end
+    cchar_values[trace_slot] = Float64(trace_index)
+    extension_index = trace_index + active_point_count + 1
+    inverse_incremental_slope = if direction > 0.0
+        denominator = gslope_values[trace_index] *
+            (1.0 - vchar_values[state_start])
+        denominator != 0.0 || throw(ArgumentError(
+            "hysteretic-inductor upper initial slope denominator is zero",
+        ))
+        inv(denominator)
+    else
+        denominator = gslope_values[trace_index] *
+            (1.0 + vchar_values[state_start])
+        denominator != 0.0 || throw(ArgumentError(
+            "hysteretic-inductor lower initial slope denominator is zero",
+        ))
+        inv(denominator)
+    end
+    isfinite(inverse_incremental_slope) && extension_index <= length(gslope_values) ||
+        throw(ArgumentError("hysteretic-inductor initial incremental slope is invalid"))
+    companion_admittance_s = delta2 / inverse_incremental_slope
+    companion_current_a = current_a - voltage_v * companion_admittance_s
+    gslope_values[state_start] = companion_current_a
+    gslope_values[state_start + 1] = companion_admittance_s
+    vchar_values[state_start + 2] = flux_wb
+    vchar_values[state_start + 3] = current_a
+    gslope_values[state_start + 2] = direction
+    gslope_values[state_start + 3] = Float64(trace_index)
+    runtime_flux_wb = flux_wb - voltage_v * delta2
+    return (
+        cchar=cchar_values,
+        vchar=vchar_values,
+        gslope=gslope_values,
+        current_a=current_a,
+        flux_wb=flux_wb,
+        runtime_flux_wb=runtime_flux_wb,
+        companion_current_a=companion_current_a,
+        companion_admittance_s=companion_admittance_s,
+        direction=Int(direction),
+        trace_index=trace_index,
+        lower_major_loop_flux_wb=bounds.lower_wb,
+        upper_major_loop_flux_wb=bounds.upper_wb,
+    )
+end
+
 function hysteresis_runtime_table(
     characteristic::HysteresisLoopPreprocessResult;
     half_timestep_s::Real,

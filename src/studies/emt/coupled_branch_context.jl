@@ -1941,6 +1941,25 @@ function _sync_deck_time_switch_over16_state!(
     over16_state.switch_operation.closed_switch_count =
         count(identity, over16_state.switch_topology.closed_mask)
 
+    if switch_count == 0
+        if !isempty(over16_state.switch_admittance.base_admittance)
+            over16_state.switch_admittance = OVER16SwitchAdmittanceState(
+                zeros(Float64, 0, 0),
+            )
+        end
+        if !isempty(over16_state.switch_retriangularization.factor)
+            over16_state.switch_retriangularization =
+                OVER16SwitchRetriangularizationState(zeros(Float64, 0, 0))
+        end
+        isempty(over16_state.switch_sparse_factor.kk) ||
+            (over16_state.switch_sparse_factor =
+                OVER16SwitchSparseFactorWorkspaceState(Int[], Float64[], Int[]))
+        isempty(over16_state.switch_fortran_sparse_factor.kk) ||
+            (over16_state.switch_fortran_sparse_factor =
+                OVER16FortranSparseFactorWorkspaceState(Int[], Float64[], Int[]))
+        return over16_state
+    end
+
     base_admittance_size = size(over16_state.switch_admittance.base_admittance)
     active_admittance_size = size(over16_state.switch_admittance.admittance)
     if base_admittance_size != (node_count, node_count) ||
@@ -2054,6 +2073,41 @@ function _deck_configure_current_extinction_step!(
         workspace,
         element_index + 1,
     )
+end
+
+
+function _deck_configure_current_extinction_step!(
+    elements::NodalElementSequence,
+    element_names::Vector{Symbol},
+    target_name::Symbol,
+    time_s::Float64,
+    switch_index::Int,
+    requested_closed_mask::Vector{Bool},
+    workspace::DeckTimeSwitchStepWorkspace,
+    element_index::Int=1,
+)
+    for index in element_index:length(elements)
+        @inbounds element_names[index] == target_name || continue
+        element = elements[index]
+        if element isa CurrentZeroSwitch
+            prepare_current_zero_switch!(element, time_s)
+            requested_closed_mask[switch_index] = element.closed
+            workspace.open_times[switch_index] = element.open_request_time_s
+            workspace.critical_currents[switch_index] = element.critical_current_a
+            workspace.delay_times[switch_index] = element.open_delay_time_s
+        elseif element isa TimeSwitch && element.current_extinction !== nothing
+            prepare_current_zero_switch!(element, time_s)
+            requested_closed_mask[switch_index] =
+                element.current_extinction.closed
+            workspace.open_times[switch_index] = element.open_time_s
+            workspace.critical_currents[switch_index] =
+                element.current_extinction.critical_current_a
+            workspace.delay_times[switch_index] =
+                element.current_extinction.not_before_time_s
+        end
+        return nothing
+    end
+    return nothing
 end
 
 function _deck_time_switch_sparse_state_config!(

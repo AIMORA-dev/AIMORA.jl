@@ -14,11 +14,15 @@ struct NonlinearCurrentStepResult{
     N<:AbstractVector{Float64},
     S<:AbstractVector{Float64},
     H<:AbstractVector{Float64},
+    D<:AbstractVector{Float64},
+    A<:AbstractVector{Float64},
 }
     rhs::R
     nonlinear_sparse_ykm::N
     saturated_transformer_sparse_ykm::S
     hysteretic_inductor_admittance_deltas::H
+    hysteretic_inductor_source_current_deltas::D
+    anonl::A
     saturated_transformer_sparse_update_count::Int
     saturated_transformer_sparse_retriangularization_request_count::Int
     current_update_count::Int
@@ -141,6 +145,8 @@ function over16_nonlinear_current_compensation_update!(
         preview.nonlinear_sparse_ykm,
         preview.saturated_transformer_sparse_ykm,
         preview.hysteretic_inductor_admittance_deltas,
+        preview.hysteretic_inductor_source_current_deltas,
+        preview.anonl,
         preview.saturated_transformer_sparse_update_count,
         preview.saturated_transformer_sparse_retriangularization_request_count,
         state.current_update_count,

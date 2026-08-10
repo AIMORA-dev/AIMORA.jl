@@ -451,15 +451,6 @@ function _fixed_source_node_representatives(
         return nothing
     end
 
-    for boundary in _fixed_source_initial_switch_boundaries(parsed)
-        boundary.control_signal === nothing && continue
-        boundary.initially_closed || continue
-        boundary.from_node == 0 || boundary.to_node == 0 ||
-            union_nodes(boundary.from_node, boundary.to_node)
-    end
-    for node in eachindex(representatives)
-        representatives[node] = representative(node)
-    end
     _fixed_source_constant_source_domain(parsed) || return representatives
 
     for row in DeckParser.deck_over2_branch_rows(parsed)
@@ -545,12 +536,20 @@ end
 
 function _fixed_source_factor(admittance::Matrix{ComplexF64})
     isempty(admittance) && return nothing, false
-    try
-        return lu(admittance), false
-    catch error
-        error isa SingularException || rethrow()
-    end
-    return qr(admittance, ColumnNorm()), true
+    diagnostics = _solve_harmonic_linear_system(
+        admittance,
+        zeros(ComplexF64, size(admittance, 1));
+        current_absolute_a=1.0e-12,
+        current_relative=1.0e-10,
+        rank_relative_threshold_multiplier=10.0,
+        maximum_condition_estimate=Inf,
+    )
+    diagnostics.classification === :unique || throw(ArgumentError(
+        "FIX SOURCE steady-state network classification " *
+        "$(diagnostics.classification): rank " *
+        "$(diagnostics.numerical_rank)/$(size(admittance, 1))",
+    ))
+    return lu(admittance), false
 end
 
 function _fixed_source_voltage_workspace(
@@ -704,7 +703,59 @@ function _fixed_source_bounded_angle(
         angle_deg - correction : angle_deg
 end
 
-function deck_fixed_source_load_flow(parsed::DeckParser.DeckParseResult)
+function _fixed_source_power_scale(
+    parsed::DeckParser.DeckParseResult,
+    constraints,
+)
+    power_targets = Float64[]
+    for constraint in constraints
+        constraint.active_power === missing ||
+            push!(power_targets, abs(constraint.active_power))
+        constraint.reactive_power === missing ||
+            push!(power_targets, abs(constraint.reactive_power))
+    end
+    power_scale = maximum(power_targets; init=0.0)
+    return max(
+        power_scale,
+        DeckParser.deck_fixed_time_horizon_options(parsed).tolerance,
+    )
+end
+
+function _fixed_source_normalized_power_tolerance(
+    parsed::DeckParser.DeckParseResult,
+    absolute_power_tolerance_w::Real,
+    relative_power_tolerance::Real,
+)
+    absolute_tolerance = Float64(absolute_power_tolerance_w)
+    relative_tolerance = Float64(relative_power_tolerance)
+    isfinite(absolute_tolerance) && absolute_tolerance > 0.0 ||
+        throw(ArgumentError("absolute FIX SOURCE power tolerance must be finite and positive"))
+    isfinite(relative_tolerance) && relative_tolerance > 0.0 ||
+        throw(ArgumentError("relative FIX SOURCE power tolerance must be finite and positive"))
+    constraints = DeckParser.deck_fixed_source_constraint_rows(parsed)
+    power_scale = _fixed_source_power_scale(parsed, constraints)
+    normalized_allowances = Float64[]
+    for constraint in constraints
+        for target in (constraint.active_power, constraint.reactive_power)
+            target === missing && continue
+            push!(
+                normalized_allowances,
+                (absolute_tolerance + relative_tolerance * abs(Float64(target))) /
+                    power_scale,
+            )
+        end
+    end
+    isempty(normalized_allowances) && throw(ArgumentError(
+        "FIX SOURCE load flow has no active or reactive power target",
+    ))
+    return minimum(normalized_allowances)
+end
+
+function deck_fixed_source_load_flow(
+    parsed::DeckParser.DeckParseResult;
+    relative_power_tolerance::Union{Nothing,Real}=nothing,
+    maximum_iterations::Union{Nothing,Integer}=nothing,
+)
     DeckParser.assert_deck_valid!(parsed)
     constraints = DeckParser.deck_fixed_source_constraint_rows(parsed)
     isempty(constraints) && throw(ArgumentError("deck does not request FIX SOURCE load flow"))
@@ -740,13 +791,18 @@ function deck_fixed_source_load_flow(parsed::DeckParser.DeckParseResult)
         fixed_nodes,
         node_representatives,
     )
-    power_targets = Float64[]
-    for constraint in constraints
-        constraint.active_power === missing || push!(power_targets, abs(constraint.active_power))
-        constraint.reactive_power === missing || push!(power_targets, abs(constraint.reactive_power))
-    end
-    power_scale = maximum(power_targets; init = 0.0)
-    power_scale = max(power_scale, DeckParser.deck_fixed_time_horizon_options(parsed).tolerance)
+    power_scale = _fixed_source_power_scale(parsed, constraints)
+    effective_power_tolerance = relative_power_tolerance === nothing ?
+        control.relative_power_tolerance : Float64(relative_power_tolerance)
+    isfinite(effective_power_tolerance) && effective_power_tolerance > 0.0 ||
+        throw(ArgumentError(
+            "FIX SOURCE relative power tolerance must be finite and positive",
+        ))
+    effective_maximum_iterations = maximum_iterations === nothing ?
+        control.maximum_iterations : Int(maximum_iterations)
+    effective_maximum_iterations > 0 || throw(ArgumentError(
+        "FIX SOURCE maximum iterations must be positive",
+    ))
 
     node_voltage_phasors = voltage_workspace.node_voltage
     node_currents = similar(node_voltage_phasors)
@@ -759,7 +815,7 @@ function deck_fixed_source_load_flow(parsed::DeckParser.DeckParseResult)
     converged = false
     completed_iterations = 0
 
-    for iteration in 0:control.maximum_iterations
+    for iteration in 0:effective_maximum_iterations
         _fixed_source_voltage_solution!(
             voltage_workspace,
             source_phasors,
@@ -791,14 +847,14 @@ function deck_fixed_source_load_flow(parsed::DeckParser.DeckParseResult)
                 (reactive_power - Float64(constraint.reactive_power)) / power_scale
             active_mismatches[constraint_index] = active_mismatch
             reactive_mismatches[constraint_index] = reactive_mismatch
-            converged &= abs(active_mismatch) <= control.relative_power_tolerance &&
-                         abs(reactive_mismatch) <= control.relative_power_tolerance
+            converged &= abs(active_mismatch) <= effective_power_tolerance &&
+                         abs(reactive_mismatch) <= effective_power_tolerance
         end
         completed_iterations = iteration
-        (converged || iteration == control.maximum_iterations) && break
+        (converged || iteration == effective_maximum_iterations) && break
 
-        iteration_scale = ((control.maximum_iterations - iteration) /
-                           control.maximum_iterations)^2
+        iteration_scale = ((effective_maximum_iterations - iteration) /
+                           effective_maximum_iterations)^2
         for (constraint_index, constraint) in enumerate(constraints)
             angle_correction_deg = clamp(
                 active_mismatches[constraint_index] *
@@ -850,8 +906,8 @@ function deck_fixed_source_load_flow(parsed::DeckParser.DeckParseResult)
         :steady_state_source_constraint_solution,
         converged,
         completed_iterations,
-        control.maximum_iterations,
-        control.relative_power_tolerance,
+        effective_maximum_iterations,
+        effective_power_tolerance,
         _fixed_source_network_topology_kinds(parsed),
         Symbol[boundary.name for boundary in switch_boundaries],
         Symbol[boundary.from_node_name for boundary in switch_boundaries],
@@ -901,8 +957,11 @@ function _fixed_source_runtime_row(row, phasor::ComplexF64)
     )
 end
 
-function apply_deck_fixed_source_load_flow(parsed::DeckParser.DeckParseResult)
-    result = deck_fixed_source_load_flow(parsed)
+function apply_deck_fixed_source_load_flow(
+    parsed::DeckParser.DeckParseResult;
+    kwargs...,
+)
+    result = deck_fixed_source_load_flow(parsed; kwargs...)
     result.converged || throw(ArgumentError(
         "cannot apply a nonconverged FIX SOURCE solution to an EMT runtime",
     ))

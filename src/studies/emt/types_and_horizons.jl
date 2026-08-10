@@ -63,7 +63,9 @@ using ..NonlinearNetwork: NonlinearChatterDecision, NonlinearSolveDiagnostics
 using ..NonlinearNodal: NonlinearNodalSystem,
                         advance_nonlinear_step!,
                         nonlinear_linear_system
-using ..Sources: AnalyticSourceSignal
+using ..Sources: AnalyticSourceSignal,
+                 SinusoidalSourceSignal,
+                 sinusoidal_source_peak_phasor
 using ..Machines: MachineNetworkCouplingState,
                   MachineTerminalCurrentState,
                   SynchronousMachineDynamicState,
@@ -275,6 +277,28 @@ export UnifiedEMTConfig,
        SeriesRLCAlterationRecord,
        DeckEMTExecution,
        PreparedEMTStudy,
+       PreparedMachineEMTStudy,
+       AverageValueGridFollowingConverterInitialization,
+       PreparedAverageValueGridFollowingEMTStudy,
+       AbstractEMTHarmonicFormulation,
+       PhysicalFrequencyFormulation,
+       TimestepMatchedFormulation,
+       EMTInitializationTolerances,
+       OperatingPointQuantity,
+       EMTOperatingPoint,
+       EMTInitializationRequest,
+       EMTInitializationResidual,
+       OperatingPointMappingRecord,
+       EMTInitializationTopologyReport,
+       EMTInitializationFrequencyPoint,
+       NoArtificialTransientMetric,
+       EMTInitializationStateRecord,
+       EMTInitializationFailure,
+       EMTInitializationReport,
+       EMTInitializationResult,
+       DeckCaseInitialization,
+       initialize_emt_study,
+       initialization_accepted,
        EMTStudyWorkspace,
        EMTStepTransaction,
        EMTHybridEventSurface,
@@ -1121,6 +1145,503 @@ end
 struct PreparedEMTStudy{R,P}
     runtime_template::R
     parsed::P
+end
+
+"""Atomic model-owned machine state together with a one-step coupled EMT probe."""
+struct PreparedMachineEMTStudy{I,H,P}
+    machine_family::Symbol
+    initialization_state::I
+    one_step_horizon::H
+    parsed::P
+end
+
+"""Explicit ownership binding between one admitted average-value converter and its three network terminal/current-source phases."""
+struct AverageValueGridFollowingConverterInitialization{P<:InverterParams}
+    parameters::P
+    terminal_nodes::NTuple{3,Symbol}
+    current_source_names::NTuple{3,Symbol}
+
+    function AverageValueGridFollowingConverterInitialization(
+        parameters::P;
+        terminal_nodes::NTuple{3,Symbol},
+        current_source_names::NTuple{3,Symbol},
+    ) where {P<:InverterParams}
+        length(unique(terminal_nodes)) == 3 || throw(ArgumentError(
+            "average-value converter initialization requires three distinct phase terminals",
+        ))
+        length(unique(current_source_names)) == 3 || throw(ArgumentError(
+            "average-value converter initialization requires three distinct phase-current owners",
+        ))
+        return new{P}(parameters, terminal_nodes, current_source_names)
+    end
+end
+
+"""Accepted harmonic network plus the model-owned average-value converter/controller state and its one-step equilibrium probe."""
+struct PreparedAverageValueGridFollowingEMTStudy{N,E,C}
+    network::N
+    equilibrium::E
+    converter::C
+end
+
+"""Frequency-domain formulation used to construct an instantaneous-EMT state."""
+abstract type AbstractEMTHarmonicFormulation end
+
+"""Evaluate every admitted model at the requested physical frequency."""
+struct PhysicalFrequencyFormulation <: AbstractEMTHarmonicFormulation end
+
+"""Evaluate each admitted discrete recurrence at the requested physical waveform frequency and timestep."""
+struct TimestepMatchedFormulation <: AbstractEMTHarmonicFormulation
+    timestep_s::Float64
+
+    function TimestepMatchedFormulation(timestep_s::Real)
+        timestep = Float64(timestep_s)
+        isfinite(timestep) && timestep > 0.0 || throw(ArgumentError(
+            "timestep-matched initialization requires a finite positive timestep",
+        ))
+        return new(timestep)
+    end
+end
+
+"""Quantity-specific numerical limits for accepting one EMT initialization."""
+Base.@kwdef struct EMTInitializationTolerances
+    voltage_absolute_v::Float64 = 1.0e-9
+    voltage_relative::Float64 = 1.0e-10
+    current_absolute_a::Float64 = 1.0e-10
+    current_relative::Float64 = 1.0e-10
+    power_absolute_w::Float64 = 1.0e-7
+    power_relative::Float64 = 1.0e-9
+    energy_absolute_j::Float64 = 1.0e-9
+    energy_relative::Float64 = 1.0e-8
+    flux_absolute_wb::Float64 = 1.0e-12
+    operating_point_maximum_iterations::Int = 2000
+    scaled_residual_maximum::Float64 = 1.0
+    rank_relative_threshold_multiplier::Float64 = 10.0
+    maximum_condition_estimate::Float64 = 1.0e12
+    no_artificial_transient_normalized_rms::Float64 = 1.0e-8
+    first_step_scaled_discontinuity::Float64 = 1.0e-8
+end
+
+"""One versioned operating-point quantity with an explicit conversion into its target SI orientation."""
+struct OperatingPointQuantity
+    asset::Symbol
+    quantity::Symbol
+    phase::Symbol
+    value::ComplexF64
+    unit::String
+    basis::String
+    scale_to_si::Float64
+    orientation::String
+    orientation_sign::Float64
+    absolute_uncertainty::Float64
+    provenance::ParameterProvenance
+
+    function OperatingPointQuantity(
+        asset::Symbol,
+        quantity::Symbol,
+        value::Number;
+        phase::Symbol=:not_applicable,
+        unit::AbstractString,
+        basis::AbstractString="absolute_si",
+        scale_to_si::Real=1.0,
+        orientation::AbstractString,
+        orientation_sign::Real=1.0,
+        absolute_uncertainty::Real=0.0,
+        provenance::ParameterProvenance,
+    )
+        complex_value = ComplexF64(value)
+        scale = Float64(scale_to_si)
+        sign = Float64(orientation_sign)
+        uncertainty = Float64(absolute_uncertainty)
+        isempty(String(asset)) && throw(ArgumentError("operating-point asset cannot be empty"))
+        isempty(String(quantity)) && throw(ArgumentError("operating-point quantity cannot be empty"))
+        all(isfinite, (real(complex_value), imag(complex_value))) || throw(ArgumentError(
+            "operating-point quantity value must be finite",
+        ))
+        isfinite(scale) && scale > 0.0 || throw(ArgumentError(
+            "operating-point SI scale must be finite and positive",
+        ))
+        sign in (-1.0, 1.0) || throw(ArgumentError(
+            "operating-point orientation sign must be -1 or 1",
+        ))
+        isfinite(uncertainty) && uncertainty >= 0.0 || throw(ArgumentError(
+            "operating-point uncertainty must be finite and nonnegative",
+        ))
+        isempty(strip(unit)) && throw(ArgumentError("operating-point unit cannot be empty"))
+        isempty(strip(basis)) && throw(ArgumentError("operating-point basis cannot be empty"))
+        isempty(strip(orientation)) && throw(ArgumentError(
+            "operating-point orientation cannot be empty",
+        ))
+        return new(
+            asset,
+            quantity,
+            phase,
+            complex_value,
+            String(unit),
+            String(basis),
+            scale,
+            String(orientation),
+            sign,
+            uncertainty,
+            provenance,
+        )
+    end
+end
+
+"""Immutable versioned operating point that may be mapped into an EMT realization."""
+struct EMTOperatingPoint
+    schema::UInt32
+    source_representation::Symbol
+    project_signature::String
+    settings_signature::String
+    model_signature::String
+    source_state_signature::String
+    frequency_hz::Float64
+    time_origin_s::Float64
+    phase_order::NTuple{3,Symbol}
+    quantities::Vector{OperatingPointQuantity}
+
+    function EMTOperatingPoint(
+        source_representation::Symbol,
+        project_signature::AbstractString,
+        settings_signature::AbstractString,
+        model_signature::AbstractString,
+        frequency_hz::Real,
+        quantities::AbstractVector{<:OperatingPointQuantity};
+        schema::Integer=1,
+        time_origin_s::Real=0.0,
+        phase_order::NTuple{3,Symbol}=(:a, :b, :c),
+        source_state_signature::AbstractString="",
+    )
+        schema_value = UInt32(schema)
+        schema_value == UInt32(1) || throw(ArgumentError(
+            "unsupported EMT operating-point schema $schema_value",
+        ))
+        isempty(String(source_representation)) && throw(ArgumentError(
+            "operating-point source representation cannot be empty",
+        ))
+        frequency = Float64(frequency_hz)
+        time_origin = Float64(time_origin_s)
+        isfinite(frequency) && frequency >= 0.0 || throw(ArgumentError(
+            "operating-point frequency must be finite and nonnegative",
+        ))
+        isfinite(time_origin) || throw(ArgumentError(
+            "operating-point time origin must be finite",
+        ))
+        length(unique(phase_order)) == 3 || throw(ArgumentError(
+            "operating-point phase order must contain three distinct phases",
+        ))
+        signatures = String.((project_signature, settings_signature, model_signature))
+        all(value -> !isempty(strip(value)), signatures) || throw(ArgumentError(
+            "operating-point signatures cannot be empty",
+        ))
+        owned_quantities = OperatingPointQuantity[quantity for quantity in quantities]
+        isempty(owned_quantities) && throw(ArgumentError(
+            "operating point must contain at least one mapped quantity",
+        ))
+        keys = [(quantity.asset, quantity.quantity, quantity.phase) for quantity in owned_quantities]
+        length(unique(keys)) == length(keys) || throw(ArgumentError(
+            "operating-point asset/quantity/phase keys must be unique",
+        ))
+        source_state = String(source_state_signature)
+        source_representation === :accepted_emt_initialization &&
+            isempty(strip(source_state)) && throw(ArgumentError(
+            "an accepted-EMT operating point requires its source-state signature",
+        ))
+        return new(
+            schema_value,
+            source_representation,
+            signatures...,
+            source_state,
+            frequency,
+            time_origin,
+            phase_order,
+            owned_quantities,
+        )
+    end
+end
+
+"""Complete request for physical or timestep-matched EMT state construction."""
+struct EMTInitializationRequest{F<:AbstractEMTHarmonicFormulation,O}
+    formulation::F
+    frequency_hz::Float64
+    frequency_grid_hz::Vector{Float64}
+    time_origin_s::Float64
+    operating_point::O
+    project_signature::String
+    settings_signature::String
+    model_signature::String
+    tolerances::EMTInitializationTolerances
+end
+
+function EMTInitializationRequest(
+    formulation::F;
+    frequency_hz::Real,
+    frequency_grid_hz::AbstractVector{<:Real}=Float64[frequency_hz],
+    time_origin_s::Real=0.0,
+    operating_point::O=nothing,
+    project_signature::AbstractString,
+    settings_signature::AbstractString,
+    model_signature::AbstractString,
+    tolerances::EMTInitializationTolerances=EMTInitializationTolerances(),
+) where {F<:AbstractEMTHarmonicFormulation,O}
+    frequency = Float64(frequency_hz)
+    time_origin = Float64(time_origin_s)
+    isfinite(frequency) && frequency >= 0.0 || throw(ArgumentError(
+        "initialization frequency must be finite and nonnegative",
+    ))
+    isfinite(time_origin) || throw(ArgumentError(
+        "initialization time origin must be finite",
+    ))
+    frequency_grid = sort!(unique(Float64.(frequency_grid_hz)))
+    isempty(frequency_grid) && throw(ArgumentError(
+        "initialization frequency grid must contain at least one point",
+    ))
+    all(value -> isfinite(value) && value >= 0.0, frequency_grid) ||
+        throw(ArgumentError(
+            "initialization frequency grid must be finite and nonnegative",
+        ))
+    if formulation isa TimestepMatchedFormulation
+        all(value -> 2.0 * pi * value * formulation.timestep_s < pi,
+            frequency_grid) || throw(ArgumentError(
+            "timestep-matched initialization frequency grid must remain below Nyquist",
+        ))
+    end
+    signatures = String.((project_signature, settings_signature, model_signature))
+    all(value -> !isempty(strip(value)), signatures) || throw(ArgumentError(
+        "initialization signatures cannot be empty",
+    ))
+    _validate_emt_initialization_tolerances(tolerances)
+    return EMTInitializationRequest(
+        formulation,
+        frequency,
+        frequency_grid,
+        time_origin,
+        operating_point,
+        signatures...,
+        tolerances,
+    )
+end
+
+function _validate_emt_initialization_tolerances(tolerances::EMTInitializationTolerances)
+    tolerances.operating_point_maximum_iterations > 0 || throw(ArgumentError(
+        "EMT operating-point maximum iterations must be positive",
+    ))
+    values = Float64[
+        tolerances.voltage_absolute_v,
+        tolerances.voltage_relative,
+        tolerances.current_absolute_a,
+        tolerances.current_relative,
+        tolerances.power_absolute_w,
+        tolerances.power_relative,
+        tolerances.energy_absolute_j,
+        tolerances.energy_relative,
+        tolerances.flux_absolute_wb,
+        tolerances.scaled_residual_maximum,
+        tolerances.rank_relative_threshold_multiplier,
+        tolerances.maximum_condition_estimate,
+        tolerances.no_artificial_transient_normalized_rms,
+        tolerances.first_step_scaled_discontinuity,
+    ]
+    all(value -> isfinite(value) && value > 0.0, values) || throw(ArgumentError(
+        "EMT initialization tolerances must be finite and positive",
+    ))
+    return tolerances
+end
+
+"""One unscaled and scaled initialization residual owned by a physical equation or mapping."""
+struct EMTInitializationResidual
+    owner::Symbol
+    quantity::Symbol
+    unit::String
+    value::Float64
+    absolute_tolerance::Float64
+    relative_tolerance::Float64
+    reference_scale::Float64
+    uncertainty_allowance::Float64
+    scaled_value::Float64
+    passed::Bool
+end
+
+"""One explicit source-to-target operating-point quantity conversion."""
+struct OperatingPointMappingRecord
+    asset::Symbol
+    quantity::Symbol
+    phase::Symbol
+    source_value::ComplexF64
+    target_value_si::ComplexF64
+    source_unit::String
+    target_unit::String
+    basis::String
+    orientation::String
+    scale_to_si::Float64
+    orientation_sign::Float64
+    absolute_uncertainty_si::Float64
+    residual::Float64
+    constraint_current_phasor_a::ComplexF64
+    passed::Bool
+end
+
+"""Connected-component, rank, conditioning, and residual diagnostics for the harmonic network."""
+struct EMTInitializationTopologyReport
+    node_count::Int
+    reduced_node_count::Int
+    switch_node_groups::Vector{Vector{Int}}
+    connected_components::Vector{Vector{Int}}
+    referenced_components::BitVector
+    unreferenced_components::Vector{Vector{Int}}
+    numerical_rank::Int
+    condition_estimate::Float64
+    maximum_residual_a::Float64
+    relative_residual::Float64
+    classification::Symbol
+end
+
+"""One physical-frequency or timestep-matched network equilibrium with strict topology diagnostics."""
+struct EMTInitializationFrequencyPoint
+    formulation::Symbol
+    frequency_assignment::Symbol
+    physical_frequency_hz::Float64
+    reactive_angular_frequency_rad_s::Float64
+    node_physical_frequencies_hz::Vector{Float64}
+    node_frequency_source_row_indices::Vector{Int}
+    source_frequency_successor_indices::Vector{Int}
+    frequency_subnetwork_count::Int
+    node_voltage_phasors::Vector{ComplexF64}
+    source_injection_phasors::Vector{ComplexF64}
+    operating_constraint_current_phasors::Vector{ComplexF64}
+    topology::EMTInitializationTopologyReport
+    admittance_symmetry_max_abs_error::Float64
+    minimum_dissipative_eigenvalue_s::Float64
+    passed::Bool
+end
+
+"""One independently defined unwanted-transient metric over an undisturbed window."""
+struct NoArtificialTransientMetric
+    quantity::Symbol
+    unit::String
+    window_start_s::Float64
+    window_end_s::Float64
+    normalized_rms::Float64
+    maximum_scaled_discontinuity::Float64
+    low_frequency_envelope_drift::Float64
+    energy_residual_j::Float64
+    threshold::Float64
+    passed::Bool
+end
+
+"""One state family proven present and initialized in the accepted EMT candidate."""
+struct EMTInitializationStateRecord
+    owner::Symbol
+    state_family::Symbol
+    instance_count::Int
+    initialization_basis::Symbol
+
+    function EMTInitializationStateRecord(
+        owner::Symbol,
+        state_family::Symbol,
+        instance_count::Integer,
+        initialization_basis::Symbol,
+    )
+        count = Int(instance_count)
+        count > 0 || throw(ArgumentError(
+            "an EMT initialization state record must describe at least one instance",
+        ))
+        return new(owner, state_family, count, initialization_basis)
+    end
+end
+
+"""Typed initialization refusal with the exact scientific owner and context."""
+struct EMTInitializationFailure
+    code::Symbol
+    owner::Symbol
+    quantity::Symbol
+    message::String
+    context::NamedTuple
+end
+
+"""Complete accepted-or-refused initialization evidence without private factor objects."""
+struct EMTInitializationReport
+    status::Symbol
+    formulation::Symbol
+    frequency_hz::Float64
+    time_origin_s::Float64
+    topology::EMTInitializationTopologyReport
+    frequency_scan::Vector{EMTInitializationFrequencyPoint}
+    residuals::Vector{EMTInitializationResidual}
+    mappings::Vector{OperatingPointMappingRecord}
+    state_inventory::Vector{EMTInitializationStateRecord}
+    initialized_state_owners::Vector{Symbol}
+    unsupported_state_owners::Vector{Symbol}
+    transient_metrics::Vector{NoArtificialTransientMetric}
+    warnings::Vector{String}
+    project_signature::String
+    settings_signature::String
+    model_signature::String
+    deterministic_state_signature::String
+end
+
+"""Atomic initialization result; a refused result never contains a mutable prepared study."""
+struct EMTInitializationResult{P}
+    prepared::P
+    report::EMTInitializationReport
+    failure::Union{Nothing,EMTInitializationFailure}
+end
+
+"""One direct or prior-case-mapped initialization instruction for a deck sequence case."""
+struct DeckCaseInitialization{R<:EMTInitializationRequest}
+    request::R
+    mapped_from_case_index::Union{Nothing,Int}
+
+    function DeckCaseInitialization(
+        request::R;
+        mapped_from_case_index::Union{Nothing,Integer}=nothing,
+    ) where {R<:EMTInitializationRequest}
+        source_case = mapped_from_case_index === nothing ? nothing :
+            Int(mapped_from_case_index)
+        source_case === nothing || source_case > 0 || throw(ArgumentError(
+            "mapped source case index must be positive",
+        ))
+        if source_case !== nothing
+            request.operating_point isa EMTOperatingPoint || throw(ArgumentError(
+                "mapped case initialization requires a typed operating point",
+            ))
+            request.operating_point.source_representation ===
+                :accepted_emt_initialization || throw(ArgumentError(
+                "mapped case initialization must identify accepted EMT state as its source",
+            ))
+        end
+        return new{R}(request, source_case)
+    end
+end
+
+initialization_accepted(result::EMTInitializationResult) =
+    result.failure === nothing && result.report.status === :accepted
+
+_emt_harmonic_formulation_symbol(::PhysicalFrequencyFormulation) =
+    :physical_frequency
+_emt_harmonic_formulation_symbol(::TimestepMatchedFormulation) =
+    :timestep_matched
+
+function _emt_reactive_angular_frequency(
+    ::PhysicalFrequencyFormulation,
+    physical_angular_frequency::Float64,
+)
+    return physical_angular_frequency
+end
+
+function _emt_reactive_angular_frequency(
+    formulation::TimestepMatchedFormulation,
+    physical_angular_frequency::Float64,
+)
+    angle = 0.5 * physical_angular_frequency * formulation.timestep_s
+    abs(angle) < 0.5 * pi || throw(ArgumentError(
+        "timestep-matched initialization frequency must remain below Nyquist",
+    ))
+    value = (2.0 / formulation.timestep_s) * tan(angle)
+    isfinite(value) || throw(ArgumentError(
+        "timestep-matched reactive frequency is nonfinite",
+    ))
+    return value
 end
 
 struct EMTRestartMutationRecord

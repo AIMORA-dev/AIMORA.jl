@@ -346,6 +346,13 @@ function _pseudo_nonlinear_inductor_initial_state_config(
     nonlinear_types = Int.(get(nonlinear_current_config, :nonlinear_types, Int[]))
     count = length(nonlinear_types)
     count == 0 && return nonlinear_current_config
+    pseudo_indices = findall(_is_pseudo_nonlinear_inductor_type, nonlinear_types)
+    isempty(pseudo_indices) && return nonlinear_current_config
+    get(
+        nonlinear_current_config,
+        :saturated_transformer_residual_flux_initialized,
+        false,
+    ) && return nonlinear_current_config
     from_nodes = Int.(get(nonlinear_current_config, :nonlinear_from_nodes, Int[]))
     to_nodes = Int.(get(nonlinear_current_config, :nonlinear_to_nodes, Int[]))
     deck_from_nodes =
@@ -436,6 +443,650 @@ function _pseudo_nonlinear_inductor_initial_state_config(
             initial_characteristic_current_values = steady_currents,
             initial_stored_voltage_values = stored_voltages,
             initial_table_index_values = table_indices,
+        ),
+    )
+end
+
+function _piecewise_nonlinear_inductor_characteristic_state(
+    current_a::Float64,
+    flux_wb::Float64,
+    table_start::Int,
+    table_end::Int,
+    currents_a::AbstractVector{<:Real},
+    fluxes_wb::AbstractVector{<:Real};
+    flux_tolerance_wb::Float64,
+)
+    1 <= table_start < table_end <= length(currents_a) || throw(ArgumentError(
+        "piecewise nonlinear-inductor characteristic range is invalid",
+    ))
+    table_end <= length(fluxes_wb) || throw(ArgumentError(
+        "piecewise nonlinear-inductor flux characteristic is incomplete",
+    ))
+    lower_current_a = Float64(currents_a[table_start])
+    upper_current_a = Float64(currents_a[table_end])
+    current_scale = max(abs(lower_current_a), abs(upper_current_a), abs(current_a), 1.0)
+    current_tolerance_a = 64.0 * eps(current_scale)
+    lower_current_a - current_tolerance_a <= current_a <=
+        upper_current_a + current_tolerance_a || throw(ArgumentError(
+        "piecewise nonlinear-inductor harmonic current lies outside its characteristic",
+    ))
+    bounded_current_a = clamp(current_a, lower_current_a, upper_current_a)
+    segment = if bounded_current_a <= lower_current_a
+        table_start
+    elseif bounded_current_a >= upper_current_a
+        table_end - 1
+    else
+        clamp(
+            searchsortedlast(
+                @view(currents_a[table_start:table_end]),
+                bounded_current_a;
+                by=Float64,
+            ) + table_start - 1,
+            table_start,
+            table_end - 1,
+        )
+    end
+    current_delta_a = Float64(currents_a[segment + 1]) -
+        Float64(currents_a[segment])
+    flux_delta_wb = Float64(fluxes_wb[segment + 1]) -
+        Float64(fluxes_wb[segment])
+    current_delta_a > 0.0 && flux_delta_wb > 0.0 || throw(ArgumentError(
+        "piecewise nonlinear-inductor characteristic must increase strictly",
+    ))
+    fraction = (bounded_current_a - Float64(currents_a[segment])) /
+        current_delta_a
+    characteristic_flux_wb = Float64(fluxes_wb[segment]) +
+        fraction * flux_delta_wb
+    flux_scale = max(abs(characteristic_flux_wb), abs(flux_wb), 1.0)
+    allowance_wb = max(flux_tolerance_wb, 64.0 * eps(flux_scale))
+    abs(flux_wb - characteristic_flux_wb) <= allowance_wb || throw(ArgumentError(
+        "piecewise nonlinear-inductor harmonic flux-current point is not on its characteristic",
+    ))
+    return (
+        current_a=bounded_current_a,
+        flux_wb=characteristic_flux_wb,
+        segment=segment,
+        flux_residual_wb=abs(flux_wb - characteristic_flux_wb),
+        flux_allowance_wb=allowance_wb,
+    )
+end
+
+function _saturated_transformer_initial_state_config(
+    nonlinear_current_config::Union{Nothing,NamedTuple},
+    steady_state_initial_sample,
+)
+    nonlinear_current_config === nothing && return nothing
+    steady_state_initial_sample === nothing && return nonlinear_current_config
+    get(
+        nonlinear_current_config,
+        :saturated_transformer_residual_flux_initialized,
+        false,
+    ) && return nonlinear_current_config
+    haskey(nonlinear_current_config, :saturated_transformer_branch_assembly) ||
+        return nonlinear_current_config
+    nonlinear_types = Int.(nonlinear_current_config.nonlinear_types)
+    transformer_indices = findall(
+        ==(SATURATED_TRANSFORMER_NONLINEAR_TYPE),
+        nonlinear_types,
+    )
+    isempty(transformer_indices) && return nonlinear_current_config
+    count = length(nonlinear_types)
+    from_nodes = Int.(nonlinear_current_config.nonlinear_from_nodes)
+    to_nodes = Int.(nonlinear_current_config.nonlinear_to_nodes)
+    table_starts = Int.(nonlinear_current_config.nonlinear_admittance_nodes)
+    table_ends = Int.(nonlinear_current_config.nonlinear_table_end_indices)
+    declared_currents = Float64.(
+        nonlinear_current_config.nonlinear_steady_state_current_values,
+    )
+    declared_fluxes = Float64.(
+        nonlinear_current_config.nonlinear_steady_state_flux_values,
+    )
+    characteristic_currents = Float64.(
+        nonlinear_current_config.nonlinear_characteristic_current_values,
+    )
+    characteristic_fluxes = Float64.(
+        nonlinear_current_config.nonlinear_characteristic_flux_values,
+    )
+    cchar = Float64.(nonlinear_current_config.cchar)
+    gslope = Float64.(nonlinear_current_config.gslope)
+    delta2 = Float64(nonlinear_current_config.delta2)
+    length(from_nodes) == length(to_nodes) == length(table_starts) ==
+        length(table_ends) == length(declared_currents) ==
+        length(declared_fluxes) == count || throw(ArgumentError(
+        "saturated-transformer initialization arrays must match nonlinear_types",
+    ))
+    length(characteristic_currents) == length(characteristic_fluxes) ==
+        length(cchar) == length(gslope) || throw(ArgumentError(
+        "saturated-transformer characteristic arrays must have equal lengths",
+    ))
+    delta2 > 0.0 || throw(ArgumentError(
+        "saturated-transformer initialization requires a positive half timestep",
+    ))
+    companion_currents = Float64.(get(
+        nonlinear_current_config,
+        :initial_companion_current_values,
+        zeros(count),
+    ))
+    characteristic_state_currents = Float64.(get(
+        nonlinear_current_config,
+        :initial_characteristic_current_values,
+        declared_currents,
+    ))
+    stored_fluxes = Float64.(get(
+        nonlinear_current_config,
+        :initial_stored_voltage_values,
+        zeros(count),
+    ))
+    runtime_fluxes = Float64.(get(
+        nonlinear_current_config,
+        :initial_runtime_voltage_values,
+        stored_fluxes,
+    ))
+    current_segments = Float64.(get(
+        nonlinear_current_config,
+        :initial_current_segment_values,
+        ones(count),
+    ))
+    table_indices = Int.(get(
+        nonlinear_current_config,
+        :initial_table_index_values,
+        table_starts,
+    ))
+    phasors = steady_state_initial_sample.node_voltage_phasors
+    for index in transformer_indices
+        state = _piecewise_nonlinear_inductor_characteristic_state(
+            declared_currents[index],
+            declared_fluxes[index],
+            table_starts[index],
+            table_ends[index],
+            characteristic_currents,
+            characteristic_fluxes;
+            flux_tolerance_wb=
+                64.0 * eps(max(abs(declared_fluxes[index]), 1.0)),
+        )
+        branch_voltage = real(
+            _node_voltage_phasor(phasors, from_nodes[index]) -
+            _node_voltage_phasor(phasors, to_nodes[index]),
+        )
+        stored_flux = state.flux_wb - delta2 * branch_voltage
+        table_index = state.segment
+        stored_fluxes[index] = stored_flux
+        runtime_fluxes[index] = stored_flux
+        characteristic_state_currents[index] = state.current_a
+        companion_currents[index] =
+            (stored_flux - cchar[table_index]) * gslope[table_index] / delta2
+        current_segments[index] =
+            stored_flux < 0.0 ?
+            -(table_index - table_starts[index] + 1) :
+            table_index - table_starts[index] + 1
+        table_indices[index] = table_index
+    end
+    return merge(
+        nonlinear_current_config,
+        (
+            seed_initial_nonlinear_state=true,
+            initial_companion_current_values=companion_currents,
+            initial_characteristic_current_values=characteristic_state_currents,
+            initial_stored_voltage_values=stored_fluxes,
+            initial_runtime_voltage_values=runtime_fluxes,
+            initial_current_segment_values=current_segments,
+            initial_table_index_values=table_indices,
+            saturated_transformer_residual_flux_initialized=true,
+        ),
+    )
+end
+
+function _piecewise_nonlinear_inductor_initial_state_config(
+    nonlinear_current_config::Union{Nothing,NamedTuple},
+    steady_state_initial_sample,
+)
+    nonlinear_current_config === nothing && return nothing
+    steady_state_initial_sample === nothing && return nonlinear_current_config
+    nonlinear_types = Int.(get(nonlinear_current_config, :nonlinear_types, Int[]))
+    indices = findall(==(PIECEWISE_NONLINEAR_INDUCTOR_TYPE), nonlinear_types)
+    isempty(indices) && return nonlinear_current_config
+    count = length(nonlinear_types)
+    deck_from_nodes = Int.(get(
+        nonlinear_current_config,
+        :nonlinear_deck_from_nodes,
+        Int[],
+    ))
+    deck_to_nodes = Int.(get(
+        nonlinear_current_config,
+        :nonlinear_deck_to_nodes,
+        Int[],
+    ))
+    table_starts = Int.(get(
+        nonlinear_current_config,
+        :nonlinear_admittance_nodes,
+        Int[],
+    ))
+    table_ends = Int.(get(
+        nonlinear_current_config,
+        :nonlinear_table_end_indices,
+        Int[],
+    ))
+    declared_currents = Float64.(get(
+        nonlinear_current_config,
+        :nonlinear_steady_state_current_values,
+        zeros(Float64, count),
+    ))
+    declared_fluxes = Float64.(get(
+        nonlinear_current_config,
+        :nonlinear_steady_state_flux_values,
+        zeros(Float64, count),
+    ))
+    owner_names = Symbol.(get(
+        nonlinear_current_config,
+        :nonlinear_owner_names,
+        fill(Symbol(""), count),
+    ))
+    owner_line_numbers = Int.(get(
+        nonlinear_current_config,
+        :nonlinear_owner_line_numbers,
+        zeros(Int, count),
+    ))
+    all(length(values) == count for values in (
+        deck_from_nodes,
+        deck_to_nodes,
+        table_starts,
+        table_ends,
+        declared_currents,
+        declared_fluxes,
+        owner_names,
+        owner_line_numbers,
+    )) || throw(ArgumentError(
+        "piecewise nonlinear-inductor initialization arrays must match nonlinear_types",
+    ))
+    currents_a = Float64.(nonlinear_current_config.cchar)
+    fluxes_wb = Float64.(nonlinear_current_config.vchar)
+    delta2 = Float64(nonlinear_current_config.delta2)
+    isfinite(delta2) && delta2 > 0.0 || throw(ArgumentError(
+        "piecewise nonlinear-inductor initialization half timestep must be finite and positive",
+    ))
+    flux_tolerance_wb = Float64(get(nonlinear_current_config, :flzero, 0.0))
+    phasors = ComplexF64.(steady_state_initial_sample.node_voltage_phasors)
+    initial_companion_currents = Float64.(get(
+        nonlinear_current_config,
+        :initial_companion_current_values,
+        zeros(Float64, count),
+    ))
+    initial_characteristic_values = Float64.(get(
+        nonlinear_current_config,
+        :initial_characteristic_current_values,
+        zeros(Float64, count),
+    ))
+    initial_stored_fluxes = Float64.(get(
+        nonlinear_current_config,
+        :initial_stored_voltage_values,
+        zeros(Float64, count),
+    ))
+    initial_runtime_fluxes = Float64.(get(
+        nonlinear_current_config,
+        :initial_runtime_voltage_values,
+        initial_stored_fluxes,
+    ))
+    initial_currents = Float64.(get(
+        nonlinear_current_config,
+        :initial_current_segment_values,
+        zeros(Float64, count),
+    ))
+    initial_segments = Int.(get(
+        nonlinear_current_config,
+        :initial_table_index_values,
+        table_starts,
+    ))
+    all(length(values) == count for values in (
+        initial_companion_currents,
+        initial_characteristic_values,
+        initial_stored_fluxes,
+        initial_runtime_fluxes,
+        initial_currents,
+        initial_segments,
+    )) || throw(ArgumentError(
+        "piecewise nonlinear-inductor runtime seeds must match nonlinear_types",
+    ))
+    initialized_fluxes = fill(NaN, count)
+    initialized_predictor_fluxes = fill(NaN, count)
+    initialized_currents = fill(NaN, count)
+    initialized_segments = zeros(Int, count)
+    characteristic_flux_residuals = fill(NaN, count)
+    for index in indices
+        from_node = deck_from_nodes[index]
+        to_node = deck_to_nodes[index]
+        branch_phasor =
+            _node_voltage_phasor(phasors, from_node) -
+            _node_voltage_phasor(phasors, to_node)
+        frequency_hz = _nonlinear_initial_frequency_hz(
+            steady_state_initial_sample,
+            from_node,
+            to_node,
+        )
+        physical_angular_frequency = 2.0 * pi * frequency_hz
+        physical_angular_frequency > 0.0 || throw(_EMTInitializationRefusal(
+            :unsupported_dc_state,
+            :piecewise_nonlinear_inductor_state,
+            :flux,
+            "piecewise nonlinear-inductor initialization requires a positive harmonic frequency",
+            (owner=owner_names[index], line_no=owner_line_numbers[index]),
+        ))
+        reactive_angular_frequency = if get(
+            steady_state_initial_sample,
+            :exact_discrete_histories,
+            false,
+        )
+            _steady_state_reactive_angular_frequency(
+                steady_state_initial_sample,
+                frequency_hz,
+            )
+        else
+            physical_angular_frequency
+        end
+        declared_current_a = declared_currents[index]
+        declared_flux_wb = declared_fluxes[index]
+        harmonic_current_phasor = if declared_current_a == 0.0 && declared_flux_wb == 0.0
+            0.0 + 0.0im
+        else
+            declared_current_a != 0.0 && declared_flux_wb != 0.0 &&
+                declared_flux_wb / declared_current_a > 0.0 ||
+                throw(_EMTInitializationRefusal(
+                    :invalid_declared_state,
+                    :piecewise_nonlinear_inductor_state,
+                    :steady_state_flux_current,
+                    "a nonzero piecewise nonlinear-inductor steady state requires current and flux with a positive secant inductance",
+                    (
+                        owner=owner_names[index],
+                        line_no=owner_line_numbers[index],
+                        steady_state_current_a=declared_current_a,
+                        steady_state_flux_wb=declared_flux_wb,
+                    ),
+                ))
+            secant_inductance_h = declared_flux_wb / declared_current_a
+            branch_phasor /
+                complex(0.0, reactive_angular_frequency * secant_inductance_h)
+        end
+        current_a = real(harmonic_current_phasor)
+        flux_wb = imag(branch_phasor) / reactive_angular_frequency
+        state = try
+            _piecewise_nonlinear_inductor_characteristic_state(
+                current_a,
+                flux_wb,
+                table_starts[index],
+                table_ends[index],
+                currents_a,
+                fluxes_wb;
+                flux_tolerance_wb,
+            )
+        catch error
+            error isa _EMTInitializationRefusal && rethrow()
+            throw(_EMTInitializationRefusal(
+                :infeasible_model_state,
+                :piecewise_nonlinear_inductor_state,
+                :flux_current_point,
+                sprint(showerror, error),
+                (
+                    owner=owner_names[index],
+                    line_no=owner_line_numbers[index],
+                    branch_current_a=current_a,
+                    harmonic_flux_wb=flux_wb,
+                ),
+            ))
+        end
+        branch_voltage_v = real(branch_phasor)
+        predictor_flux_wb = state.flux_wb + delta2 * branch_voltage_v
+        initial_characteristic_values[index] = state.flux_wb
+        initial_stored_fluxes[index] = state.flux_wb
+        initial_runtime_fluxes[index] = predictor_flux_wb
+        initial_currents[index] = state.current_a
+        initial_segments[index] = state.segment
+        initialized_fluxes[index] = state.flux_wb
+        initialized_predictor_fluxes[index] = predictor_flux_wb
+        initialized_currents[index] = state.current_a
+        initialized_segments[index] = state.segment
+        characteristic_flux_residuals[index] = state.flux_residual_wb
+    end
+    return merge(
+        nonlinear_current_config,
+        (
+            seed_initial_nonlinear_state=true,
+            initial_companion_current_values=initial_companion_currents,
+            initial_characteristic_current_values=initial_characteristic_values,
+            initial_stored_voltage_values=initial_stored_fluxes,
+            initial_runtime_voltage_values=initial_runtime_fluxes,
+            initial_current_segment_values=initial_currents,
+            initial_table_index_values=initial_segments,
+            piecewise_nonlinear_inductor_initial_flux_values=initialized_fluxes,
+            piecewise_nonlinear_inductor_initial_predictor_flux_values=
+                initialized_predictor_fluxes,
+            piecewise_nonlinear_inductor_initial_current_values=initialized_currents,
+            piecewise_nonlinear_inductor_initial_segment_values=initialized_segments,
+            piecewise_nonlinear_inductor_characteristic_flux_residual_values=
+                characteristic_flux_residuals,
+        ),
+    )
+end
+
+function _hysteretic_inductor_initial_state_config(
+    nonlinear_current_config::Union{Nothing,NamedTuple},
+    steady_state_initial_sample,
+)
+    nonlinear_current_config === nothing && return nothing
+    steady_state_initial_sample === nothing && return nonlinear_current_config
+    nonlinear_types = Int.(get(nonlinear_current_config, :nonlinear_types, Int[]))
+    hysteretic_indices = findall(==(HYSTERETIC_INDUCTOR_NONLINEAR_TYPE), nonlinear_types)
+    isempty(hysteretic_indices) && return nonlinear_current_config
+    count = length(nonlinear_types)
+    deck_from_nodes = Int.(get(
+        nonlinear_current_config,
+        :nonlinear_deck_from_nodes,
+        Int[],
+    ))
+    deck_to_nodes = Int.(get(
+        nonlinear_current_config,
+        :nonlinear_deck_to_nodes,
+        Int[],
+    ))
+    state_start_indices = Int.(get(
+        nonlinear_current_config,
+        :nonlinear_admittance_nodes,
+        Int[],
+    ))
+    major_loop_start_indices = Int.(get(
+        nonlinear_current_config,
+        :initial_table_index_values,
+        Int[],
+    ))
+    initial_companion_currents = Float64.(get(
+        nonlinear_current_config,
+        :initial_companion_current_values,
+        zeros(Float64, count),
+    ))
+    initial_characteristic_values = Float64.(get(
+        nonlinear_current_config,
+        :initial_characteristic_current_values,
+        zeros(Float64, count),
+    ))
+    initial_fluxes = Float64.(get(
+        nonlinear_current_config,
+        :initial_stored_voltage_values,
+        zeros(Float64, count),
+    ))
+    runtime_fluxes = Float64.(get(
+        nonlinear_current_config,
+        :initial_runtime_voltage_values,
+        initial_fluxes,
+    ))
+    initial_currents = Float64.(get(
+        nonlinear_current_config,
+        :initial_current_segment_values,
+        zeros(Float64, count),
+    ))
+    residual_fluxes = Float64.(get(
+        nonlinear_current_config,
+        :fortran_gap_status_values,
+        zeros(Float64, count),
+    ))
+    owner_names = Symbol.(get(
+        nonlinear_current_config,
+        :nonlinear_owner_names,
+        fill(Symbol(""), count),
+    ))
+    owner_line_numbers = Int.(get(
+        nonlinear_current_config,
+        :nonlinear_owner_line_numbers,
+        zeros(Int, count),
+    ))
+    all(length(values) == count for values in (
+        deck_from_nodes,
+        deck_to_nodes,
+        state_start_indices,
+        major_loop_start_indices,
+        initial_companion_currents,
+        initial_characteristic_values,
+        initial_fluxes,
+        runtime_fluxes,
+        initial_currents,
+        residual_fluxes,
+        owner_names,
+        owner_line_numbers,
+    )) || throw(ArgumentError(
+        "hysteretic-inductor initialization arrays must match nonlinear_types",
+    ))
+    cchar = Float64.(nonlinear_current_config.cchar)
+    vchar = Float64.(nonlinear_current_config.vchar)
+    gslope = Float64.(nonlinear_current_config.gslope)
+    phasors = ComplexF64.(steady_state_initial_sample.node_voltage_phasors)
+    delta2 = Float64(nonlinear_current_config.delta2)
+    flux_tolerance = Float64(get(nonlinear_current_config, :flzero, 0.0))
+    initialized_fluxes = fill(NaN, count)
+    initialized_currents = fill(NaN, count)
+    initialized_directions = zeros(Int, count)
+    initialized_trace_indices = zeros(Int, count)
+    lower_flux_bounds = fill(NaN, count)
+    upper_flux_bounds = fill(NaN, count)
+    for index in hysteretic_indices
+        from_node = deck_from_nodes[index]
+        to_node = deck_to_nodes[index]
+        branch_phasor =
+            _node_voltage_phasor(phasors, from_node) -
+            _node_voltage_phasor(phasors, to_node)
+        physical_frequency_hz = _nonlinear_initial_frequency_hz(
+            steady_state_initial_sample,
+            from_node,
+            to_node,
+        )
+        physical_angular_frequency = 2.0 * pi * physical_frequency_hz
+        physical_angular_frequency > 0.0 || throw(_EMTInitializationRefusal(
+            :unsupported_dc_state,
+            :hysteretic_magnetic_state,
+            :flux,
+            "hysteretic-inductor initialization requires a positive harmonic frequency",
+            (owner=owner_names[index], line_no=owner_line_numbers[index]),
+        ))
+        declared_current_a = initial_companion_currents[index]
+        declared_flux_wb = initial_fluxes[index]
+        reactive_angular_frequency = if get(
+            steady_state_initial_sample,
+            :exact_discrete_histories,
+            false,
+        )
+            timestep_s = Float64(steady_state_initial_sample.timestep_s)
+            angle = 0.5 * physical_angular_frequency * timestep_s
+            abs(angle) < 0.5 * pi || throw(_EMTInitializationRefusal(
+                :frequency_above_nyquist,
+                :hysteretic_magnetic_state,
+                :frequency_hz,
+                "hysteretic-inductor initialization frequency must remain below Nyquist",
+                (owner=owner_names[index], line_no=owner_line_numbers[index]),
+            ))
+            (2.0 / timestep_s) * tan(angle)
+        else
+            physical_angular_frequency
+        end
+        branch_current_phasor = if declared_current_a == 0.0
+            0.0 + 0.0im
+        else
+            declared_current_a > 0.0 && declared_flux_wb > 0.0 ||
+                throw(_EMTInitializationRefusal(
+                    :invalid_declared_state,
+                    :hysteretic_magnetic_state,
+                    :steady_state_flux_current,
+                    "a nonzero hysteretic-inductor current requires positive declared current and flux magnitudes",
+                    (
+                        owner=owner_names[index],
+                        line_no=owner_line_numbers[index],
+                        steady_state_current_a=declared_current_a,
+                        steady_state_flux_wb=declared_flux_wb,
+                    ),
+                ))
+            incremental_inductance_h = declared_flux_wb / declared_current_a
+            branch_phasor /
+                complex(0.0, reactive_angular_frequency * incremental_inductance_h)
+        end
+        harmonic_flux_wb = imag(branch_phasor) / physical_angular_frequency
+        state = try
+            _hysteretic_inductor_steady_state_table(
+                cchar,
+                vchar,
+                gslope;
+                state_start_index=state_start_indices[index],
+                major_loop_start_index=major_loop_start_indices[index],
+                branch_current_a=real(branch_current_phasor),
+                branch_flux_wb=harmonic_flux_wb,
+                branch_voltage_v=real(branch_phasor),
+                residual_flux_wb=residual_fluxes[index],
+                half_timestep_s=delta2,
+                flux_tolerance_wb=flux_tolerance,
+            )
+        catch error
+            error isa _EMTInitializationRefusal && rethrow()
+            throw(_EMTInitializationRefusal(
+                :infeasible_model_state,
+                :hysteretic_magnetic_state,
+                :flux_current_point,
+                sprint(showerror, error),
+                (
+                    owner=owner_names[index],
+                    line_no=owner_line_numbers[index],
+                    branch_current_a=real(branch_current_phasor),
+                    harmonic_flux_wb=harmonic_flux_wb,
+                    residual_flux_wb=residual_fluxes[index],
+                ),
+            ))
+        end
+        cchar = state.cchar
+        vchar = state.vchar
+        gslope = state.gslope
+        initial_companion_currents[index] = state.companion_current_a
+        initial_characteristic_values[index] = state.flux_wb
+        initial_fluxes[index] = state.flux_wb
+        runtime_fluxes[index] = state.runtime_flux_wb
+        initial_currents[index] = state.current_a
+        initialized_fluxes[index] = state.flux_wb
+        initialized_currents[index] = state.current_a
+        initialized_directions[index] = state.direction
+        initialized_trace_indices[index] = state.trace_index
+        lower_flux_bounds[index] = state.lower_major_loop_flux_wb
+        upper_flux_bounds[index] = state.upper_major_loop_flux_wb
+    end
+    return merge(
+        nonlinear_current_config,
+        (
+            seed_initial_nonlinear_state=true,
+            cchar=cchar,
+            vchar=vchar,
+            gslope=gslope,
+            initial_companion_current_values=initial_companion_currents,
+            initial_characteristic_current_values=initial_characteristic_values,
+            initial_stored_voltage_values=initial_fluxes,
+            initial_runtime_voltage_values=runtime_fluxes,
+            initial_current_segment_values=initial_currents,
+            hysteretic_initial_flux_values=initialized_fluxes,
+            hysteretic_initial_current_values=initialized_currents,
+            hysteretic_initial_direction_values=initialized_directions,
+            hysteretic_initial_trace_indices=initialized_trace_indices,
+            hysteretic_major_loop_lower_flux_values=lower_flux_bounds,
+            hysteretic_major_loop_upper_flux_values=upper_flux_bounds,
         ),
     )
 end
@@ -2114,6 +2765,24 @@ function _steady_state_branch_frequency_hz(
         default_frequency_hz : selected_frequency_hz
 end
 
+function _steady_state_reactive_angular_frequency(sample, frequency_hz::Float64)
+    physical_angular_frequency = 2.0 * pi * frequency_hz
+    formulation = hasproperty(sample, :harmonic_formulation) ?
+        getproperty(sample, :harmonic_formulation) : :physical_frequency
+    if formulation === :physical_frequency
+        return physical_angular_frequency
+    elseif formulation === :timestep_matched
+        hasproperty(sample, :timestep_s) || throw(ArgumentError(
+            "timestep-matched steady-state sample must declare timestep_s",
+        ))
+        return _emt_reactive_angular_frequency(
+            TimestepMatchedFormulation(Float64(sample.timestep_s)),
+            physical_angular_frequency,
+        )
+    end
+    throw(ArgumentError("unsupported steady-state harmonic formulation $formulation"))
+end
+
 function _seed_steady_state_series_rl_branch!(
     branch::SeriesRLBranch,
     sample,
@@ -2131,10 +2800,12 @@ function _seed_steady_state_series_rl_branch!(
             imag(branch_voltage_phasor),
         ),
     ) || throw(ArgumentError("series R-L steady-state voltage must be finite"))
+    reactive_angular_frequency =
+        _steady_state_reactive_angular_frequency(sample, frequency_hz)
     impedance =
         branch.l <= 0.0 ?
         complex(branch.r, 0.0) :
-        complex(branch.r, 2.0 * pi * frequency_hz * branch.l)
+        complex(branch.r, reactive_angular_frequency * branch.l)
     current_phasor =
         abs(impedance) == 0.0 ? complex(0.0, 0.0) : branch_voltage_phasor / impedance
     all(
@@ -2158,7 +2829,7 @@ function _seed_steady_state_series_rlc_branch!(
     branch_voltage_phasor =
         _steady_state_node_voltage_phasor(sample, branch.a) -
         _steady_state_node_voltage_phasor(sample, branch.b)
-    omega = 2.0 * pi * frequency_hz
+    omega = _steady_state_reactive_angular_frequency(sample, frequency_hz)
     if omega <= 0.0
         branch.v_prev = real(branch_voltage_phasor)
         branch.i_prev = 0.0
@@ -2188,17 +2859,27 @@ function _seed_steady_state_capacitor_branch!(
     branch_voltage_phasor =
         _steady_state_node_voltage_phasor(sample, branch.a) -
         _steady_state_node_voltage_phasor(sample, branch.b)
-    current_phasor = im * (2.0 * pi * frequency_hz) * branch.c * branch_voltage_phasor
+    reactive_angular_frequency =
+        _steady_state_reactive_angular_frequency(sample, frequency_hz)
+    current_phasor = im * reactive_angular_frequency * branch.c * branch_voltage_phasor
     branch.v_prev = real(branch_voltage_phasor)
     branch.i_prev = real(current_phasor)
     branch.i_last = branch.i_prev
     return branch
 end
 
-function _coupled_inductive_steady_state_admittance(branch::CoupledInductiveBranch)
-    admittance = im .* branch.susceptance
+function _coupled_inductive_steady_state_admittance(
+    branch::CoupledInductiveBranch,
+    angular_frequency::Float64=branch.angular_frequency,
+)
+    isfinite(angular_frequency) && angular_frequency > 0.0 || throw(ArgumentError(
+        "coupled-inductive steady-state angular frequency must be finite and positive",
+    ))
+    frequency_scale = branch.angular_frequency / angular_frequency
+    scaled_susceptance = frequency_scale .* branch.susceptance
+    admittance = im .* scaled_susceptance
     if branch.series_resistance > 0.0
-        reference_susceptance = branch.susceptance[
+        reference_susceptance = scaled_susceptance[
             branch.resistance_reference_port,
             branch.resistance_reference_port,
         ]
@@ -2218,7 +2899,13 @@ function _seed_steady_state_coupled_inductive_branch!(
         _steady_state_node_voltage_phasor(sample, branch.b[index])
         for index in eachindex(branch.a)
     ]
-    current_phasors = _coupled_inductive_steady_state_admittance(branch) *
+    frequency_hz = Float64(sample.steady_state_frequency_hz)
+    reactive_angular_frequency =
+        _steady_state_reactive_angular_frequency(sample, frequency_hz)
+    current_phasors = _coupled_inductive_steady_state_admittance(
+        branch,
+        reactive_angular_frequency,
+    ) *
                       port_voltage_phasors
     branch.previous_voltage .= real.(port_voltage_phasors)
     branch.previous_current .= real.(current_phasors)
@@ -2236,8 +2923,12 @@ function _seed_steady_state_coupled_series_rl_branch!(
         _steady_state_node_voltage_phasor(sample, branch.b[index])
         for index in eachindex(branch.a)
     ]
-    impedance =
-        complex.(branch.resistance_matrix, 2.0 * pi * frequency_hz .* branch.inductance_matrix)
+    reactive_angular_frequency =
+        _steady_state_reactive_angular_frequency(sample, frequency_hz)
+    impedance = complex.(
+        branch.resistance_matrix,
+        reactive_angular_frequency .* branch.inductance_matrix,
+    )
     current_phasors = impedance \ port_voltage_phasors
     branch.previous_voltage .= real.(port_voltage_phasors)
     branch.previous_current .= real.(current_phasors)
@@ -2289,7 +2980,8 @@ function _seed_lumped_sequence_frequency_histories!(
     dt_s::Float64,
     frequency_hz::Float64,
 )
-    angular_frequency = 2.0 * pi * frequency_hz
+    angular_frequency =
+        _steady_state_reactive_angular_frequency(sample, frequency_hz)
     branch_voltage_phasors = ComplexF64[
         _steady_state_node_voltage_phasor(sample, element.a[phase]) -
         _steady_state_node_voltage_phasor(sample, element.b[phase])

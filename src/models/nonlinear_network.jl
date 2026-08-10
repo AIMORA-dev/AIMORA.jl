@@ -1,5 +1,11 @@
 module NonlinearNetwork
 
+using ..StudyCore: ParameterNature,
+                   PhysicalModelParameter,
+                   ScalingBasisParameter,
+                   NumericalPolicyParameter,
+                   ParameterProvenance
+
 export AbstractNonlinearCurrentDevice,
        NonlinearDeviceFormulation,
        NonlinearParameterNature,
@@ -39,43 +45,8 @@ Implementations must evaluate trial states without mutating accepted device stat
 """
 abstract type AbstractNonlinearCurrentDevice end
 
-"""Scientific role of one nonlinear-network parameter provenance record."""
-@enum NonlinearParameterNature begin
-    PhysicalModelParameter
-    ScalingBasisParameter
-    NumericalPolicyParameter
-end
-
-"""Source, units, transformation, uncertainty, and validity attached to physical or numerical nonlinear-network parameters."""
-struct NonlinearParameterProvenance
-    source::String
-    units::String
-    transformation::String
-    uncertainty::String
-    validity_domain::String
-    nature::NonlinearParameterNature
-
-    function NonlinearParameterProvenance(
-        source::AbstractString,
-        units::AbstractString,
-        transformation::AbstractString,
-        uncertainty::AbstractString,
-        validity_domain::AbstractString,
-        nature::NonlinearParameterNature,
-    )
-        values = String.((
-            source,
-            units,
-            transformation,
-            uncertainty,
-            validity_domain,
-        ))
-        all(value -> !isempty(strip(value)), values) || throw(ArgumentError(
-            "nonlinear parameter provenance fields must not be empty",
-        ))
-        return new(values..., nature)
-    end
-end
+const NonlinearParameterNature = ParameterNature
+const NonlinearParameterProvenance = ParameterProvenance
 
 function _caller_physical_parameter_provenance(
     units::AbstractString,

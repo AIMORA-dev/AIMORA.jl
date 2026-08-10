@@ -5,9 +5,11 @@ using ..Branches: CurrentInjection, TheveninSource
 export constant_current_injection,
        constant_thevenin_source,
        AnalyticSourceSignal,
+       SinusoidalSourceSignal,
        analytic_current_injection_source,
        analytic_source_value,
        analytic_thevenin_source,
+       sinusoidal_source_peak_phasor,
        sinusoidal_thevenin_source,
        sinusoidal_value
 
@@ -43,6 +45,67 @@ mutable struct AnalyticSourceSignal
     end
 end
 
+"""Typed sinusoidal waveform whose peak phasor and time-domain value share one convention."""
+mutable struct SinusoidalSourceSignal
+    amplitude::Float64
+    frequency::Float64
+    phase::Float64
+    offset::Float64
+
+    function SinusoidalSourceSignal(
+        amplitude::Real,
+        frequency::Real,
+        phase::Real,
+        offset::Real,
+    )
+        values = Float64.((amplitude, frequency, phase, offset))
+        all(isfinite, values) || throw(ArgumentError(
+            "sinusoidal source parameters must be finite",
+        ))
+        values[2] >= 0.0 || throw(ArgumentError(
+            "sinusoidal source frequency must be nonnegative",
+        ))
+        return new(values...)
+    end
+end
+
+(signal::SinusoidalSourceSignal)(time_s::Real) = sinusoidal_value(
+    time_s,
+    signal.amplitude,
+    signal.frequency;
+    phase_rad=signal.phase,
+    offset_pu=signal.offset,
+)
+
+"""Return the real-cosine peak phasor represented by a typed sinusoidal source at one harmonic frequency."""
+function sinusoidal_source_peak_phasor(
+    signal::SinusoidalSourceSignal,
+    physical_frequency_hz::Real,
+)
+    frequency = Float64(physical_frequency_hz)
+    isfinite(frequency) && frequency >= 0.0 || throw(ArgumentError(
+        "harmonic source frequency must be finite and nonnegative",
+    ))
+    if signal.frequency == 0.0
+        frequency == 0.0 || return 0.0 + 0.0im
+        return complex(
+            signal.offset + signal.amplitude * sin(signal.phase),
+            0.0,
+        )
+    end
+    isapprox(
+        frequency,
+        signal.frequency;
+        atol=1.0e-12,
+        rtol=1.0e-12,
+    ) || return 0.0 + 0.0im
+    abs(signal.offset) <= 64.0 * eps(Float64) *
+        max(abs(signal.amplitude), 1.0) || throw(ArgumentError(
+        "a nonzero-offset sinusoidal source requires separate DC and AC harmonic owners",
+    ))
+    return signal.amplitude * cis(signal.phase - 0.5 * pi)
+end
+
 function (signal::AnalyticSourceSignal)(time_s::Real)
     return analytic_source_value(
         signal.source_type,
@@ -75,14 +138,15 @@ end
 function sinusoidal_thevenin_source(node::Int, conductance::Real, amplitude_pu::Real,
                                     frequency_hz::Real; phase_rad::Real=0.0,
                                     offset_pu::Real=0.0)
-    amplitude = Float64(amplitude_pu)
-    frequency = Float64(frequency_hz)
-    phase = Float64(phase_rad)
-    offset = Float64(offset_pu)
     return TheveninSource(
         node,
         Float64(conductance),
-        t -> sinusoidal_value(t, amplitude, frequency; phase_rad=phase, offset_pu=offset),
+        SinusoidalSourceSignal(
+            amplitude_pu,
+            frequency_hz,
+            phase_rad,
+            offset_pu,
+        ),
     )
 end
 

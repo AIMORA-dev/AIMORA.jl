@@ -652,6 +652,10 @@ function _initialize_control_system_network_steady_state!(
         end
     end
     _apply_control_system_frequency_initializations!(runtime)
+    _set_controlled_switch_inputs!(runtime)
+    for switch in runtime.switch_elements
+        sync_controlled_switch!(switch, 0.0)
+    end
     return runtime
 end
 
@@ -2521,6 +2525,7 @@ function prepare_emt_study(
     dt_s::Float64 = 20e-6,
     t_end_s::Float64 = 0.0,
     initial_voltage_source::Symbol = :none,
+    initial_voltage_sample = nothing,
     saturated_transformer_branch_runtime_enabled::Bool = false,
     coupled_lumped_sequence_history_enabled::Bool = false,
     distributed_transposed_line_runtime_enabled::Bool = true,
@@ -2541,6 +2546,10 @@ function prepare_emt_study(
     initial_voltage_source in (:none, :steady_state) ||
         throw(ArgumentError(
             "prepared dynamic EMT execution supports :none or :steady_state initialization",
+        ))
+    initial_voltage_sample === nothing || initial_voltage_source == :none ||
+        throw(ArgumentError(
+            "an explicit initial voltage sample cannot be combined with initial_voltage_source",
         ))
     timing =
         time_horizon == :deck ?
@@ -2583,7 +2592,8 @@ function prepare_emt_study(
                 element isa PowerSemiconductorBridgeLeg,
             parsed.elements,
         ) ||
-        !isempty(series_rlc_alterations)
+        !isempty(series_rlc_alterations) ||
+        initial_voltage_sample !== nothing
     dynamic_network_runtime || throw(ArgumentError(
         "prepared EMT execution currently requires the production dynamic network runtime",
     ))
@@ -2606,6 +2616,7 @@ function prepare_emt_study(
         t_end_s = runtime_t_end_s,
         steady_state_initial_sample_enabled =
             initial_voltage_source == :steady_state,
+        supplied_initial_sample = initial_voltage_sample,
         saturated_transformer_intake = saturated_transformer_intake,
         saturated_transformer_nonlinear_current_enabled =
             saturated_transformer_intake !== nothing,
@@ -2639,6 +2650,60 @@ end
         comparisons;
         init = :(false),
     )
+end
+
+function _tuple_element_alias(
+    elements::NodalElementSequence,
+    element_index::Int,
+    expected,
+)
+    1 <= element_index <= length(elements) || return false
+    return _nodal_element_index_alias(
+        elements.contiguous_type_batches,
+        element_index,
+        0,
+        expected,
+    )
+end
+
+_nodal_element_index_alias(::Tuple{}, ::Int, ::Int, _expected) = false
+
+function _nodal_element_index_alias(
+    batches::Tuple,
+    element_index::Int,
+    preceding_count::Int,
+    expected,
+)
+    batch = first(batches)
+    final_index = preceding_count + length(batch)
+    if element_index <= final_index
+        return @inbounds batch[element_index - preceding_count] === expected
+    end
+    return _nodal_element_index_alias(
+        Base.tail(batches),
+        element_index,
+        final_index,
+        expected,
+    )
+end
+
+_nodal_element_identity_alias(::Tuple{}, _expected) = false
+
+function _nodal_element_identity_alias(batches::Tuple, expected)
+    for element in first(batches)
+        element === expected && return true
+    end
+    return _nodal_element_identity_alias(Base.tail(batches), expected)
+end
+
+_nodal_source_signal_alias(::Tuple{}, _signal) = false
+
+function _nodal_source_signal_alias(batches::Tuple, signal)
+    for element in first(batches)
+        hasproperty(element, :value) && getproperty(element, :value) === signal &&
+            return true
+    end
+    return _nodal_source_signal_alias(Base.tail(batches), signal)
 end
 
 function _check_prepared_runtime_aliases(runtime::PreparedDynamicDeckRuntime)
@@ -2679,14 +2744,18 @@ function _check_prepared_runtime_aliases(runtime::PreparedDynamicDeckRuntime)
             ))
     end
     for branch in context.saturated_transformer_nonlinear_slope_branch_batch
-        any(element -> element === branch, elements) || throw(ArgumentError(
+        _nodal_element_identity_alias(
+            elements.contiguous_type_batches,
+            branch,
+        ) || throw(ArgumentError(
             "prepared nonlinear slope batch must alias the nodal element",
         ))
     end
     for signal in context.analytic_source_signals
-        any(elements) do element
-            hasproperty(element, :value) && getproperty(element, :value) === signal
-        end || throw(ArgumentError(
+        _nodal_source_signal_alias(
+            elements.contiguous_type_batches,
+            signal,
+        ) || throw(ArgumentError(
             "prepared analytic source list must alias the nodal source signal",
         ))
     end
@@ -2699,13 +2768,19 @@ function _check_prepared_runtime_aliases(runtime::PreparedDynamicDeckRuntime)
     control_runtime = context.control_system_runtime
     if control_runtime !== nothing
         for observation in control_runtime.switch_observations
-            any(element -> element === observation.switch, elements) ||
+            _nodal_element_identity_alias(
+                elements.contiguous_type_batches,
+                observation.switch,
+            ) ||
                 throw(ArgumentError(
                     "prepared control observation must alias the nodal switch",
                 ))
         end
         for switch in control_runtime.switch_elements
-            any(element -> element === switch, elements) || throw(ArgumentError(
+            _nodal_element_identity_alias(
+                elements.contiguous_type_batches,
+                switch,
+            ) || throw(ArgumentError(
                 "prepared control switch runtime must alias the nodal switch",
             ))
         end
@@ -3915,6 +3990,55 @@ function _deck_switch_grounded_conductance_current(
     )
 end
 
+
+function _deck_switch_grounded_conductance_current(
+    elements::NodalElementSequence,
+    endpoint::Int,
+    voltage::AbstractVector{Float64},
+    dt_s::Float64,
+)
+    return _deck_switch_grounded_conductance_current_batches(
+        elements.contiguous_type_batches,
+        endpoint,
+        voltage,
+        dt_s,
+    )
+end
+
+_deck_switch_grounded_conductance_current_batches(
+    ::Tuple{},
+    ::Int,
+    ::AbstractVector{Float64},
+    ::Float64,
+) = nothing
+
+function _deck_switch_grounded_conductance_current_batches(
+    batches::Tuple,
+    endpoint::Int,
+    voltage::AbstractVector{Float64},
+    dt_s::Float64,
+)
+    for element in first(batches)
+        if applicable(branch_companion_snapshot, element, voltage, dt_s)
+            snapshot = branch_companion_snapshot(element, voltage, dt_s)
+            if snapshot !== nothing && snapshot.kind == :conductance &&
+               (
+                   (snapshot.a == endpoint && snapshot.b == 0) ||
+                   (snapshot.b == endpoint && snapshot.a == 0)
+               )
+                return snapshot.conductance *
+                    _deck_node_voltage(voltage, endpoint)
+            end
+        end
+    end
+    return _deck_switch_grounded_conductance_current_batches(
+        Base.tail(batches),
+        endpoint,
+        voltage,
+        dt_s,
+    )
+end
+
 function _deck_closed_switch_grounded_path_current(
     boundary_run,
     switch_index::Int,
@@ -4016,6 +4140,41 @@ function _deck_runtime_switch_element(
     end
     return _deck_runtime_switch_element(
         Base.tail(elements),
+        switch_index,
+        next_found,
+    )
+end
+
+
+function _deck_runtime_switch_element(
+    elements::NodalElementSequence,
+    switch_index::Int,
+    found::Int,
+)
+    return _deck_runtime_switch_element_batches(
+        elements.contiguous_type_batches,
+        switch_index,
+        found,
+    )
+end
+
+_deck_runtime_switch_element_batches(::Tuple{}, ::Int, ::Int) = nothing
+
+function _deck_runtime_switch_element_batches(
+    batches::Tuple,
+    switch_index::Int,
+    found::Int,
+)
+    batch = first(batches)
+    next_found = found
+    if eltype(batch) <: Union{TimeSwitch,CurrentZeroSwitch}
+        next_found += length(batch)
+        if found < switch_index <= next_found
+            return @inbounds batch[switch_index - found]
+        end
+    end
+    return _deck_runtime_switch_element_batches(
+        Base.tail(batches),
         switch_index,
         next_found,
     )

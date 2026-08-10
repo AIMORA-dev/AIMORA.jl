@@ -657,8 +657,7 @@ current_extinction_enabled(::CurrentZeroSwitch) = true
 current_extinction_enabled(s::TimeSwitch) = s.current_extinction !== nothing
 current_extinction_enabled(::Tuple{}) = false
 current_extinction_enabled(elements::Tuple) =
-    current_extinction_enabled(first(elements)) ||
-    current_extinction_enabled(Base.tail(elements))
+    any(current_extinction_enabled, elements)
 
 function configure_current_extinction!(
     switch::TimeSwitch,

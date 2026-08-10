@@ -97,6 +97,9 @@ struct DeckCaseRun
     execution_kind::Symbol
     trace::Union{Nothing,DeckEMTTrace}
     auxiliary::DeckAuxiliaryStudyRun
+    initialization_report::Union{Nothing,EMTInitializationReport}
+    initialization_failure::Union{Nothing,EMTInitializationFailure}
+    initialization_source_case_index::Union{Nothing,Int}
 end
 
 struct DeckCaseSequenceRun
@@ -105,6 +108,79 @@ struct DeckCaseSequenceRun
     aborted_case_count::Int
     discarded_card_count::Int
     run_terminated::Bool
+    initialization_failure_count::Int
+end
+
+function _deck_case_initialization_timing(
+    parsed::DeckParser.DeckParseResult,
+    initialization::DeckCaseInitialization,
+    dt_s::Float64,
+    t_end_s::Float64,
+    time_horizon::Symbol,
+)
+    time_horizon in (:arguments, :deck) || throw(ArgumentError(
+        "unsupported EMT case-sequence time horizon $time_horizon",
+    ))
+    timing = time_horizon === :deck ? deck_fixed_step_horizon(parsed) :
+        (dt_s=dt_s, t_end_s=t_end_s)
+    request = initialization.request
+    timestep = request.formulation isa TimestepMatchedFormulation ?
+        request.formulation.timestep_s : Float64(timing.dt_s)
+    isapprox(
+        timestep,
+        Float64(timing.dt_s);
+        atol=0.0,
+        rtol=64.0 * eps(Float64),
+    ) || throw(ArgumentError(
+        "case-sequence initialization timestep does not match the selected case horizon",
+    ))
+    horizon = max(Float64(timing.t_end_s), timestep)
+    return (; timestep_s=timestep, t_end_s=horizon)
+end
+
+function _validate_case_initialization_source!(
+    initialization::DeckCaseInitialization,
+    case_index::Int,
+    accepted_reports::Dict{Int,EMTInitializationReport},
+)
+    source_case = initialization.mapped_from_case_index
+    source_case === nothing && return nothing
+    source_case < case_index || throw(ArgumentError(
+        "mapped initialization source case must precede its target case",
+    ))
+    source_report = get(accepted_reports, source_case, nothing)
+    source_report === nothing && throw(ArgumentError(
+        "mapped initialization source case has no accepted initialization state",
+    ))
+    operating_point = initialization.request.operating_point
+    operating_point.source_state_signature ==
+        source_report.deterministic_state_signature || throw(ArgumentError(
+        "mapped initialization source-state signature is stale",
+    ))
+    return nothing
+end
+
+function _missing_case_initialization_source_failure(
+    initialization::DeckCaseInitialization,
+    case_index::Int,
+    accepted_reports::Dict{Int,EMTInitializationReport},
+)
+    source_case = initialization.mapped_from_case_index
+    source_case === nothing && return nothing
+    source_case < case_index || throw(ArgumentError(
+        "mapped initialization source case must precede its target case",
+    ))
+    haskey(accepted_reports, source_case) && return nothing
+    return EMTInitializationFailure(
+        :missing_source_initialization_state,
+        :case_sequence_initialization,
+        :source_state,
+        "mapped initialization source case has no accepted initialization state",
+        (
+            source_case_index=source_case,
+            target_case_index=case_index,
+        ),
+    )
 end
 
 function deck_frequency_scan_schedule(row::DeckParser.DeckStudyOptionRequestRow)
@@ -535,8 +611,16 @@ function run_deck_case_sequence_emt(
         Nothing,
         DeckImpulseResponseFitControl,
     }=nothing,
+    initializations::AbstractDict{<:Integer,<:DeckCaseInitialization}=
+        Dict{Int,DeckCaseInitialization}(),
 )
     runs = DeckCaseRun[]
+    accepted_initialization_reports = Dict{Int,EMTInitializationReport}()
+    known_case_indices = Set(data_case.case_index for data_case in sequence.cases)
+    all(case_index -> Int(case_index) in known_case_indices, keys(initializations)) ||
+        throw(ArgumentError(
+            "case-sequence initialization map contains an unknown case index",
+        ))
     for data_case in sequence.cases
         parsed = data_case.parsed
         assert_deck_valid!(parsed)
@@ -545,15 +629,70 @@ function run_deck_case_sequence_emt(
             impulse_response_fit_control,
         )
         execution_kind = _case_execution_kind(parsed, auxiliary)
-        trace = execution_kind in (:emt, :emt_with_auxiliary) ?
-            run_deck_emt(
-                parsed;
-                dt_s,
-                t_end_s,
-                time_horizon,
-                output_schedule,
-            ) :
-            nothing
+        initialization = get(initializations, data_case.case_index, nothing)
+        initialization_report = nothing
+        initialization_failure = nothing
+        initialization_source_case_index = nothing
+        trace = nothing
+        if execution_kind in (:emt, :emt_with_auxiliary)
+            if initialization === nothing
+                trace = run_deck_emt(
+                    parsed;
+                    dt_s,
+                    t_end_s,
+                    time_horizon,
+                    output_schedule,
+                )
+            else
+                initialization_source_case_index =
+                    initialization.mapped_from_case_index
+                initialization_failure =
+                    _missing_case_initialization_source_failure(
+                        initialization,
+                        data_case.case_index,
+                        accepted_initialization_reports,
+                    )
+                if initialization_failure !== nothing
+                    execution_kind = :emt_initialization_failed
+                else
+                    _validate_case_initialization_source!(
+                        initialization,
+                        data_case.case_index,
+                        accepted_initialization_reports,
+                    )
+                    timing = _deck_case_initialization_timing(
+                        parsed,
+                        initialization,
+                        dt_s,
+                        t_end_s,
+                        time_horizon,
+                    )
+                    initialized = initialize_emt_study(
+                        parsed,
+                        initialization.request;
+                        t_end_s=timing.t_end_s,
+                        output_schedule,
+                    )
+                    initialization_report = initialized.report
+                    initialization_failure = initialized.failure
+                    if initialization_accepted(initialized)
+                        accepted_initialization_reports[data_case.case_index] =
+                            initialized.report
+                        trace = evaluate_emt_study!(
+                            EMTStudyWorkspace(initialized.prepared),
+                        )
+                        execution_kind = execution_kind === :emt ?
+                            :initialized_emt : :initialized_emt_with_auxiliary
+                    else
+                        execution_kind = :emt_initialization_failed
+                    end
+                end
+            end
+        elseif initialization !== nothing
+            throw(ArgumentError(
+                "case initialization was supplied for a non-EMT case",
+            ))
+        end
         push!(
             runs,
             DeckCaseRun(
@@ -563,6 +702,9 @@ function run_deck_case_sequence_emt(
                 execution_kind,
                 trace,
                 auxiliary,
+                initialization_report,
+                initialization_failure,
+                initialization_source_case_index,
             ),
         )
     end
@@ -572,6 +714,7 @@ function run_deck_case_sequence_emt(
         sequence.aborted_case_count,
         sequence.discarded_card_count,
         sequence.run_terminated,
+        count(data_case -> data_case.initialization_failure !== nothing, runs),
     )
 end
 
@@ -620,6 +763,17 @@ function deck_case_sequence_result(run::DeckCaseSequenceRun; elapsed_s::Float64=
         warnings,
         StudyWarning[
             study_warning(
+                data_case.initialization_failure.code,
+                data_case.initialization_failure.message,
+            )
+            for data_case in run.cases
+            if data_case.initialization_failure !== nothing
+        ],
+    )
+    append!(
+        warnings,
+        StudyWarning[
+            study_warning(
                 exclusion,
                 "The request is an explicitly retired input-conversion utility, not a production simulation effect: $(exclusion).",
             )
@@ -633,6 +787,11 @@ function deck_case_sequence_result(run::DeckCaseSequenceRun; elapsed_s::Float64=
             result_quantity(:case_count, length(run.cases); unit="count"),
             result_quantity(:executed_emt_case_count, executed_count; unit="count"),
             result_quantity(:aborted_case_count, run.aborted_case_count; unit="count"),
+            result_quantity(
+                :initialization_failure_count,
+                run.initialization_failure_count;
+                unit="count",
+            ),
             result_quantity(:frequency_scan_count, schedule_count; unit="count"),
             result_quantity(
                 :whole_network_frequency_scan_count,
@@ -696,6 +855,7 @@ function write_deck_case_sequence_summary(
         println(io, "aborted_case_count = ", run.aborted_case_count)
         println(io, "discarded_card_count = ", run.discarded_card_count)
         println(io, "run_terminated = ", run.run_terminated)
+        println(io, "initialization_failure_count = ", run.initialization_failure_count)
         println(io, "elapsed_s = ", elapsed_s)
         for data_case in run.cases
             println(io)
@@ -709,6 +869,38 @@ function write_deck_case_sequence_summary(
                 _toml_text(String(data_case.execution_kind)),
             )
             println(io, "emt_executed = ", data_case.trace !== nothing)
+            println(
+                io,
+                "initialization_status = ",
+                _toml_text(
+                    data_case.initialization_report !== nothing ?
+                    String(data_case.initialization_report.status) :
+                    data_case.initialization_failure !== nothing ? "failed" :
+                    "not_requested",
+                ),
+            )
+            println(
+                io,
+                "initialization_source_case_index = ",
+                data_case.initialization_source_case_index === nothing ? 0 :
+                    data_case.initialization_source_case_index,
+            )
+            println(
+                io,
+                "initialization_state_signature = ",
+                _toml_text(
+                    data_case.initialization_report === nothing ? "" :
+                    data_case.initialization_report.deterministic_state_signature,
+                ),
+            )
+            println(
+                io,
+                "initialization_failure_code = ",
+                _toml_text(
+                    data_case.initialization_failure === nothing ? "" :
+                    String(data_case.initialization_failure.code),
+                ),
+            )
             println(
                 io,
                 "frequency_scan_count = ",

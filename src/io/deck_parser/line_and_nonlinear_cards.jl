@@ -2350,22 +2350,22 @@ function push_hysteretic_inductor_row!(
     reference_kind::Symbol=:none,
     reference_index::Int=0,
 )::Bool
-    steady_state_flux = fixed_float_or_default!(
+    steady_state_current = fixed_float_or_default!(
         result,
         image,
         line_no,
         27,
         38,
-        "hysteretic_inductor_steady_state_flux_Wb",
+        "hysteretic_inductor_steady_state_current_A",
         0.0,
     )
-    steady_state_current = fixed_float_or_default!(
+    steady_state_flux = fixed_float_or_default!(
         result,
         image,
         line_no,
         39,
         50,
-        "hysteretic_inductor_steady_state_current_A",
+        "hysteretic_inductor_steady_state_flux_Wb",
         0.0,
     )
     residual_flux = fixed_float_or_default!(

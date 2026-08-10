@@ -8,6 +8,11 @@ export STUDY_STATUSES,
        SwitchingStateEquivalent,
        AverageValue,
        FieldCoupledDetailed,
+       ParameterNature,
+       PhysicalModelParameter,
+       ScalingBasisParameter,
+       NumericalPolicyParameter,
+       ParameterProvenance,
        NumericDomainBound,
        ModelValidityDomain,
        DynamicStateInventory,
@@ -44,6 +49,44 @@ const RESULT_STATUSES = (:ok, :warning, :failed, :not_implemented, :invalid_inpu
     SwitchingStateEquivalent
     AverageValue
     FieldCoupledDetailed
+end
+
+"""Scientific role of a physical, scaling, or numerical parameter record."""
+@enum ParameterNature begin
+    PhysicalModelParameter
+    ScalingBasisParameter
+    NumericalPolicyParameter
+end
+
+"""Source, units, transformation, uncertainty, validity, and scientific role of one parameter."""
+struct ParameterProvenance
+    source::String
+    units::String
+    transformation::String
+    uncertainty::String
+    validity_domain::String
+    nature::ParameterNature
+
+    function ParameterProvenance(
+        source::AbstractString,
+        units::AbstractString,
+        transformation::AbstractString,
+        uncertainty::AbstractString,
+        validity_domain::AbstractString,
+        nature::ParameterNature,
+    )
+        values = String.((
+            source,
+            units,
+            transformation,
+            uncertainty,
+            validity_domain,
+        ))
+        all(value -> !isempty(strip(value)), values) || throw(ArgumentError(
+            "parameter provenance fields must not be empty",
+        ))
+        return new(values..., nature)
+    end
 end
 
 struct NumericDomainBound

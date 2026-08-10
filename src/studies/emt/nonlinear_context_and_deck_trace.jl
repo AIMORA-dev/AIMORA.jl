@@ -102,6 +102,8 @@ function _deck_merge_nonlinear_current_configs(configs::Vector{NamedTuple})
     safety_shunt_resistance_ohm_values = Float64[]
     safety_shunt_conductance_s_values = Float64[]
     nonlinear_current_segments = Float64[]
+    nonlinear_steady_state_current_values = Float64[]
+    nonlinear_steady_state_flux_values = Float64[]
     fortran_nonlinear_admittance_nodes = Int[]
     fortran_nonlinear_state_start_indices = Int[]
     fortran_gap_status_values = Float64[]
@@ -183,6 +185,16 @@ function _deck_merge_nonlinear_current_configs(configs::Vector{NamedTuple})
             Int.(get(config, :initial_table_index_values, zeros(Int, local_count)))
         local_segments =
             Float64.(get(config, :nonlinear_current_segments, zeros(Float64, local_count)))
+        local_steady_currents = Float64.(get(
+            config,
+            :nonlinear_steady_state_current_values,
+            zeros(Float64, local_count),
+        ))
+        local_steady_fluxes = Float64.(get(
+            config,
+            :nonlinear_steady_state_flux_values,
+            zeros(Float64, local_count),
+        ))
         local_minimum_on_time =
             Float64.(get(config, :minimum_on_time_values, zeros(Float64, local_count)))
         local_timed_resistance_arm_times = Float64.(get(
@@ -207,6 +219,8 @@ function _deck_merge_nonlinear_current_configs(configs::Vector{NamedTuple})
             length(local_initial_curr) == local_count &&
             length(local_initial_ilast) == local_count &&
             length(local_segments) == local_count &&
+            length(local_steady_currents) == local_count &&
+            length(local_steady_fluxes) == local_count &&
             length(local_minimum_on_time) == local_count &&
             length(local_timed_resistance_arm_times) == local_count &&
             length(local_rearm_indices) == local_count &&
@@ -347,6 +361,14 @@ function _deck_merge_nonlinear_current_configs(configs::Vector{NamedTuple})
                 ),
             )
             push!(nonlinear_current_segments, local_segments[local_index])
+            push!(
+                nonlinear_steady_state_current_values,
+                local_steady_currents[local_index],
+            )
+            push!(
+                nonlinear_steady_state_flux_values,
+                local_steady_fluxes[local_index],
+            )
             push!(minimum_on_time_values, local_minimum_on_time[local_index])
             push!(
                 timed_resistance_arm_time_values,
@@ -522,6 +544,17 @@ function _deck_merge_nonlinear_current_configs(configs::Vector{NamedTuple})
         initial_table_index_values = initial_table_index_values,
         initial_cursub_values = zeros(Float64, initial_cursub_count),
         nonlinear_current_segments = nonlinear_current_segments,
+        nonlinear_steady_state_current_values =
+            nonlinear_steady_state_current_values,
+        nonlinear_steady_state_flux_values = nonlinear_steady_state_flux_values,
+        saturated_transformer_residual_flux_initialized = any(
+            config -> get(
+                config,
+                :saturated_transformer_residual_flux_initialized,
+                false,
+            ),
+            configs,
+        ),
         minimum_on_time_values = minimum_on_time_values,
         timed_resistance_arm_time_values = timed_resistance_arm_time_values,
         rearm_time_state_indices = rearm_time_state_indices,
@@ -1678,6 +1711,7 @@ function _prepare_dynamic_deck_runtime(
     saturated_transformer_nonlinear_current_enabled::Bool = true,
     coupled_lumped_sequence_history_enabled::Bool = false,
     steady_state_initial_sample_enabled::Bool = false,
+    supplied_initial_sample = nothing,
     time_switch_event_delay_s::Float64 = 0.0,
     current_zero_switching::Bool = false,
     recorded_step_indices = nothing,
@@ -1703,6 +1737,8 @@ function _prepare_dynamic_deck_runtime(
             saturated_transformer_sparse_config = saturated_transformer_sparse_config,
         )
     steady_state_initial_sample =
+        supplied_initial_sample !== nothing ?
+        deepcopy(supplied_initial_sample) :
         steady_state_initial_sample_enabled ?
         deck_steady_state_voltage_phasors(
             parsed;
@@ -1710,6 +1746,14 @@ function _prepare_dynamic_deck_runtime(
             winding_number = saturated_transformer_winding_number,
         ) :
         nothing
+    consistent_initial_state_enabled = supplied_initial_sample !== nothing
+    if consistent_initial_state_enabled
+        saturated_transformer_current_config =
+            _saturated_transformer_initial_state_config(
+                saturated_transformer_current_config,
+                steady_state_initial_sample,
+            )
+    end
     saturated_transformer_current_config =
         _pseudo_nonlinear_inductor_initial_state_config(
             saturated_transformer_current_config,
@@ -1721,6 +1765,28 @@ function _prepare_dynamic_deck_runtime(
             saturated_transformer_current_config;
             delta2 = dt_s / 2.0,
         )
+    if consistent_initial_state_enabled
+        deck_nonlinear_current_config =
+            _saturated_transformer_initial_state_config(
+                deck_nonlinear_current_config,
+                steady_state_initial_sample,
+            )
+        deck_nonlinear_current_config =
+            _pseudo_nonlinear_inductor_initial_state_config(
+                deck_nonlinear_current_config,
+                steady_state_initial_sample,
+            )
+        deck_nonlinear_current_config =
+            _piecewise_nonlinear_inductor_initial_state_config(
+                deck_nonlinear_current_config,
+                steady_state_initial_sample,
+            )
+        deck_nonlinear_current_config =
+            _hysteretic_inductor_initial_state_config(
+                deck_nonlinear_current_config,
+                steady_state_initial_sample,
+            )
+    end
     if deck_nonlinear_current_config !== nothing &&
        saturated_transformer_current_config === nothing &&
        _deck_uses_dynamic_nonlinear_runtime(parsed)
@@ -1850,7 +1916,11 @@ function _prepare_dynamic_deck_runtime(
         nothing :
         _steady_state_initial_output_values(context)
     steady_state_initial_current_injections =
-        steady_state_initial_sample === nothing ? nothing :
+        steady_state_initial_sample === nothing ||
+        (
+            hasproperty(steady_state_initial_sample, :exact_discrete_histories) &&
+            steady_state_initial_sample.exact_discrete_histories
+        ) ? nothing :
         _steady_state_current_injections(context, steady_state_initial_sample)
     first_dynamic_step_index = steady_state_initial_sample === nothing ? 0 : 1
     reset_current_source_values =
@@ -1999,7 +2069,7 @@ function run_deck_emt_with_over16_boundary(
 )
     updates = collect_run_diagnostics ? Any[] : nothing
     _apply_due_series_rlc_alterations!(context)
-    if steady_state_initial_sample !== nothing
+    if steady_state_initial_sample !== nothing && context.step_index == 0
         _apply_steady_state_initial_sample!(
             context,
             steady_state_initial_sample,

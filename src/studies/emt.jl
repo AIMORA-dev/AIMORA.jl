@@ -32,6 +32,7 @@ include(joinpath(@__DIR__, "emt", "checkpoint_io.jl"))
 include(joinpath(@__DIR__, "emt", "restart_execution.jl"))
 include(joinpath(@__DIR__, "emt", "deck_timestep_orchestration.jl"))
 include(joinpath(@__DIR__, "emt", "case_sequence_execution.jl"))
+include(joinpath(@__DIR__, "emt", "consistent_initialization.jl"))
 include(joinpath(@__DIR__, "emt", "snapshot_results_and_json.jl"))
 include(joinpath(@__DIR__, "emt", "result_serialization.jl"))
 

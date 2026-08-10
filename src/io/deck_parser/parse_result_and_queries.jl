@@ -15,6 +15,7 @@ using ..Nodal: NodalSystem
 using ..Sources:
     analytic_current_injection_source,
     analytic_thevenin_source,
+    SinusoidalSourceSignal,
     sinusoidal_thevenin_source,
     sinusoidal_value
 using ..Switches: IdealSwitch, TimeSwitch

@@ -13,8 +13,10 @@ using ..StudyCore: AverageValue,
 
 export InverterParams,
        InverterState,
+       GridFollowingInverterEquilibrium,
        inverter_contract,
        initial_inverter_state,
+       grid_following_inverter_equilibrium,
        step_inverter,
        inverter_row,
        simulate_inverter,
@@ -113,6 +115,22 @@ struct InverterState
     xiq::Float64
 end
 
+"""Complete balanced dq operating state and its exact one-step recurrence for the admitted average-value grid-following inverter."""
+struct GridFollowingInverterEquilibrium
+    state::InverterState
+    one_step_state::InverterState
+    derivative::InverterState
+    current_reference_a::NTuple{2,Float64}
+    grid_voltage_dq_v::NTuple{2,Float64}
+    converter_voltage_dq_v::NTuple{2,Float64}
+    phase_current_phasors_a::NTuple{3,ComplexF64}
+    phase_converter_voltage_phasors_v::NTuple{3,ComplexF64}
+    active_power_w::Float64
+    reactive_power_var::Float64
+    voltage_limit_v::Float64
+    voltage_margin_v::Float64
+end
+
 function base_values(p::InverterParams)
     omega = 2.0 * pi * p.f_hz
     v_phase_peak = sqrt(2.0) * p.v_ll_rms_v / sqrt(3.0)
@@ -180,6 +198,83 @@ end
 function initial_inverter_state(p::InverterParams = InverterParams())
     _, _, id0, iq0 = references(0.0, p)
     return InverterState(id0, iq0, 0.0, 0.0)
+end
+
+"""Construct the unsaturated zero-error dq state owned by the admitted average-value model and prove its fixed-step recurrence without hidden settling."""
+function grid_following_inverter_equilibrium(
+    p::InverterParams=InverterParams();
+    timestep_s::Real,
+)
+    timestep = Float64(timestep_s)
+    isfinite(timestep) && timestep > 0.0 || throw(ArgumentError(
+        "grid-following inverter equilibrium requires a finite positive timestep",
+    ))
+    assessment = assess_validity(
+        inverter_contract(),
+        (
+            frequency_hz=p.f_hz,
+            base_power_va=p.s_base_va,
+            line_voltage_rms_v=p.v_ll_rms_v,
+            filter_resistance_ohm=p.r_filter_ohm,
+            filter_inductance_h=p.l_filter_h,
+            dc_voltage_v=p.v_dc_v,
+            proportional_gain=p.kp_i,
+            integral_gain=p.ki_i,
+            initial_active_power_pu=p.p_ref_0_pu,
+            final_active_power_pu=p.p_ref_1_pu,
+            reactive_power_pu=p.q_ref_pu,
+            reference_step_time_s=p.step_time_s,
+            timestep_s=timestep,
+            end_time_s=timestep,
+        );
+        requested_fidelity=AverageValue,
+    )
+    assert_validity(assessment)
+    omega, direct_grid_voltage_v, _ = base_values(p)
+    active_power_w, reactive_power_var, direct_current_a, quadrature_current_a =
+        references(0.0, p)
+    state = initial_inverter_state(p)
+    state_derivative = derivative(state, 0.0, p)
+    direct_converter_voltage_v = direct_grid_voltage_v +
+        p.r_filter_ohm * direct_current_a -
+        omega * p.l_filter_h * quadrature_current_a
+    quadrature_converter_voltage_v =
+        p.r_filter_ohm * quadrature_current_a +
+        omega * p.l_filter_h * direct_current_a
+    voltage_limit_v = p.v_dc_v / sqrt(3.0)
+    voltage_magnitude_v = hypot(
+        direct_converter_voltage_v,
+        quadrature_converter_voltage_v,
+    )
+    voltage_margin_v = voltage_limit_v - voltage_magnitude_v
+    voltage_margin_v >= -64.0 * eps(max(voltage_limit_v, voltage_magnitude_v)) ||
+        throw(ArgumentError(
+            "grid-following inverter operating target requires a saturated voltage command",
+        ))
+    one_step_state = step_inverter(state, 0.0, timestep, p)
+    current_space_phasor_a = complex(direct_current_a, quadrature_current_a)
+    converter_voltage_space_phasor_v = complex(
+        direct_converter_voltage_v,
+        quadrature_converter_voltage_v,
+    )
+    phase_rotations = (1.0 + 0.0im, cis(-2.0 * pi / 3.0), cis(2.0 * pi / 3.0))
+    return GridFollowingInverterEquilibrium(
+        state,
+        one_step_state,
+        state_derivative,
+        (direct_current_a, quadrature_current_a),
+        (direct_grid_voltage_v, 0.0),
+        (direct_converter_voltage_v, quadrature_converter_voltage_v),
+        ntuple(phase -> current_space_phasor_a * phase_rotations[phase], 3),
+        ntuple(
+            phase -> converter_voltage_space_phasor_v * phase_rotations[phase],
+            3,
+        ),
+        active_power_w,
+        reactive_power_var,
+        voltage_limit_v,
+        max(voltage_margin_v, 0.0),
+    )
 end
 
 step_inverter(x::InverterState, t::Float64, dt::Float64, p::InverterParams) = rk4_step(x, t, dt, p)

@@ -922,21 +922,16 @@ function parse_current!(result::DeckParseResult, tokens, line_no::Int)
     if amplitude === nothing || frequency === nothing
         return result
     end
-    amplitude_value = Float64(amplitude)
-    frequency_value = Float64(frequency)
-    phase_value = Float64(phase)
-    offset_value = Float64(offset)
     push_element!(
         result,
         tokens,
         CurrentInjection(
             node,
-            t -> sinusoidal_value(
-                t,
-                amplitude_value,
-                frequency_value;
-                phase_rad=phase_value,
-                offset_pu=offset_value,
+            SinusoidalSourceSignal(
+                amplitude,
+                frequency,
+                phase,
+                offset,
             ),
         ),
         line_no,

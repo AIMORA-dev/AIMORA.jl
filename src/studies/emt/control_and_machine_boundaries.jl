@@ -95,6 +95,7 @@ function run_deck_universal_machine_horizon(
     parsed::DeckParser.DeckParseResult;
     machine_index::Int=1,
     time_step_s::Real=deck_fixed_step_horizon(parsed).dt_s,
+    dynamic_step_count::Int=deck_fixed_step_horizon(parsed).step_count,
 )
     DeckParser.assert_deck_valid!(parsed)
     horizon = deck_fixed_step_horizon(parsed)
@@ -103,6 +104,9 @@ function run_deck_universal_machine_horizon(
     dt_s = Float64(time_step_s)
     dt_s == horizon.dt_s ||
         throw(ArgumentError("machine network horizon time step must match the deck time step"))
+    1 <= dynamic_step_count <= horizon.step_count || throw(ArgumentError(
+        "dynamic_step_count must be within the parsed deck horizon",
+    ))
     network_nodes = _deck_universal_machine_network_nodes(parsed, machine_index)
     machine_section = _deck_universal_machine_section(parsed)
     predicted_current_coupling =
@@ -270,8 +274,8 @@ function run_deck_universal_machine_horizon(
     context = initialize_step_context(
         runtime_parsed;
         dt_s = dt_s,
-        t_end_s = horizon.t_end_s,
-        recorded_step_indices = [0, horizon.step_count],
+        t_end_s = dynamic_step_count * dt_s,
+        recorded_step_indices = [0, dynamic_step_count],
     )
     if !manually_initialized_machine
         _seed_steady_state_network_state!(context, steady_state)
@@ -293,7 +297,7 @@ function run_deck_universal_machine_horizon(
         )
     end
 
-    call_count = horizon.step_count + 1
+    call_count = dynamic_step_count + 1
     coil_count = length(parameters.coil_conductances)
     outputs = zeros(Float64, coil_count + 3, call_count)
     currents = zeros(Float64, coil_count, call_count)
@@ -329,7 +333,7 @@ function run_deck_universal_machine_horizon(
     speed = zeros(Float64, call_count)
     angle = zeros(Float64, call_count)
     iterations = zeros(Int, call_count)
-    times = Float64[step * dt_s for step in 0:horizon.step_count]
+    times = Float64[step * dt_s for step in 0:dynamic_step_count]
     terminal_voltages = zeros(Float64, 3, call_count)
     rotor_thevenin = zeros(Float64, 3, 3, call_count)
     speed_thevenin = zeros(Float64, call_count)
@@ -1015,19 +1019,190 @@ function _trace_output_channel_names(elements::Tuple, element_names::AbstractVec
     return names
 end
 
+function _trace_output_channel_names(
+    elements::NodalElementSequence,
+    element_names::AbstractVector{Symbol},
+)
+    names = Symbol[]
+    first_index = 1
+    for batch in elements.contiguous_type_batches
+        _trace_contiguous_output_channel_names!(
+            names,
+            batch,
+            element_names,
+            first_index,
+        )
+        first_index += length(batch)
+    end
+    return names
+end
+
+function _trace_contiguous_output_channel_names!(
+    names::Vector{Symbol},
+    elements::AbstractVector{T},
+    element_names,
+    first_index::Int,
+) where {T}
+    for offset in 0:(length(elements) - 1)
+        trace_output_channel_names!(
+            names,
+            _element_trace_name(element_names, first_index + offset),
+            elements[offset + 1],
+        )
+    end
+    return names
+end
+
 _trace_output_channel_names!(names::Vector{Symbol}, elements::Tuple{}, element_names, index::Int) = names
 
-function _trace_output_channel_names!(names::Vector{Symbol}, elements::Tuple, element_names, index::Int)
-    element = first(elements)
-    trace_output_channel_names!(names, _element_trace_name(element_names, index), element)
-    return _trace_output_channel_names!(names, Base.tail(elements), element_names, index + 1)
+function _trace_homogeneous_output_channel_names!(
+    names::Vector{Symbol},
+    elements::Tuple{Vararg{T}},
+    element_names,
+    first_index::Int,
+) where {T}
+    for offset in 0:(length(elements) - 1)
+        element = getfield(elements, offset + 1)
+        trace_output_channel_names!(
+            names,
+            _element_trace_name(element_names, first_index + offset),
+            element,
+        )
+    end
+    return names
+end
+
+@generated function _trace_output_channel_names!(
+    names::Vector{Symbol},
+    elements::T,
+    element_names,
+    index::Int,
+) where {T<:Tuple}
+    element_types = fieldtypes(T)
+    if length(element_types) > 32 && all(==(first(element_types)), element_types)
+        return :(_trace_homogeneous_output_channel_names!(
+            names, elements, element_names, index,
+        ))
+    elseif length(element_types) > 32 &&
+           all(==(element_types[2]), element_types[2:end])
+        return quote
+            element = first(elements)
+            trace_output_channel_names!(
+                names,
+                _element_trace_name(element_names, index),
+                element,
+            )
+            _trace_homogeneous_output_channel_names!(
+                names, Base.tail(elements), element_names, index + 1,
+            )
+        end
+    end
+    return quote
+        element = first(elements)
+        trace_output_channel_names!(
+            names,
+            _element_trace_name(element_names, index),
+            element,
+        )
+        _trace_output_channel_names!(
+            names, Base.tail(elements), element_names, index + 1,
+        )
+    end
 end
 
 _record_trace_outputs!(output::AbstractMatrix{Float64}, sample::Int, elements::Tuple{}, voltage, first_channel::Int) = first_channel
 
-function _record_trace_outputs!(output::AbstractMatrix{Float64}, sample::Int, elements::Tuple, voltage, first_channel::Int)
-    next_channel = trace_output_values!(output, first_channel, sample, first(elements), voltage)
-    return _record_trace_outputs!(output, sample, Base.tail(elements), voltage, next_channel)
+function _record_trace_outputs!(
+    output::AbstractMatrix{Float64},
+    sample::Int,
+    elements::NodalElementSequence,
+    voltage,
+    first_channel::Int,
+)
+    next_channel = first_channel
+    for batch in elements.contiguous_type_batches
+        next_channel = _record_contiguous_trace_outputs!(
+            output,
+            sample,
+            batch,
+            voltage,
+            next_channel,
+        )
+    end
+    return next_channel
+end
+
+function _record_contiguous_trace_outputs!(
+    output::AbstractMatrix{Float64},
+    sample::Int,
+    elements::AbstractVector{T},
+    voltage,
+    first_channel::Int,
+) where {T}
+    next_channel = first_channel
+    for element in elements
+        next_channel = trace_output_values!(
+            output,
+            next_channel,
+            sample,
+            element,
+            voltage,
+        )
+    end
+    return next_channel
+end
+
+function _record_homogeneous_trace_outputs!(
+    output::AbstractMatrix{Float64},
+    sample::Int,
+    elements::Tuple{Vararg{T}},
+    voltage,
+    first_channel::Int,
+) where {T}
+    next_channel = first_channel
+    for index in eachindex(elements)
+        next_channel = trace_output_values!(
+            output,
+            next_channel,
+            sample,
+            getfield(elements, index),
+            voltage,
+        )
+    end
+    return next_channel
+end
+
+@generated function _record_trace_outputs!(
+    output::AbstractMatrix{Float64},
+    sample::Int,
+    elements::T,
+    voltage,
+    first_channel::Int,
+) where {T<:Tuple}
+    element_types = fieldtypes(T)
+    if length(element_types) > 32 && all(==(first(element_types)), element_types)
+        return :(_record_homogeneous_trace_outputs!(
+            output, sample, elements, voltage, first_channel,
+        ))
+    elseif length(element_types) > 32 &&
+           all(==(element_types[2]), element_types[2:end])
+        return quote
+            next_channel = trace_output_values!(
+                output, first_channel, sample, first(elements), voltage,
+            )
+            _record_homogeneous_trace_outputs!(
+                output, sample, Base.tail(elements), voltage, next_channel,
+            )
+        end
+    end
+    return quote
+        next_channel = trace_output_values!(
+            output, first_channel, sample, first(elements), voltage,
+        )
+        _record_trace_outputs!(
+            output, sample, Base.tail(elements), voltage, next_channel,
+        )
+    end
 end
 
 function _record_context_outputs!(
