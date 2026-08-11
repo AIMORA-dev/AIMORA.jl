@@ -1,6 +1,9 @@
 name: Public package CI
 
 on:
+  push:
+    branches: [main]
+  pull_request:
   schedule:
     - cron: "0 3 * * 0"
   workflow_dispatch:
@@ -8,23 +11,20 @@ on:
 permissions:
   contents: read
 
+concurrency:
+  group: engine-${{ github.workflow }}-${{ github.ref }}
+  cancel-in-progress: true
+
 jobs:
   test-open-core:
-    runs-on: ubuntu-latest
     strategy:
+      fail-fast: false
       matrix:
-        julia-version: ["1.10", "1"]
-    steps:
-      - uses: actions/checkout@v6
-        with:
-          submodules: false
-      - uses: julia-actions/setup-julia@v3
-        with:
-          version: ${{ matrix.julia-version }}
-      - uses: julia-actions/cache@v3
-      - name: Prove solver content is absent
-        run: |
-          test ! -e src/solvers
-          test -z "$(git ls-files src/solvers)"
-      - name: Check and test the open core
-        run: make check test
+        julia-version: ['1.10', '1']
+    uses: AIMORA-dev/.github/.github/workflows/julia-smoke.yml@c4eea2f0d3237419875db67a8c8d8752fce790cd
+    with:
+      julia-version: ${{ matrix.julia-version }}
+      test-command: |
+        test ! -e src/solvers
+        test -z "$(git ls-files src/solvers)"
+        make check test

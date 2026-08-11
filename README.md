@@ -43,10 +43,8 @@ Makefile                   test and check commands
 
 ## Related repositories
 
-- [BPAEMTPReference.jl](https://github.com/AIMORA-dev/BPAEMTPReference.jl): compiled historical reference and Julia wrapper
-- [AIMORADocs](https://github.com/AIMORA-dev/AIMORADocs): unified documentation
-- [AIMORACases.jl](https://github.com/AIMORA-dev/AIMORACases.jl): example and benchmark cases plus runnable examples grouped by study
-- [AIMORACatalogs.jl](https://github.com/AIMORA-dev/AIMORACatalogs.jl): open catalog schemas and distributable model data
+- [AIMORAResources](https://github.com/AIMORA-dev/AIMORAResources): compiled historical reference, unified documentation, public cases, catalogues, independent reference models, report templates, teaching material, and provenance
+- [AIMORAPlatform](https://github.com/AIMORA-dev/AIMORAPlatform): project, format, layout, service, visual, reporting, and symbol packages
 
 ## Licence
 
