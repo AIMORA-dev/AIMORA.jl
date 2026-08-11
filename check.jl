@@ -13,6 +13,7 @@ const REQUIRED_PATHS = (
     "src/core",
     "src/io",
     "src/models",
+    "src/solver_api/backend.jl",
     "src/studies",
     "test/runtests.jl",
 )
@@ -42,11 +43,13 @@ for forbidden_path in (
         fail("internal development path is present: $(forbidden_path)")
 end
 
-tracked_solver = read(
-    `git -C $ROOT ls-files --stage src/solvers`,
-    String,
-)
-occursin(r"^160000 [0-9a-f]{40} 0\tsrc/solvers\n?$", tracked_solver) ||
-    fail("src/solvers is not exactly one Git submodule pointer")
+tracked_solver = read(`git -C $ROOT ls-files --stage src/solvers`, String)
+isempty(tracked_solver) || fail("public repository retains a nested solver Gitlink")
+
+if isfile(joinpath(ROOT, ".gitmodules"))
+    gitmodules = read(joinpath(ROOT, ".gitmodules"), String)
+    !contains(gitmodules, "src/solvers") ||
+        fail("public repository metadata retains the private solver path")
+end
 
 println("AIMORA package boundary check passed")

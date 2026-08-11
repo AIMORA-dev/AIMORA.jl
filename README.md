@@ -14,7 +14,7 @@ using AIMORA
 AIMORA.solver_status()
 ```
 
-The public package loads independently. Project data, study input profiles, asset tables, validation, inverter examples, and future study interfaces remain available. Installation instructions for licensed capabilities are provided with the corresponding distribution.
+The public package loads independently. Project data, study input profiles, asset tables, validation, inverter examples, and future study interfaces remain available. A production-solve request without an explicitly registered backend returns `AIMORA.SolverUnavailableResult`. Installation and explicit activation instructions for licensed capabilities are provided with the corresponding distribution.
 
 ## Current scientific scope
 
@@ -31,11 +31,11 @@ CPU remains the default. Backend-neutral support for AMD, Intel, and other GPU f
 
 ```text
 src/AIMORA.jl              package entrypoint
+src/solver_api/             public backend contracts and typed availability results
 src/core/            public study, model, table, and validation contracts
 src/models/          public equipment and component implementations
 src/studies/         public study workflows and declared roadmap
 src/io/              public input/output and reporting implementations
-src/solvers/         separately distributed numerical backend boundary
 test/                      public and production integration package tests
 check.jl                   package structure and publication-boundary check
 Makefile                   test and check commands
@@ -50,6 +50,4 @@ Makefile                   test and check commands
 
 ## Licence
 
-This repository's AIMORA-authored content is distributed under the PolyForm Noncommercial License 1.0.0. Research, education, personal study, public-interest noncommercial use, and other purposes permitted by that licence are free; commercial use requires a separate written agreement with Ahmed Elkholy <ahmed_elkholy@f-eng.tanta.edu.eg>. There is no licence key, activation, telemetry, or technical feature restriction. Clearly identified third-party material retains its own terms, and copies received under an earlier licence retain those prior grants.
-
-The private `src/solvers` submodule is proprietary and grants no public distribution or use right.
+This repository's AIMORA-authored content is distributed under the PolyForm Noncommercial License 1.0.0. Research, education, personal study, public-interest noncommercial use, and other purposes permitted by that licence are free; commercial use requires a separate written agreement with Ahmed Elkholy <ahmed_elkholy@f-eng.tanta.edu.eg>. There is no licence key, telemetry, or technical feature restriction in this public package. Clearly identified third-party material retains its own terms, and copies received under an earlier licence retain those prior grants.

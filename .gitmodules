@@ -1,4 +1,0 @@
-[submodule "src/solvers"]
-	path = src/solvers
-	url = git@github.com:AIMORA-dev/AIMORASolvers.jl.git
-	branch = main

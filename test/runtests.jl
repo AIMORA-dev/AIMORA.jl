@@ -16,6 +16,22 @@ include("nonlinear_network.jl")
     end
 end
 
+@testset "public solver backend contract" begin
+    @test AIMORA.AbstractAIMORASolverBackend isa DataType
+    if AIMORA.solver_available()
+        @test :emt in getfield.(AIMORA.solver_capabilities(), :id)
+        @test AIMORA.backend_metadata().name == :aimora_production
+    else
+        @test isempty(AIMORA.solver_capabilities())
+        @test AIMORA.backend_metadata() isa AIMORA.SolverUnavailableResult
+        unavailable = AIMORA.prepare_study(nothing, :emt)
+        @test unavailable isa AIMORA.SolverUnavailableResult
+        @test unavailable.operation == :prepare_study
+        @test unavailable.required_capability == :study_preparation
+        @test unavailable.mode == :open_core
+    end
+end
+
 @testset "open engineering core" begin
     issue = AIMORA.ValidationCore.missing_data("line", "length is required")
     result = AIMORA.ValidationCore.validation_result(source = "public package test")
@@ -750,6 +766,7 @@ if AIMORA.solver_available()
 else
     @testset "public checkout has no solver source" begin
         @test AIMORA.solver_status().mode == :open_core
+        @test AIMORA.solver_status().backend === nothing
         @test !isdefined(AIMORA, :Nodal)
         @test !isdefined(AIMORA, :Nonlinear)
         @test_throws ErrorException AIMORA.require_solver()

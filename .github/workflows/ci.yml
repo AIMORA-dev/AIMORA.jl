@@ -24,13 +24,7 @@ jobs:
       - uses: julia-actions/cache@v3
       - name: Prove solver content is absent
         run: |
-          test ! -f src/solvers/nodal.jl
-          test ! -f src/solvers/timestep.jl
+          test ! -e src/solvers
+          test -z "$(git ls-files src/solvers)"
       - name: Check and test the open core
         run: make check test
-      - name: Check tracked solver boundary
-        run: |
-          if git ls-files src/solvers | grep -v '^src/solvers$'; then
-            echo "Public history contains files below the private solver gitlink."
-            exit 1
-          fi
