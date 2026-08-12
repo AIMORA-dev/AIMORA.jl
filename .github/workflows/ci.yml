@@ -28,3 +28,24 @@ jobs:
         test ! -e src/solvers
         test -z "$(git ls-files src/solvers)"
         make check test
+
+  cross-platform-open-core:
+    if: github.event_name == 'schedule' || github.event_name == 'workflow_dispatch'
+    runs-on: ${{ matrix.os }}
+    strategy:
+      fail-fast: false
+      matrix:
+        os: [ubuntu-latest, macos-latest, windows-latest]
+        julia: ['1.10', '1']
+    steps:
+      - uses: actions/checkout@v4
+      - uses: julia-actions/setup-julia@v2
+        with:
+          version: ${{ matrix.julia }}
+      - uses: julia-actions/cache@v2
+      - name: Public engine and task-platform qualification
+        shell: bash
+        run: |
+          test ! -e src/solvers
+          test -z "$(git ls-files src/solvers)"
+          make check test
