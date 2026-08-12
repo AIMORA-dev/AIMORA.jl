@@ -4,6 +4,7 @@ using LinearAlgebra
 using Printf
 
 include("nonlinear_network.jl")
+include("native_extensions.jl")
 
 @testset "public package isolation" begin
     for module_name in (
