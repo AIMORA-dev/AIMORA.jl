@@ -9,6 +9,133 @@ const EMTExactSampledTaskScheduler = ExactSampledTaskScheduler
 const next_emt_sampled_task_time = next_sampled_task_time
 const run_due_emt_sampled_tasks! = run_due_sampled_tasks!
 
+_emt_task_scheduler_empty(scheduler::ExactSampledTaskScheduler) =
+    isempty(scheduler.tasks)
+_emt_task_scheduler_empty(scheduler::GeneralEMTTaskScheduler) =
+    isempty(scheduler.tasks)
+_emt_task_scheduler_empty(adapter::ExactSampledTaskCompatibilityAdapter) =
+    _emt_task_scheduler_empty(adapter.scheduler)
+
+function _emt_next_task_time(
+    scheduler::ExactSampledTaskScheduler,
+    current_time_s::Float64,
+    endpoint_time_s::Float64,
+    tolerance_s::Float64,
+)
+    return next_sampled_task_time(
+        scheduler,
+        current_time_s,
+        endpoint_time_s;
+        tolerance_s,
+    )
+end
+
+function _emt_next_task_time(
+    adapter::ExactSampledTaskCompatibilityAdapter,
+    current_time_s::Float64,
+    endpoint_time_s::Float64,
+    tolerance_s::Float64,
+)
+    return _emt_next_task_time(
+        adapter.scheduler,
+        current_time_s,
+        endpoint_time_s,
+        tolerance_s,
+    )
+end
+
+function _emt_next_task_time(
+    scheduler::GeneralEMTTaskScheduler,
+    current_time_s::Float64,
+    endpoint_time_s::Float64,
+    tolerance_s::Float64,
+)
+    instant = next_general_task_instant(scheduler)
+    instant === nothing && return Inf
+    time_s = Float64(instant)
+    time_s < current_time_s - tolerance_s && throw(EMTTaskPlatform.EMTTaskPlatformFailure(
+        :missed_task_activation,
+        "general EMT task boundary precedes the active EMT interval";
+        instant,
+    ))
+    return time_s <= endpoint_time_s + tolerance_s ? time_s : Inf
+end
+
+_emt_task_scheduler_checkpoint(scheduler::ExactSampledTaskScheduler) = (
+    task_states = sampled_task_checkpoint.(scheduler.tasks),
+    occurrence_count = length(scheduler.occurrences),
+    invalidated_power = scheduler.last_run_power_history_invalidating,
+)
+_emt_task_scheduler_checkpoint(scheduler::GeneralEMTTaskScheduler) =
+    general_task_scheduler_checkpoint(scheduler)
+_emt_task_scheduler_checkpoint(adapter::ExactSampledTaskCompatibilityAdapter) =
+    _emt_task_scheduler_checkpoint(adapter.scheduler)
+
+function _restore_emt_task_scheduler!(scheduler::ExactSampledTaskScheduler, checkpoint)
+    length(checkpoint.task_states) == length(scheduler.tasks) || throw(ArgumentError(
+        "hybrid sampled-task state count changed during a boundary action",
+    ))
+    for (task, state) in zip(scheduler.tasks, checkpoint.task_states)
+        restore_sampled_task_checkpoint!(task, state)
+    end
+    resize!(scheduler.occurrences, checkpoint.occurrence_count)
+    scheduler.last_run_power_history_invalidating = checkpoint.invalidated_power
+    return scheduler
+end
+_restore_emt_task_scheduler!(scheduler::GeneralEMTTaskScheduler, checkpoint) =
+    restore_general_task_scheduler_checkpoint!(scheduler, checkpoint)
+_restore_emt_task_scheduler!(adapter::ExactSampledTaskCompatibilityAdapter, checkpoint) =
+    _restore_emt_task_scheduler!(adapter.scheduler, checkpoint)
+
+function _run_due_emt_tasks!(
+    scheduler::ExactSampledTaskScheduler,
+    owner,
+    time_s::Float64,
+    tolerance_s::Float64,
+)
+    return run_due_sampled_tasks!(scheduler, owner, time_s; tolerance_s)
+end
+
+function _run_due_emt_tasks!(
+    adapter::ExactSampledTaskCompatibilityAdapter,
+    owner,
+    time_s::Float64,
+    tolerance_s::Float64,
+)
+    return _run_due_emt_tasks!(
+        adapter.scheduler,
+        owner,
+        time_s,
+        tolerance_s,
+    )
+end
+
+function _run_due_emt_tasks!(
+    scheduler::GeneralEMTTaskScheduler,
+    owner,
+    time_s::Float64,
+    tolerance_s::Float64,
+)
+    instant = next_general_task_instant(scheduler)
+    instant === nothing && return 0
+    abs(Float64(instant) - time_s) <= tolerance_s || return 0
+    return run_due_general_tasks!(scheduler, owner, instant; checkpoint_owner = false)
+end
+
+_emt_task_scheduler_invalidated_power(scheduler::ExactSampledTaskScheduler) =
+    sampled_task_scheduler_last_run_invalidated_power(scheduler)
+_emt_task_scheduler_invalidated_power(scheduler::GeneralEMTTaskScheduler) =
+    general_task_scheduler_last_run_invalidated_power(scheduler)
+_emt_task_scheduler_invalidated_power(adapter::ExactSampledTaskCompatibilityAdapter) =
+    _emt_task_scheduler_invalidated_power(adapter.scheduler)
+
+_emt_task_scheduler_occurrence_count(scheduler::ExactSampledTaskScheduler) =
+    length(scheduler.occurrences)
+_emt_task_scheduler_occurrence_count(scheduler::GeneralEMTTaskScheduler) =
+    general_task_scheduler_occurrence_count(scheduler)
+_emt_task_scheduler_occurrence_count(adapter::ExactSampledTaskCompatibilityAdapter) =
+    _emt_task_scheduler_occurrence_count(adapter.scheduler)
+
 struct EMTHybridCallbackOwner{R}
     runtime::R
 end
@@ -400,7 +527,12 @@ function configure_emt_hybrid_execution(
         AbstractHybridEventSurface[],
     sampled_tasks::AbstractVector{<:AbstractExactSampledTask} =
         AbstractExactSampledTask[],
-    scheduler::Union{Nothing,ExactSampledTaskScheduler} = nothing,
+    scheduler::Union{
+        Nothing,
+        ExactSampledTaskScheduler,
+        GeneralEMTTaskScheduler,
+        ExactSampledTaskCompatibilityAdapter,
+    } = nothing,
     scheduler_tick_s::Union{Nothing,Real} = nothing,
     scheduler_origin_s::Real = 0.0,
     policy::HybridEventPolicy = HybridEventPolicy(),
@@ -786,32 +918,15 @@ function _emt_hybrid_has_due_tasks(
     integrator::EMTHybridStepIntegrator,
     time_s::Float64,
 )
-    isempty(integrator.scheduler.tasks) && return false
-    task_time = next_sampled_task_time(
+    _emt_task_scheduler_empty(integrator.scheduler) && return false
+    task_time = _emt_next_task_time(
         integrator.scheduler,
         time_s,
-        time_s;
-        tolerance_s = integrator.policy.simultaneity_tolerance_s,
+        time_s,
+        integrator.policy.simultaneity_tolerance_s,
     )
     return isfinite(task_time) &&
         abs(task_time - time_s) <= integrator.policy.simultaneity_tolerance_s
-end
-
-function _emt_hybrid_task_states(integrator::EMTHybridStepIntegrator)
-    return [
-        sampled_task_checkpoint(abstract_task)
-        for abstract_task in integrator.scheduler.tasks
-    ]
-end
-
-function _restore_emt_hybrid_task_states!(integrator, states)
-    length(states) == length(integrator.scheduler.tasks) || throw(ArgumentError(
-        "hybrid sampled-task state count changed during a boundary action",
-    ))
-    for (abstract_task, state) in zip(integrator.scheduler.tasks, states)
-        restore_sampled_task_checkpoint!(abstract_task, state)
-    end
-    return integrator
 end
 
 function _emt_hybrid_apply_boundary_actions!(
@@ -824,10 +939,7 @@ function _emt_hybrid_apply_boundary_actions!(
     isempty(indices) && !tasks_due && return (event_count = 0, task_count = 0)
     fired_before = copy(integrator.surface_fired)
     occurrence_count_before = length(integrator.occurrences)
-    scheduler_occurrence_count_before = length(integrator.scheduler.occurrences)
-    scheduler_invalidation_before =
-        integrator.scheduler.last_run_power_history_invalidating
-    task_states_before = _emt_hybrid_task_states(integrator)
+    scheduler_before = _emt_task_scheduler_checkpoint(integrator.scheduler)
     topology_count_before = integrator.topology_invalidation_count
     step_event_count_before = integrator.last_global_step_event_count
     workspace_ready_before = integrator.workspace.ready
@@ -835,14 +947,14 @@ function _emt_hybrid_apply_boundary_actions!(
     begin_emt_step_transaction!(integrator.transaction)
     try
         event_count = _emt_hybrid_apply_events!(integrator, indices, time_s, roots)
-        task_count = run_due_sampled_tasks!(
+        task_count = _run_due_emt_tasks!(
             integrator.scheduler,
             integrator.callback_owner,
-            time_s;
-            tolerance_s = integrator.policy.simultaneity_tolerance_s,
+            time_s,
+            integrator.policy.simultaneity_tolerance_s,
         )
         task_count > 0 &&
-            sampled_task_scheduler_last_run_invalidated_power(integrator.scheduler) &&
+            _emt_task_scheduler_invalidated_power(integrator.scheduler) &&
             _invalidate_emt_hybrid_power_history!(integrator.workspace.runtime.context)
         commit_emt_step_transaction!(integrator.transaction)
         return (event_count = event_count, task_count = task_count)
@@ -850,10 +962,7 @@ function _emt_hybrid_apply_boundary_actions!(
         _emt_hybrid_restore_if_active!(integrator)
         copyto!(integrator.surface_fired, fired_before)
         resize!(integrator.occurrences, occurrence_count_before)
-        resize!(integrator.scheduler.occurrences, scheduler_occurrence_count_before)
-        integrator.scheduler.last_run_power_history_invalidating =
-            scheduler_invalidation_before
-        _restore_emt_hybrid_task_states!(integrator, task_states_before)
+        _restore_emt_task_scheduler!(integrator.scheduler, scheduler_before)
         integrator.topology_invalidation_count = topology_count_before
         integrator.last_global_step_event_count = step_event_count_before
         integrator.workspace.ready = workspace_ready_before
@@ -892,13 +1001,13 @@ function _emt_hybrid_next_boundary(
 )
     tolerance = integrator.policy.simultaneity_tolerance_s
     boundary = endpoint_time_s
-    if !isempty(integrator.scheduler.tasks) &&
+    if !_emt_task_scheduler_empty(integrator.scheduler) &&
        endpoint_time_s > left_time_s + tolerance
-        task_time = next_sampled_task_time(
+        task_time = _emt_next_task_time(
             integrator.scheduler,
             left_time_s + tolerance,
-            endpoint_time_s;
-            tolerance_s = tolerance,
+            endpoint_time_s,
+            tolerance,
         )
         isfinite(task_time) && task_time > left_time_s + tolerance &&
             (boundary = min(boundary, task_time))
@@ -989,7 +1098,7 @@ function _advance_emt_hybrid_step_impl!(integrator::EMTHybridStepIntegrator)
     integrator.completed && return integrator
     workspace = integrator.workspace
     context = workspace.runtime.context
-    if isempty(integrator.surfaces) && isempty(integrator.scheduler.tasks)
+    if isempty(integrator.surfaces) && _emt_task_scheduler_empty(integrator.scheduler)
         context.dt_s = integrator.nominal_dt_s
         _advance_prepared_emt_step!(
             workspace.runtime;
@@ -1157,12 +1266,14 @@ end
 
 function emt_hybrid_execution_status(integrator::EMTHybridStepIntegrator)
     transaction = emt_step_transaction_status(integrator.transaction)
+    status_scheduler = integrator.scheduler isa ExactSampledTaskCompatibilityAdapter ?
+        integrator.scheduler.scheduler : integrator.scheduler
     sampled_controls = [
-        task for task in integrator.scheduler.tasks
+        task for task in status_scheduler.tasks
         if task isa ExactSampledControlTask
     ]
     pwm_tasks = [
-        task for task in integrator.scheduler.tasks
+        task for task in status_scheduler.tasks
         if task isa ExactPWMTask
     ]
     return (
@@ -1173,7 +1284,9 @@ function emt_hybrid_execution_status(integrator::EMTHybridStepIntegrator)
         provisional_interval_count = integrator.provisional_interval_count,
         localized_root_count = integrator.localized_root_count,
         event_count = length(integrator.occurrences),
-        sampled_task_execution_count = length(integrator.scheduler.occurrences),
+        sampled_task_execution_count = _emt_task_scheduler_occurrence_count(
+            integrator.scheduler,
+        ),
         sampled_control_sample_count = sum(
             task -> task.sample_count,
             sampled_controls;

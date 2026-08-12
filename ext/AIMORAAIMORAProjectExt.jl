@@ -7,6 +7,23 @@ import AIMORA.NativeExtensions: ExtensionFailure,
                                 ExtensionIdentity,
                                 extension_identity,
                                 resolve_extension
+import AIMORA.EMTTaskPlatform: CarrierEMTTask,
+                               ConverterControlEMTTask,
+                               EMTLogicalTime,
+                               EMTTaskEffect,
+                               EMTTaskFamily,
+                               EMTTaskSpec,
+                               InterfaceEMTTask,
+                               InvalidateEMTInterface,
+                               InvalidateEMTOutput,
+                               InvalidateEMTPowerHistory,
+                               InvalidateEMTTopology,
+                               MechanicalEMTTask,
+                               ProtectionEMTTask,
+                               SourceEMTTask,
+                               ThermalEMTTask,
+                               UserDefinedEMTTask,
+                               emt_task_spec
 
 const PROJECT_SERVICE_TO_RUNTIME = Dict(
     AIMORAProject.ExtensionInitializationService => :initialize,
@@ -21,6 +38,59 @@ const PROJECT_SERVICE_TO_RUNTIME = Dict(
     AIMORAProject.ExtensionCheckpointService => :checkpoint,
     AIMORAProject.ExtensionReusableDefinitionService => :reusable_definition,
 )
+
+const PROJECT_TASK_FAMILY_TO_ENGINE = Dict{AIMORAProject.ControlTaskFamily,EMTTaskFamily}(
+    AIMORAProject.ProtectionControlTask => ProtectionEMTTask,
+    AIMORAProject.CarrierControlTask => CarrierEMTTask,
+    AIMORAProject.ConverterControlTask => ConverterControlEMTTask,
+    AIMORAProject.MechanicalControlTask => MechanicalEMTTask,
+    AIMORAProject.SourceControlTask => SourceEMTTask,
+    AIMORAProject.ThermalControlTask => ThermalEMTTask,
+    AIMORAProject.InterfaceControlTask => InterfaceEMTTask,
+    AIMORAProject.UserDefinedControlTask => UserDefinedEMTTask,
+)
+
+const PROJECT_TASK_EFFECT_TO_ENGINE = Dict{AIMORAProject.ControlTaskInvalidation,EMTTaskEffect}(
+    AIMORAProject.InvalidateControlPowerHistory => InvalidateEMTPowerHistory,
+    AIMORAProject.InvalidateControlTopology => InvalidateEMTTopology,
+    AIMORAProject.InvalidateControlInterface => InvalidateEMTInterface,
+    AIMORAProject.InvalidateControlOutput => InvalidateEMTOutput,
+)
+
+function _project_logical_time(
+    project::AIMORAProject.CanonicalProject,
+    value::AIMORAProject.PhysicalValue{AIMORAProject.ScalarQuantity},
+)
+    quantity = AIMORAProject.convert_quantity(
+        project.units,
+        value.quantity,
+        AIMORAProject.UnitId("s"),
+    )
+    rational = AIMORAProject.exact_rational(quantity.value)
+    return EMTLogicalTime(rational.numerator, rational.denominator)
+end
+
+"""Resolve one inert Project task declaration into the dependency-light public EMT task contract."""
+function emt_task_spec(
+    project::AIMORAProject.CanonicalProject,
+    declaration::AIMORAProject.ControlTaskDeclaration,
+)
+    return EMTTaskSpec(
+        declaration.task.value,
+        PROJECT_TASK_FAMILY_TO_ENGINE[declaration.family],
+        _project_logical_time(project, declaration.epoch),
+        _project_logical_time(project, declaration.period),
+        _project_logical_time(project, declaration.phase),
+        _project_logical_time(project, declaration.computational_delay);
+        priority = declaration.priority,
+        read_resources = getfield.(collect(declaration.read_resources), :value),
+        write_resources = getfield.(collect(declaration.write_resources), :value),
+        predecessors = getfield.(collect(declaration.predecessors), :value),
+        effects = EMTTaskEffect[
+            PROJECT_TASK_EFFECT_TO_ENGINE[effect] for effect in declaration.invalidations
+        ],
+    )
+end
 
 function extension_identity(declaration::AIMORAProject.ExtensionDeclaration)
     implementation = declaration.implementation
