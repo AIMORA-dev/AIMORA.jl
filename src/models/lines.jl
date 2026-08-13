@@ -10,5 +10,6 @@ include(joinpath(@__DIR__, "lines", "cable_geometry.jl"))
 include(joinpath(@__DIR__, "lines", "cable_impedance.jl"))
 include(joinpath(@__DIR__, "lines", "overhead_line_constants.jl"))
 include(joinpath(@__DIR__, "lines", "nested_cable_matrices.jl"))
+include(joinpath(@__DIR__, "lines", "wideband_parameters.jl"))
 
 end
