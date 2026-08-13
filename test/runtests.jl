@@ -776,5 +776,6 @@ else
 end
 
 if AIMORA.solver_available()
+    include("extended_power_semiconductor_fidelity.jl")
     include("performance.jl")
 end

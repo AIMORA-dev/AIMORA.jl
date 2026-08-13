@@ -30,11 +30,18 @@ export AbstractNonlinearCurrentDevice,
        NonlinearSolveDiagnostics,
        NonlinearSolveFailure,
        NonlinearSolveResult,
+       NonlinearDeviceEventSurface,
        nonlinear_device_formulation,
        nonlinear_device_provenance,
        nonlinear_terminal_nodes,
        nonlinear_current_jacobian!,
+       prepare_nonlinear_device_step!,
        accept_nonlinear_device_state!,
+       finish_nonlinear_device_step!,
+       nonlinear_device_event_surfaces,
+       nonlinear_device_event_value,
+       nonlinear_device_event_candidate_time,
+       apply_nonlinear_device_event!,
        classify_numerical_chatter,
        validate_nonlinear_solve_options,
        nonlinear_result_accepted
@@ -121,6 +128,19 @@ function nonlinear_current_jacobian!(
     ))
 end
 
+"""Prepare one non-mutating nonlinear companion evaluation for an exact candidate substep.
+
+Stateful devices may cache only candidate-step metadata here. The surrounding solver transaction owns rollback, and physical state is accepted only through `accept_nonlinear_device_state!` after network convergence.
+"""
+function prepare_nonlinear_device_step!(
+    device::AbstractNonlinearCurrentDevice,
+    time_s::Float64,
+    step_s::Float64,
+    companion_method::Symbol,
+)
+    return nothing
+end
+
 """Accept device state only after the coupled network solution has converged; stateless devices use the default no-op."""
 function accept_nonlinear_device_state!(
     device::AbstractNonlinearCurrentDevice,
@@ -129,6 +149,118 @@ function accept_nonlinear_device_state!(
     time_s::Float64,
 )
     return nothing
+end
+
+"""Accept state with the converged terminal Jacobian when a device can reuse its final constitutive evaluation."""
+function accept_nonlinear_device_state!(
+    device::AbstractNonlinearCurrentDevice,
+    terminal_voltage_v::AbstractVector{Float64},
+    terminal_current_a::AbstractVector{Float64},
+    terminal_jacobian_s::AbstractMatrix{Float64},
+    time_s::Float64,
+)
+    return accept_nonlinear_device_state!(
+        device,
+        terminal_voltage_v,
+        terminal_current_a,
+        time_s,
+    )
+end
+"""Finish one accepted nonlinear-device substep after every device has accepted coupled state."""
+function finish_nonlinear_device_step!(device::AbstractNonlinearCurrentDevice)
+    return nothing
+end
+
+"""One solver-neutral, directed event surface owned by a nonlinear physical device.
+
+`value` and `candidate_time` must be pure reads of the accepted or transactionally
+probed device state. `transition` may mutate only the device and is called only
+after the network has accepted the localized left substep. A candidate time is an
+analytic hard boundary; a missing candidate is localized from directed endpoint
+values by the private solver.
+"""
+struct NonlinearDeviceEventSurface{V,T,C}
+    name::Symbol
+    direction::Symbol
+    priority::Int
+    topology_invalidating::Bool
+    value::V
+    transition::T
+    candidate_time::C
+
+    function NonlinearDeviceEventSurface(
+        name::Symbol,
+        value::V,
+        transition::T;
+        direction::Symbol=:any,
+        priority::Integer=0,
+        topology_invalidating::Bool=false,
+        candidate_time::C=(_device -> nothing),
+    ) where {V,T,C}
+        name == Symbol("") && throw(ArgumentError(
+            "nonlinear-device event name must not be empty",
+        ))
+        direction in (:falling, :any, :rising) || throw(ArgumentError(
+            "nonlinear-device event direction must be :falling, :any, or :rising",
+        ))
+        return new{V,T,C}(
+            name,
+            direction,
+            Int(priority),
+            topology_invalidating,
+            value,
+            transition,
+            candidate_time,
+        )
+    end
+end
+
+"""Return the stable-priority event surfaces currently admitted by a device."""
+nonlinear_device_event_surfaces(::AbstractNonlinearCurrentDevice) = ()
+
+function nonlinear_device_event_value(
+    surface::NonlinearDeviceEventSurface,
+    device,
+    time_s::Real,
+)
+    time = Float64(time_s)
+    isfinite(time) || throw(ArgumentError(
+        "nonlinear-device event evaluation time must be finite",
+    ))
+    raw_value = applicable(surface.value, device, time) ?
+        surface.value(device, time) : surface.value(device)
+    raw_value === nothing && return nothing
+    value = Float64(raw_value)
+    isfinite(value) || throw(ArgumentError(
+        "nonlinear-device event $(surface.name) returned a non-finite value",
+    ))
+    return value
+end
+
+function nonlinear_device_event_candidate_time(
+    surface::NonlinearDeviceEventSurface,
+    device,
+)
+    raw_time = surface.candidate_time(device)
+    raw_time === nothing && return nothing
+    time = Float64(raw_time)
+    isfinite(time) || throw(ArgumentError(
+        "nonlinear-device event $(surface.name) returned a non-finite candidate time",
+    ))
+    return time
+end
+
+function apply_nonlinear_device_event!(
+    surface::NonlinearDeviceEventSurface,
+    device,
+    time_s::Real,
+)
+    time = Float64(time_s)
+    isfinite(time) || throw(ArgumentError(
+        "nonlinear-device event transition time must be finite",
+    ))
+    surface.transition(device, time)
+    return surface
 end
 
 function _validate_two_terminal_nodes(positive_node::Integer, negative_node::Integer)

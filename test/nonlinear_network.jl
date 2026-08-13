@@ -215,10 +215,10 @@ if AIMORA.solver_available()
         step_s::Float64,
     ) = nothing
 
-    mutable struct TimeLimitedLinearCurrentBranch <: AbstractNonlinearCurrentDevice
+    mutable struct TimeLimitedLinearCurrentBranch{F} <: AbstractNonlinearCurrentDevice
         positive_node::Int
         negative_node::Int
-        failure_time_s::Float64
+        failure_time_s::F
         accepted_state_count::Int
     end
 
@@ -241,7 +241,9 @@ if AIMORA.solver_available()
         terminal_voltage_v::AbstractVector{Float64},
         time_s::Float64,
     )
-        conductance = time_s >= device.failure_time_s ? NaN : 0.1
+        failure_time_s = device.failure_time_s isa Function ?
+            Float64(device.failure_time_s()) : Float64(device.failure_time_s)
+        conductance = time_s >= failure_time_s ? NaN : 0.1
         branch_current = conductance * (terminal_voltage_v[1] - terminal_voltage_v[2])
         terminal_current_a[1] = branch_current
         terminal_current_a[2] = -branch_current
@@ -254,6 +256,54 @@ if AIMORA.solver_available()
 
     function AIMORA.NonlinearNetwork.accept_nonlinear_device_state!(
         device::TimeLimitedLinearCurrentBranch,
+        terminal_voltage_v::AbstractVector{Float64},
+        terminal_current_a::AbstractVector{Float64},
+        time_s::Float64,
+    )
+        device.accepted_state_count += 1
+        return nothing
+    end
+
+    mutable struct ToggleableFailureCurrentBranch <: AbstractNonlinearCurrentDevice
+        positive_node::Int
+        negative_node::Int
+        failure_enabled::Base.RefValue{Bool}
+        failure_time_s::Float64
+        accepted_state_count::Int
+    end
+
+    AIMORA.NonlinearNetwork.nonlinear_terminal_nodes(
+        device::ToggleableFailureCurrentBranch,
+    ) = (device.positive_node, device.negative_node)
+
+    AIMORA.NonlinearNetwork.nonlinear_device_formulation(
+        ::ToggleableFailureCurrentBranch,
+    ) = PhysicalConstitutiveCurrent
+
+    AIMORA.NonlinearNetwork.nonlinear_device_provenance(
+        ::ToggleableFailureCurrentBranch,
+    ) = synthetic_physical_parameter_provenance()
+
+    function AIMORA.NonlinearNetwork.nonlinear_current_jacobian!(
+        terminal_current_a::AbstractVector{Float64},
+        terminal_jacobian_s::AbstractMatrix{Float64},
+        device::ToggleableFailureCurrentBranch,
+        terminal_voltage_v::AbstractVector{Float64},
+        time_s::Float64,
+    )
+        conductance = device.failure_enabled[] && time_s >= device.failure_time_s ? NaN : 0.1
+        branch_current = conductance * (terminal_voltage_v[1] - terminal_voltage_v[2])
+        terminal_current_a[1] = branch_current
+        terminal_current_a[2] = -branch_current
+        terminal_jacobian_s[1, 1] = conductance
+        terminal_jacobian_s[1, 2] = -conductance
+        terminal_jacobian_s[2, 1] = -conductance
+        terminal_jacobian_s[2, 2] = conductance
+        return nothing
+    end
+
+    function AIMORA.NonlinearNetwork.accept_nonlinear_device_state!(
+        device::ToggleableFailureCurrentBranch,
         terminal_voltage_v::AbstractVector{Float64},
         terminal_current_a::AbstractVector{Float64},
         time_s::Float64,
@@ -306,6 +356,74 @@ if AIMORA.solver_available()
     )
         device.accepted_state_count += 1
         error("deliberate nonlinear device acceptance failure")
+    end
+
+    mutable struct TimedEventCurrentBranch <: AbstractNonlinearCurrentDevice
+        positive_node::Int
+        negative_node::Int
+        event_time_s::Float64
+        priority::Int
+        event_count::Int
+        accepted_state_count::Int
+        last_event_time_s::Float64
+    end
+
+    AIMORA.NonlinearNetwork.nonlinear_terminal_nodes(
+        device::TimedEventCurrentBranch,
+    ) = (device.positive_node, device.negative_node)
+
+    AIMORA.NonlinearNetwork.nonlinear_device_formulation(
+        ::TimedEventCurrentBranch,
+    ) = PhysicalConstitutiveCurrent
+
+    AIMORA.NonlinearNetwork.nonlinear_device_provenance(
+        ::TimedEventCurrentBranch,
+    ) = synthetic_physical_parameter_provenance()
+
+    function AIMORA.NonlinearNetwork.nonlinear_current_jacobian!(
+        terminal_current_a::AbstractVector{Float64},
+        terminal_jacobian_s::AbstractMatrix{Float64},
+        ::TimedEventCurrentBranch,
+        terminal_voltage_v::AbstractVector{Float64},
+        time_s::Float64,
+    )
+        conductance_s = 0.1
+        branch_current_a = conductance_s *
+            (terminal_voltage_v[1] - terminal_voltage_v[2])
+        terminal_current_a .= (branch_current_a, -branch_current_a)
+        terminal_jacobian_s .= [
+            conductance_s -conductance_s
+            -conductance_s conductance_s
+        ]
+        return nothing
+    end
+
+    function AIMORA.NonlinearNetwork.accept_nonlinear_device_state!(
+        device::TimedEventCurrentBranch,
+        terminal_voltage_v::AbstractVector{Float64},
+        terminal_current_a::AbstractVector{Float64},
+        time_s::Float64,
+    )
+        device.accepted_state_count += 1
+        return nothing
+    end
+
+    function AIMORA.NonlinearNetwork.nonlinear_device_event_surfaces(
+        device::TimedEventCurrentBranch,
+    )
+        device.event_count == 0 || return ()
+        event_time_s = device.event_time_s
+        return (NonlinearDeviceEventSurface(
+            :timed_test_transition,
+            (_owner, time_s) -> event_time_s - time_s,
+            (owner, time_s) -> begin
+                owner.event_count += 1
+                owner.last_event_time_s = time_s
+            end;
+            direction=:falling,
+            priority=device.priority,
+            candidate_time=owner -> owner.event_time_s,
+        ),)
     end
 
     struct DuplicateTerminalCurrentBranch <: AbstractNonlinearCurrentDevice end
@@ -737,6 +855,90 @@ if AIMORA.solver_available()
             rollback_result.diagnostics.residual_history,
             :substep_index,
         )) == [1, 2]
+
+        timed_event = TimedEventCurrentBranch(1, 0, 0.4, 10, 0, 0, -Inf)
+        simultaneous_event = TimedEventCurrentBranch(1, 0, 0.4, 20, 0, 0, -Inf)
+        event_linear = NodalSystem(
+            1,
+            [CurrentInjection(1, _time_s -> 1.0)],
+        )
+        event_system = NonlinearNodalSystem(
+            event_linear,
+            [timed_event, simultaneous_event];
+            scales=NonlinearNetworkScales(
+                [1.0],
+                [1.0],
+                Float64[],
+                Float64[],
+            ),
+        )
+        event_result = advance_nonlinear_step!(event_system, 1.0, 1.0)
+        @test event_result.accepted
+        @test event_result.diagnostics.discontinuity_reason == :localized_event
+        @test event_result.diagnostics.companion_method == :localized_event_split
+        @test event_result.diagnostics.accepted_substep_count == 2
+        @test timed_event.event_count == 1
+        @test simultaneous_event.event_count == 1
+        @test timed_event.last_event_time_s == 0.4
+        @test simultaneous_event.last_event_time_s == 0.4
+        @test timed_event.accepted_state_count == 2
+        @test simultaneous_event.accepted_state_count == 2
+
+        rejected_event = TimedEventCurrentBranch(1, 0, 0.4, 10, 0, 0, -Inf)
+        post_event_failure = TimeLimitedLinearCurrentBranch(1, 0, 0.75, 0)
+        rejected_event_linear = NodalSystem(
+            1,
+            [CurrentInjection(1, _time_s -> 1.0)],
+        )
+        rejected_event_system = NonlinearNodalSystem(
+            rejected_event_linear,
+            [rejected_event, post_event_failure];
+            scales=NonlinearNetworkScales(
+                [1.0],
+                [1.0],
+                Float64[],
+                Float64[],
+            ),
+        )
+        rejected_event_voltage = copy(rejected_event_linear.v)
+        rejected_event_result = advance_nonlinear_step!(
+            rejected_event_system,
+            1.0,
+            1.0,
+        )
+        @test !rejected_event_result.accepted
+        @test rejected_event_result.failure.code == :nonfinite_device_current
+        @test rejected_event_linear.v == rejected_event_voltage
+        @test rejected_event.event_count == 0
+        @test rejected_event.accepted_state_count == 0
+        @test post_event_failure.accepted_state_count == 0
+
+        retry_event = TimedEventCurrentBranch(1, 0, 0.4, 10, 0, 0, -Inf)
+        retry_failure_time_s = Ref(0.75)
+        retry_failure = TimeLimitedLinearCurrentBranch(
+            1,
+            0,
+            () -> retry_failure_time_s[],
+            0,
+        )
+        retry_event_system = NonlinearNodalSystem(
+            NodalSystem(1, [CurrentInjection(1, _time_s -> 1.0)]),
+            [retry_event, retry_failure];
+            scales=NonlinearNetworkScales(
+                [1.0],
+                [1.0],
+                Float64[],
+                Float64[],
+            ),
+        )
+        first_retry_result = advance_nonlinear_step!(retry_event_system, 1.0, 1.0)
+        @test !first_retry_result.accepted
+        @test retry_event.event_count == 0
+        retry_failure_time_s[] = Inf
+        second_retry_result = advance_nonlinear_step!(retry_event_system, 1.0, 1.0)
+        @test second_retry_result.accepted
+        @test retry_event.event_count == 1
+        @test retry_event.last_event_time_s == 0.4
 
         rlc_branch = SeriesRLCBranch(1, 0, 0.2, 2.0e-3, 200.0e-6)
         discontinuity_linear = NodalSystem(
