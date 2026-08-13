@@ -1,4 +1,5 @@
 import ..Branches
+import ..BridgeTopologies
 import ..Nodal
 import ..Nonlinear
 import ..OVER16TimestepIntegration

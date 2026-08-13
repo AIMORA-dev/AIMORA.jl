@@ -4,6 +4,8 @@ using ..StudyCore: ContractQuantity,
                    DynamicStateInventory,
                    ModelValidityDomain,
                    NumericDomainBound,
+                   ParameterProvenance,
+                   PhysicalModelParameter,
                    ScientificModelContract,
                    SwitchingDetailed,
                    assess_validity,
@@ -556,5 +558,7 @@ function compute_grid_following_current_control!(
         saturated,
     )
 end
+
+include(joinpath(@__DIR__, "vsc", "extended_control_filter_platform.jl"))
 
 end

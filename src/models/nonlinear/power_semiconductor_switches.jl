@@ -1563,8 +1563,14 @@ function _power_semiconductor_dynamic_current_jacobian(
             junction,
             voltage_v,
         )
-        current_a += (charge - junction.previous_charge_c) / step_s
-        jacobian_s += capacitance / step_s
+        if fidelity.candidate_method === :trapezoidal
+            current_a += 2.0 * (charge - junction.previous_charge_c) / step_s -
+                junction.last_displacement_current_a
+            jacobian_s += 2.0 * capacitance / step_s
+        else
+            current_a += (charge - junction.previous_charge_c) / step_s
+            jacobian_s += capacitance / step_s
+        end
     end
     tail = fidelity.turn_off_tail
     if tail !== nothing && tail.active
@@ -1696,6 +1702,15 @@ function _accept_power_semiconductor_state!(
         "accepted power-semiconductor current and time must be finite",
     ))
     step_s = fidelity.candidate_step_s
+    previous_terminal_voltage_v = fidelity.previous_terminal_voltage_v
+    previous_terminal_current_a = fidelity.previous_terminal_current_a
+    previous_snubber_current_a = device.snubber === nothing ? 0.0 :
+        device.snubber.last_current_a
+    previous_snubber_stored_energy_j = device.snubber === nothing ? 0.0 :
+        0.5 * device.snubber.capacitance_f * device.snubber.capacitor_voltage_v^2
+    previous_snubber_dissipated_energy_j = device.snubber === nothing ? 0.0 :
+        device.snubber.dissipated_energy_j
+    previous_semiconductor_loss_w = device.previous_semiconductor_loss_w
     channel_current_a, channel_jacobian_s =
         _power_semiconductor_channel_current_jacobian(device, voltage_v)
     tail = fidelity.turn_off_tail
@@ -1712,6 +1727,14 @@ function _accept_power_semiconductor_state!(
     junction = fidelity.junction_charge
     if junction !== nothing
         previous_charge_c = junction.previous_charge_c
+        previous_voltage_v = junction.previous_voltage_v
+        previous_energy_j = power_semiconductor_junction_stored_energy(
+            junction,
+            previous_voltage_v,
+        )
+        previous_displacement_current_a = junction.last_displacement_current_a
+        displacement_current_a = current_a - channel_current_a -
+            accepted_tail_current_a - snubber_current_a
         if terminal_jacobian_s === nothing
             charge, capacitance = _power_semiconductor_junction_charge_capacitance(
                 junction,
@@ -1721,22 +1744,40 @@ function _accept_power_semiconductor_state!(
             size(terminal_jacobian_s) == (2, 2) || throw(DimensionMismatch(
                 "power semiconductor requires a two-by-two accepted terminal Jacobian",
             ))
-            capacitance = (
+            dynamic_jacobian_s = (
                 terminal_jacobian_s[1, 1] -
                 channel_jacobian_s -
                 snubber_jacobian_s
-            ) * step_s
-            charge = previous_charge_c + (
-                current_a - channel_current_a -
-                accepted_tail_current_a - snubber_current_a
-            ) * step_s
+            )
+            if fidelity.candidate_method === :trapezoidal
+                capacitance = 0.5 * dynamic_jacobian_s * step_s
+                charge = previous_charge_c + 0.5 * step_s * (
+                    junction.last_displacement_current_a + displacement_current_a
+                )
+            else
+                capacitance = dynamic_jacobian_s * step_s
+                charge = previous_charge_c + step_s * displacement_current_a
+            end
         end
         junction.previous_voltage_v = voltage_v
         junction.previous_charge_c = charge
         junction.last_capacitance_f = capacitance
         junction.last_charge_c = charge
-        junction.last_displacement_current_a =
-            (charge - previous_charge_c) / step_s
+        junction.last_displacement_current_a = displacement_current_a
+        current_energy_j = power_semiconductor_junction_stored_energy(
+            junction,
+            voltage_v,
+        )
+        junction_work_j = if fidelity.candidate_method === :trapezoidal
+            0.5 * step_s * (
+                previous_voltage_v * previous_displacement_current_a +
+                voltage_v * displacement_current_a
+            )
+        else
+            step_s * voltage_v * displacement_current_a
+        end
+        fidelity.companion_energy_residual_j +=
+            junction_work_j - (current_energy_j - previous_energy_j)
     end
     recovery = fidelity.recovered_charge
     if recovery !== nothing
@@ -1823,10 +1864,37 @@ function _accept_power_semiconductor_state!(
         instantaneous_loss_w,
         step_s,
     )
+    device.semiconductor_dissipated_energy_j += 0.5 * step_s * (
+        previous_semiconductor_loss_w + instantaneous_loss_w
+    ) + event_energy_j
+    previous_junction_current_a = junction === nothing ? 0.0 :
+        previous_displacement_current_a
+    channel_work_j = 0.5 * step_s * (
+        previous_terminal_voltage_v * (
+            previous_terminal_current_a - previous_junction_current_a -
+            previous_snubber_current_a
+        ) +
+        voltage_v * (channel_current_a + tail_current_a)
+    )
+    semiconductor_energy_increment_j = 0.5 * step_s * (
+        previous_semiconductor_loss_w + instantaneous_loss_w
+    ) + event_energy_j
+    fidelity.companion_energy_residual_j +=
+        channel_work_j - semiconductor_energy_increment_j
+    if device.snubber !== nothing
+        snubber = device.snubber
+        snubber_work_j = 0.5 * step_s * (
+            previous_terminal_voltage_v * previous_snubber_current_a +
+            voltage_v * snubber.last_current_a
+        )
+        snubber_stored_energy_j =
+            0.5 * snubber.capacitance_f * snubber.capacitor_voltage_v^2
+        fidelity.companion_energy_residual_j += snubber_work_j -
+            (snubber.dissipated_energy_j - previous_snubber_dissipated_energy_j) -
+            (snubber_stored_energy_j - previous_snubber_stored_energy_j)
+    end
     device.last_semiconductor_loss_w = instantaneous_loss_w
     device.previous_semiconductor_loss_w = instantaneous_loss_w
-    device.semiconductor_dissipated_energy_j += step_s * instantaneous_loss_w +
-        event_energy_j
     fidelity.previous_terminal_voltage_v = voltage_v
     fidelity.previous_terminal_current_a = current_a
     fidelity.accepted_topology_transition_count = device.topology_transition_count
@@ -1951,6 +2019,27 @@ end
 power_semiconductor_has_extended_fidelity(device::PowerSemiconductorSwitch) =
     device.extended_fidelity !== nothing
 
+function initialize_power_semiconductor_junction_state!(
+    device::PowerSemiconductorSwitch,
+    voltage_v::Real,
+)
+    fidelity = something(device.extended_fidelity)
+    junction = something(fidelity.junction_charge)
+    voltage = Float64(voltage_v)
+    charge, capacitance = _power_semiconductor_junction_charge_capacitance(
+        junction,
+        voltage,
+    )
+    junction.previous_voltage_v = voltage
+    junction.previous_charge_c = charge
+    junction.last_capacitance_f = capacitance
+    junction.last_charge_c = charge
+    junction.last_displacement_current_a = 0.0
+    fidelity.companion_energy_residual_j = 0.0
+    fidelity.previous_terminal_voltage_v = voltage
+    return device
+end
+
 function _activate_power_semiconductor_tail!(
     device::PowerSemiconductorSwitch,
     time_s::Float64,
@@ -2016,6 +2105,7 @@ function power_semiconductor_extended_state(device::PowerSemiconductorSwitch)
         junction === nothing ? 0.0 : junction.last_displacement_current_a,
         junction === nothing ? 0.0 :
             power_semiconductor_junction_stored_energy(junction, junction.last_charge_c == junction.previous_charge_c ? junction.previous_voltage_v : device.last_voltage),
+        fidelity.companion_energy_residual_j,
         tail === nothing ? false : tail.active,
         tail === nothing ? 0.0 : tail.current_a,
         tail === nothing ? 0 : tail.cutoff_event_count,

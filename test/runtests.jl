@@ -6,6 +6,7 @@ using Printf
 include("nonlinear_network.jl")
 include("native_extensions.jl")
 include("emt_task_platform.jl")
+include("extended_vsc_control_filter_platform.jl")
 
 @testset "public package isolation" begin
     for module_name in (

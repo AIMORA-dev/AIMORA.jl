@@ -27,6 +27,7 @@ struct PowerSemiconductorBridgeTopologyState
     passive_dissipated_power_w::Float64
     stored_energy_j::Float64
     dissipated_energy_j::Float64
+    companion_energy_residual_j::Float64
     blocked::Bool
     position_faults::Vector{PowerSemiconductorTopologyFault}
     transition_count::Int
@@ -498,6 +499,11 @@ function power_semiconductor_bridge_topology_state(
                 (power_semiconductor_has_extended_fidelity(valve) ?
                     power_semiconductor_extended_state(valve).junction_stored_energy_j : 0.0)
         end, bridge.valves; init=0.0)
+    companion_energy_residual = sum(bridge.valves; init=0.0) do valve
+        power_semiconductor_has_extended_fidelity(valve) ?
+            power_semiconductor_extended_state(valve).
+                companion_energy_residual_j : 0.0
+    end
     terminal_power = sum(terminal_voltage .* terminal_current)
     kcl_residual = sum(terminal_current)
     signature = _bridge_topology_state_signature(topology_signature, requested, applied,
@@ -525,6 +531,7 @@ function power_semiconductor_bridge_topology_state(
         passive_loss,
         stored_energy,
         semiconductor_dissipated_energy + bridge.dissipated_energy_j,
+        companion_energy_residual,
         bridge.blocked,
         copy(bridge.position_faults),
         bridge.transition_count + sum(power_semiconductor_bridge_topology_transition_count,

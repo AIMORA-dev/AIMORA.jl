@@ -59,10 +59,15 @@ using ..Lines: distributed_transposed_line_modal_timestep_update!,
                line_step_response_exponential_fit,
                pole_residue_transfer_value
 using ..Nodal
-using ..NonlinearNetwork: NonlinearChatterDecision, NonlinearSolveDiagnostics
+using ..NonlinearNetwork: NonlinearChatterDecision,
+                          NonlinearNetworkScales,
+                          NonlinearSolveDiagnostics
 using ..NonlinearNodal: NonlinearNodalSystem,
                         advance_nonlinear_step!,
-                        nonlinear_linear_system
+                        nonlinear_nodal_checkpoint,
+                        nonlinear_linear_system,
+                        restore_nonlinear_nodal_checkpoint!,
+                        solve_nonlinear_algebraic_state!
 using ..Sources: AnalyticSourceSignal,
                  SinusoidalSourceSignal,
                  sinusoidal_source_peak_phasor

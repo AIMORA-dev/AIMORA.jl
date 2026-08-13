@@ -872,6 +872,7 @@ mutable struct PowerSemiconductorExtendedFidelity
     candidate_prepared::Bool
     previous_terminal_voltage_v::Float64
     previous_terminal_current_a::Float64
+    companion_energy_residual_j::Float64
     accepted_topology_transition_count::Int
     pending_event_current_a::Float64
     pending_event_blocking_voltage_v::Float64
@@ -915,6 +916,7 @@ function PowerSemiconductorExtendedFidelity(;
         false,
         junction_charge === nothing ? 0.0 : junction_charge.previous_voltage_v,
         0.0,
+        0.0,
         0,
         0.0,
         0.0,
@@ -939,6 +941,7 @@ struct PowerSemiconductorExtendedState
     junction_charge_c::Float64
     displacement_current_a::Float64
     junction_stored_energy_j::Float64
+    companion_energy_residual_j::Float64
     tail_active::Bool
     tail_current_a::Float64
     tail_cutoff_event_count::Int
