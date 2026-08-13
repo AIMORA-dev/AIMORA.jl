@@ -1198,7 +1198,8 @@ function _emt_unsupported_initialization_owners(
     elements = parsed.elements
     unsupported = Symbol[]
     any(element -> element isa PowerSemiconductorSwitch ||
-        element isa PowerSemiconductorBridgeLeg, elements) &&
+        element isa PowerSemiconductorBridgeLeg ||
+        element isa PowerSemiconductorBridgeTopology, elements) &&
         push!(unsupported, :switch_detailed_periodic_prehistory)
     isempty(DeckParser.deck_universal_machine_definition_rows(parsed)) ||
         push!(unsupported, :universal_machine_state)

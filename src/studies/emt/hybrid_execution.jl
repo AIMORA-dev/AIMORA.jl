@@ -150,6 +150,11 @@ struct PowerSemiconductorBridgePoleCommand
     element_name::Symbol
 end
 
+"""A scheduler callback that routes an exact ordered gate-state request to one bridge topology aggregate."""
+struct PowerSemiconductorTopologyGateCommand
+    element_name::Symbol
+end
+
 function (command::PowerSemiconductorGateCommand)(
     owner::EMTHybridCallbackOwner,
     commanded_on::Bool,
@@ -166,6 +171,25 @@ function (command::PowerSemiconductorGateCommand)(
         "gate target $(command.element_name) is not a power-semiconductor device",
     ))
     request_power_semiconductor_gate!(device, commanded_on, time_s)
+    return nothing
+end
+
+function (command::PowerSemiconductorTopologyGateCommand)(
+    owner::EMTHybridCallbackOwner,
+    requested_state::AbstractVector{Bool},
+    time_s::Real,
+    _activation_index::Int,
+)
+    context = owner.runtime.context
+    element_index = findfirst(==(command.element_name), context.element_names)
+    element_index === nothing && throw(ArgumentError(
+        "power-semiconductor topology target $(command.element_name) is absent from the EMT runtime",
+    ))
+    bridge = context.system.elements[element_index]
+    bridge isa PowerSemiconductorBridgeTopology || throw(ArgumentError(
+        "bridge target $(command.element_name) is not a power-semiconductor topology aggregate",
+    ))
+    request_power_semiconductor_topology_gates!(bridge, requested_state, time_s)
     return nothing
 end
 
@@ -428,6 +452,38 @@ function _emt_hybrid_device_surfaces(workspace::EMTStudyWorkspace)
                         _emt_hybrid_element(owner, index),
                         position,
                     ),
+                )
+            end
+        elseif element isa PowerSemiconductorBridgeTopology
+            power_semiconductor_event_localization!(element)
+            push!(
+                surfaces,
+                HybridEventSurface(
+                    Symbol(owner_name, :_gate_transition),
+                    _owner -> nothing,
+                    (owner, time_s) -> apply_power_semiconductor_bridge_gate_transitions!(
+                        _emt_hybrid_element(owner, index),
+                        time_s,
+                    );
+                    direction = HYBRID_EVENT_RISING,
+                    priority = -15,
+                    topology_invalidating = true,
+                    repeatable = true,
+                    candidate_time = owner -> power_semiconductor_bridge_gate_transition_time(
+                        _emt_hybrid_element(owner, index),
+                    ),
+                ),
+            )
+            for (position_index, switch) in
+                enumerate(power_semiconductor_bridge_topology_valves(element))
+                position_name = element.topology.valve_positions[position_index].name
+                _append_emt_power_semiconductor_conduction_surfaces!(
+                    surfaces,
+                    Symbol(owner_name, :_, position_name),
+                    switch,
+                    owner -> power_semiconductor_bridge_topology_valves(
+                        _emt_hybrid_element(owner, index),
+                    )[position_index],
                 )
             end
         end

@@ -1,7 +1,9 @@
 
 using LinearAlgebra
+using SHA
 
 using ..Branches
+using ..BridgeTopologies
 using ..Companion
 using ..NonlinearNetwork: AbstractNonlinearCurrentDevice,
                           NonlinearParameterProvenance,
@@ -39,6 +41,12 @@ export PowerSemiconductorSwitch,
        IGBTSwitch,
        MOSFETSwitch,
        PowerSemiconductorBridgeLeg,
+       PowerSemiconductorBridgeTopology,
+       PowerSemiconductorBridgeTopologyState,
+       PowerSemiconductorTopologyFault,
+       BRIDGE_POSITION_HEALTHY,
+       BRIDGE_POSITION_STUCK_OPEN,
+       BRIDGE_POSITION_STUCK_CLOSED,
        PowerSemiconductorBridgeTerminalState,
        PowerSemiconductorBridgeGateDisposition,
        BRIDGE_GATE_ACCEPTED,
@@ -92,6 +100,15 @@ export PowerSemiconductorSwitch,
        power_semiconductor_bridge_terminal_state,
        power_semiconductor_bridge_switch,
        power_semiconductor_bridge_topology_transition_count,
+       power_semiconductor_bridge_topology_valves,
+       power_semiconductor_bridge_topology_linear_valves,
+       power_semiconductor_bridge_topology_nonlinear_valves,
+       request_power_semiconductor_topology_gates!,
+       block_power_semiconductor_topology!,
+       restart_power_semiconductor_topology!,
+       apply_power_semiconductor_topology_fault!,
+       clear_power_semiconductor_topology_fault!,
+       power_semiconductor_bridge_topology_state,
        OVER16NonlinearInverseColumnState,
        SaturableInductorBranch,
        SaturatedTransformerCharacteristicPoint,
