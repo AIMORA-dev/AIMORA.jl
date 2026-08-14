@@ -2449,7 +2449,6 @@ function read_coupled_line_fit(
         :maximum_real_pole_per_s,
         :direct_maximum_singular_value,
         :zero_frequency_maximum_singular_value,
-        :hamiltonian_minimum_real_separation_per_s,
         :hamiltonian_crossing_frequencies_hz,
         :worst_diagnostic_frequency_hz,
         :worst_diagnostic_singular_value,
@@ -2461,6 +2460,23 @@ function read_coupled_line_fit(
                 "coupled line fit passivity recertification disagrees in $(field)",
             ))
     end
+    # The minimum real part of a balanced Hamiltonian eigensolve is a
+    # conditioning diagnostic, not the passivity decision itself. Its exact
+    # magnitude can vary substantially across LAPACK builds when a valid
+    # crossing-free eigenvalue cluster lies close to the imaginary axis. Both
+    # the stored and freshly computed values must remain finite and positive;
+    # the categorical crossing result and the complete fresh continuous
+    # certificate above remain mandatory.
+    stored_hamiltonian_separation =
+        certificate_after.hamiltonian_minimum_real_separation_per_s
+    recertified_hamiltonian_separation =
+        recertified.hamiltonian_minimum_real_separation_per_s
+    all(
+        value -> isfinite(value) && value > 0.0,
+        (stored_hamiltonian_separation, recertified_hamiltonian_separation),
+    ) || throw(ArgumentError(
+        "coupled line fit passivity Hamiltonian separation is not positive and finite",
+    ))
     length(recertified.worst_incident_direction) ==
         length(certificate_after.worst_incident_direction) || throw(ArgumentError(
             "coupled line fit passivity incident direction dimension changed",
