@@ -5,6 +5,7 @@ using Printf
 
 include("nonlinear_network.jl")
 include("native_extensions.jl")
+include("coupled_line_fitting.jl")
 include("emt_task_platform.jl")
 include("extended_vsc_control_filter_platform.jl")
 

@@ -2,6 +2,7 @@ using SHA
 using TOML
 
 using ..StudyCore: ParameterProvenance, PhysicalModelParameter
+import ..CoupledLineFitting
 
 export LineParameterSource,
        LineSoilLayer,
@@ -948,6 +949,40 @@ function line_parameter_set(
         average_shunt,
         diagnostics,
         signature,
+    )
+end
+
+function CoupledLineFitting.coupled_line_terminal_response(
+    segment::LineParameterSegment;
+    reference_impedance_ohm,
+)
+    segment.kind == :mixed && throw(ArgumentError(
+        "a mixed-route line parameter segment cannot be fitted as one uniform propagation medium",
+    ))
+    fit_kind = segment.kind == :imported ? :imported_uniform : segment.kind
+    return CoupledLineFitting.coupled_line_terminal_response(
+        segment.frequencies_hz,
+        segment.series_impedance_matrices_ohm_per_m,
+        segment.shunt_admittance_matrices_s_per_m,
+        segment.length_m;
+        phase_order=segment.phase_order,
+        reference_impedance_ohm,
+        source_signature_sha256=segment.input_signature_sha256,
+        segment_id=segment.id,
+        segment_kind=fit_kind,
+    )
+end
+
+function CoupledLineFitting.coupled_line_terminal_response(
+    parameters::WidebandLineParameterSet;
+    reference_impedance_ohm,
+)
+    length(parameters.segments) == 1 || throw(ArgumentError(
+        "a mixed route must be fitted as its ordered uniform segments, not from route-average matrices",
+    ))
+    return CoupledLineFitting.coupled_line_terminal_response(
+        only(parameters.segments);
+        reference_impedance_ohm,
     )
 end
 

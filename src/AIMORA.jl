@@ -4,6 +4,7 @@ include("solver_api/backend.jl")
 
 # Public, dependency-light engineering core.
 include("core/study.jl")
+include("models/coupled_line_fitting.jl")
 include("core/validation.jl")
 include("core/inputs.jl")
 include("core/tables.jl")

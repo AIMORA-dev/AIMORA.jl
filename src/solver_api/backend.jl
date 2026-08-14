@@ -5,6 +5,7 @@ export AbstractAIMORASolverBackend,
        active_solver_backend,
        backend_metadata,
        execute_study!,
+       prepare_line_fit,
        prepare_study,
        require_solver,
        restore_backend_state!,
@@ -153,6 +154,13 @@ execute_study!(::AbstractAIMORASolverBackend, prepared) =
         message = "The active backend does not implement this prepared study contract.",
     )
 
+prepare_line_fit(::AbstractAIMORASolverBackend, request) =
+    _solver_unavailable_result(
+        :prepare_line_fit,
+        :coupled_line_fitting;
+        message = "The active backend does not implement coupled line fitting.",
+    )
+
 snapshot_backend_state(::AbstractAIMORASolverBackend, runtime) =
     _solver_unavailable_result(
         :snapshot_backend_state,
@@ -179,6 +187,13 @@ function execute_study!(prepared)
     return backend === nothing ?
            _solver_unavailable_result(:execute_study, :study_execution) :
            execute_study!(backend, prepared)
+end
+
+function prepare_line_fit(request)
+    backend = active_solver_backend()
+    return backend === nothing ?
+           _solver_unavailable_result(:prepare_line_fit, :coupled_line_fitting) :
+           prepare_line_fit(backend, request)
 end
 
 function snapshot_backend_state(runtime)
