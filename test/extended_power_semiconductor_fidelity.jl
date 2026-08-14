@@ -260,7 +260,9 @@ end
     @test !fidelity.candidate_prepared
     accepted_voltage_v = copy(linear_system.v)
     accepted_charge_c = fidelity.junction_charge.previous_charge_c
-    fidelity.junction_charge.maximum_voltage_v = 0.5
+    # Force the next 0.249 V candidate outside the admitted domain.  A 0.5 V
+    # ceiling admits that candidate and therefore cannot exercise rollback.
+    fidelity.junction_charge.maximum_voltage_v = 0.2
     rejected_result = AIMORA.NonlinearNodal.advance_nonlinear_step!(
         nonlinear_system,
         2.0e-6,
