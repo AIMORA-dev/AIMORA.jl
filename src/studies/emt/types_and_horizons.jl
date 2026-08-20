@@ -834,7 +834,7 @@ function DeckEMTTrace(
     )
 end
 
-struct DeckOVER16BoundaryPlan
+mutable struct DeckOVER16BoundaryPlan
     source::Symbol
     branch_names::Vector{Symbol}
     branch_kinds::Vector{Symbol}

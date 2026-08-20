@@ -11,6 +11,7 @@ include("emt_task_platform.jl")
 include("extended_vsc_control_filter_platform.jl")
 include("transformer_apparatus.jl")
 include("modern_machine_families.jl")
+include("measurement_chains.jl")
 
 @testset "public package isolation" begin
     for module_name in (
@@ -36,6 +37,11 @@ end
         @test unavailable.operation == :prepare_study
         @test unavailable.required_capability == :study_preparation
         @test unavailable.mode == :open_core
+        measurement_unavailable = AIMORA.materialize_measurement_branches(Any[])
+        @test measurement_unavailable isa AIMORA.SolverUnavailableResult
+        @test measurement_unavailable.operation == :materialize_measurement_branches
+        @test measurement_unavailable.required_capability ==
+            :measurement_network_materialization
     end
 end
 

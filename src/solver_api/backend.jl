@@ -5,6 +5,7 @@ export AbstractAIMORASolverBackend,
        active_solver_backend,
        backend_metadata,
        execute_study!,
+       materialize_measurement_branches,
        prepare_line_fit,
        prepare_study,
        require_solver,
@@ -154,6 +155,13 @@ execute_study!(::AbstractAIMORASolverBackend, prepared) =
         message = "The active backend does not implement this prepared study contract.",
     )
 
+materialize_measurement_branches(::AbstractAIMORASolverBackend, definitions) =
+    _solver_unavailable_result(
+        :materialize_measurement_branches,
+        :measurement_network_materialization;
+        message = "The active backend does not implement measurement-network branches.",
+    )
+
 prepare_line_fit(::AbstractAIMORASolverBackend, request) =
     _solver_unavailable_result(
         :prepare_line_fit,
@@ -187,6 +195,15 @@ function execute_study!(prepared)
     return backend === nothing ?
            _solver_unavailable_result(:execute_study, :study_execution) :
            execute_study!(backend, prepared)
+end
+
+function materialize_measurement_branches(definitions)
+    backend = active_solver_backend()
+    return backend === nothing ?
+           _solver_unavailable_result(
+        :materialize_measurement_branches,
+        :measurement_network_materialization,
+    ) : materialize_measurement_branches(backend, definitions)
 end
 
 function prepare_line_fit(request)

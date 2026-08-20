@@ -1484,7 +1484,7 @@ function run_deck_emt_with_over16_boundary(
     )
 end
 
-struct DynamicDeckStepConfigProvider{N,D,I,E,F,P,T,O,L,R} <: Function
+mutable struct DynamicDeckStepConfigProvider{N,D,I,E,F,P,T,O,L,R} <: Function
     plan::DeckOVER16BoundaryPlan
     timestep_state::OVER16AcceptedTimestepState
     nonlinear_current_config::N
