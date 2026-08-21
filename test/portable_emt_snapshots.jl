@@ -1,6 +1,7 @@
 using SHA
 using Test
 using AIMORA
+using LinearAlgebra
 using Printf
 using AIMORA.EMTTaskPlatform
 
@@ -137,6 +138,57 @@ function portable_snapshot_test_metadata(; profile = :portable_full)
         writer_version = "AIMORA.jl/test",
         creator_platform = "portable-test-platform",
     )
+end
+
+function portable_snapshot_reseal_body(body::AbstractVector{UInt8})
+    bytes = Vector{UInt8}(body)
+    return vcat(bytes, sha256(bytes))
+end
+
+function portable_snapshot_write_little_endian!(
+    bytes::AbstractVector{UInt8},
+    first_index::Int,
+    value::T,
+) where {T<:Unsigned}
+    for offset in 0:(sizeof(T) - 1)
+        bytes[first_index + offset] = UInt8((value >> (8 * offset)) & T(0xff))
+    end
+    return bytes
+end
+
+function portable_snapshot_read_little_endian(
+    bytes::AbstractVector{UInt8},
+    first_index::Int,
+    ::Type{T},
+) where {T<:Unsigned}
+    value = zero(T)
+    for offset in 0:(sizeof(T) - 1)
+        value |= T(bytes[first_index + offset]) << (8 * offset)
+    end
+    return value
+end
+
+function portable_snapshot_byte_sequence_range(
+    bytes::AbstractVector{UInt8},
+    sequence::AbstractVector{UInt8},
+)
+    isempty(sequence) && throw(ArgumentError("portable byte sequence must not be empty"))
+    last_start = length(bytes) - length(sequence) + 1
+    last_start >= 1 || error("portable byte sequence is longer than its payload")
+    for first_index in 1:last_start
+        @views bytes[first_index:(first_index + length(sequence) - 1)] == sequence &&
+            return first_index:(first_index + length(sequence) - 1)
+    end
+    error("portable byte sequence is absent")
+end
+
+function portable_snapshot_caught_failure(action)
+    return try
+        action()
+        nothing
+    catch error
+        error
+    end
 end
 
 @testset "portable EMT registered state inventory" begin
@@ -277,6 +329,185 @@ end
             first_path;
             maximum_file_bytes = 16,
         )
+
+        magic_bytes = collect(codeunits("AIMORA-PORTABLE-EMT"))
+        major_index = length(magic_bytes) + 1
+        minor_index = major_index + sizeof(UInt16)
+        metadata_length_index = minor_index + sizeof(UInt16)
+
+        unknown_major_body = Vector{UInt8}(bytes[1:(end - 32)])
+        portable_snapshot_write_little_endian!(
+            unknown_major_body,
+            major_index,
+            UInt16(2),
+        )
+        unknown_major_path = joinpath(directory, "unknown-major.aimora-snapshot")
+        write(unknown_major_path, portable_snapshot_reseal_body(unknown_major_body))
+        unknown_major = portable_snapshot_caught_failure() do
+            AIMORA.PortableSnapshots.inspect_portable_emt_snapshot(unknown_major_path)
+        end
+        @test unknown_major isa AIMORA.PortableSnapshots.PortableSnapshotFailure
+        @test unknown_major.code == :unsupported_major_version
+
+        reversed_version_body = Vector{UInt8}(bytes[1:(end - 32)])
+        reversed_version_body[major_index:(major_index + 1)] .= UInt8[0x00, 0x01]
+        reversed_version_path = joinpath(directory, "reversed-version.aimora-snapshot")
+        write(reversed_version_path, portable_snapshot_reseal_body(reversed_version_body))
+        reversed_version = portable_snapshot_caught_failure() do
+            AIMORA.PortableSnapshots.inspect_portable_emt_snapshot(reversed_version_path)
+        end
+        @test reversed_version isa AIMORA.PortableSnapshots.PortableSnapshotFailure
+        @test reversed_version.code == :unsupported_major_version
+
+        unknown_minor_body = Vector{UInt8}(bytes[1:(end - 32)])
+        portable_snapshot_write_little_endian!(
+            unknown_minor_body,
+            minor_index,
+            UInt16(2),
+        )
+        unknown_minor_path = joinpath(directory, "unknown-minor.aimora-snapshot")
+        write(unknown_minor_path, portable_snapshot_reseal_body(unknown_minor_body))
+        unknown_minor = portable_snapshot_caught_failure() do
+            AIMORA.PortableSnapshots.inspect_portable_emt_snapshot(unknown_minor_path)
+        end
+        @test unknown_minor isa AIMORA.PortableSnapshots.PortableSnapshotFailure
+        @test unknown_minor.code == :unsupported_minor_version
+
+        truncated_path = joinpath(directory, "truncated.aimora-snapshot")
+        write(truncated_path, bytes[1:32])
+        truncated = portable_snapshot_caught_failure() do
+            AIMORA.PortableSnapshots.inspect_portable_emt_snapshot(truncated_path)
+        end
+        @test truncated isa AIMORA.PortableSnapshots.PortableSnapshotFailure
+        @test truncated.code == :truncated
+
+        trailing_body = vcat(bytes[1:(end - 32)], UInt8(0))
+        trailing_path = joinpath(directory, "trailing.aimora-snapshot")
+        write(trailing_path, portable_snapshot_reseal_body(trailing_body))
+        trailing = portable_snapshot_caught_failure() do
+            AIMORA.PortableSnapshots.inspect_portable_emt_snapshot(trailing_path)
+        end
+        @test trailing isa AIMORA.PortableSnapshots.PortableSnapshotFailure
+        @test trailing.code == :trailing_bytes
+
+        length_bomb_body = Vector{UInt8}(bytes[1:(end - 32)])
+        portable_snapshot_write_little_endian!(
+            length_bomb_body,
+            metadata_length_index,
+            typemax(UInt64),
+        )
+        length_bomb_path = joinpath(directory, "length-bomb.aimora-snapshot")
+        write(length_bomb_path, portable_snapshot_reseal_body(length_bomb_body))
+        length_bomb = portable_snapshot_caught_failure() do
+            AIMORA.PortableSnapshots.inspect_portable_emt_snapshot(length_bomb_path)
+        end
+        @test length_bomb isa AIMORA.PortableSnapshots.PortableSnapshotFailure
+        @test length_bomb.code == :resource_limit
+
+        metadata_length = Int(portable_snapshot_read_little_endian(
+            bytes,
+            metadata_length_index,
+            UInt64,
+        ))
+        metadata_digest_index = metadata_length_index + sizeof(UInt64)
+        metadata_payload_index = metadata_digest_index + 32
+        metadata_corruption_body = Vector{UInt8}(bytes[1:(end - 32)])
+        metadata_corruption_body[metadata_payload_index + metadata_length - 1] ⊻= 0x01
+        metadata_corruption_path = joinpath(directory, "metadata-corruption.aimora-snapshot")
+        write(
+            metadata_corruption_path,
+            portable_snapshot_reseal_body(metadata_corruption_body),
+        )
+        metadata_corruption = portable_snapshot_caught_failure() do
+            AIMORA.PortableSnapshots.inspect_portable_emt_snapshot(
+                metadata_corruption_path,
+            )
+        end
+        @test metadata_corruption isa AIMORA.PortableSnapshots.PortableSnapshotFailure
+        @test metadata_corruption.code == :integrity
+
+        section_count_index = metadata_payload_index + metadata_length
+        section_header_index = section_count_index + sizeof(UInt32)
+        section_identity_length = Int(portable_snapshot_read_little_endian(
+            bytes,
+            section_header_index,
+            UInt32,
+        ))
+        section_identity_index = section_header_index + sizeof(UInt32)
+        section_visibility_index = section_identity_index + section_identity_length +
+            2 * sizeof(UInt16)
+        section_payload_length_index = section_visibility_index + 1
+        section_payload_length = Int(portable_snapshot_read_little_endian(
+            bytes,
+            section_payload_length_index,
+            UInt64,
+        ))
+        section_digest_index = section_payload_length_index + sizeof(UInt64)
+        section_payload_index = section_digest_index + 32
+
+        invalid_visibility_body = Vector{UInt8}(bytes[1:(end - 32)])
+        invalid_visibility_body[section_visibility_index] = 0xff
+        invalid_visibility_path = joinpath(directory, "invalid-visibility.aimora-snapshot")
+        write(
+            invalid_visibility_path,
+            portable_snapshot_reseal_body(invalid_visibility_body),
+        )
+        invalid_visibility = portable_snapshot_caught_failure() do
+            AIMORA.PortableSnapshots.inspect_portable_emt_snapshot(
+                invalid_visibility_path,
+            )
+        end
+        @test invalid_visibility isa AIMORA.PortableSnapshots.PortableSnapshotFailure
+        @test invalid_visibility.code == :invalid_section_visibility
+
+        section_corruption_body = Vector{UInt8}(bytes[1:(end - 32)])
+        section_corruption_body[section_payload_index + section_payload_length - 1] ⊻= 0x01
+        section_corruption_path = joinpath(directory, "section-corruption.aimora-snapshot")
+        write(
+            section_corruption_path,
+            portable_snapshot_reseal_body(section_corruption_body),
+        )
+        section_corruption = portable_snapshot_caught_failure() do
+            AIMORA.PortableSnapshots.inspect_portable_emt_snapshot(
+                section_corruption_path,
+            )
+        end
+        @test section_corruption isa AIMORA.PortableSnapshots.PortableSnapshotFailure
+        @test section_corruption.code == :integrity
+
+        public_alpha = AIMORA.PortableSnapshots.PortableSnapshotSection(
+            "state.alpha",
+            1,
+            0,
+            :public,
+            portable_snapshot_test_record(),
+        )
+        public_bravo = AIMORA.PortableSnapshots.PortableSnapshotSection(
+            "state.bravo",
+            1,
+            0,
+            :public,
+            portable_snapshot_test_record(),
+        )
+        ordered_bytes = AIMORA.PortableSnapshots.portable_snapshot_bytes(
+            AIMORA.PortableSnapshots.PortableEMTSnapshot(
+                portable_snapshot_test_metadata(),
+                [public_alpha, public_bravo],
+            ),
+        )
+        duplicate_body = Vector{UInt8}(ordered_bytes[1:(end - 32)])
+        bravo_range = portable_snapshot_byte_sequence_range(
+            duplicate_body,
+            collect(codeunits("state.bravo")),
+        )
+        duplicate_body[bravo_range] .= collect(codeunits("state.alpha"))
+        duplicate_path = joinpath(directory, "duplicate-section.aimora-snapshot")
+        write(duplicate_path, portable_snapshot_reseal_body(duplicate_body))
+        duplicate = portable_snapshot_caught_failure() do
+            AIMORA.PortableSnapshots.inspect_portable_emt_snapshot(duplicate_path)
+        end
+        @test duplicate isa AIMORA.PortableSnapshots.PortableSnapshotFailure
+        @test duplicate.code == :noncanonical_order
 
         legacy_path = joinpath(directory, "legacy-minor-zero.aimora-snapshot")
         legacy_bytes = AIMORA.PortableSnapshots._portable_snapshot_bytes(
@@ -502,6 +733,628 @@ if AIMORA.solver_available()
             :transformer_slope,
         )
         @test restored.signature_sha256 == captured.signature_sha256
+    end
+
+    function portable_complex_modal_line()
+        orthogonal = [1.0 1.0; 1.0 -1.0] ./ sqrt(2.0)
+        modal_angles = [0.15, -0.12]
+        modal_to_phase = complex.(orthogonal) * Diagonal(cis.(modal_angles))
+        phase_to_modal = inv(modal_to_phase)
+        transform = AIMORA.Lines.LineModalTransform(phase_to_modal, modal_to_phase)
+        characteristic_admittance = ComplexF64[
+            0.02cis(2.0 * modal_angles[1]),
+            0.03cis(2.0 * modal_angles[2]),
+        ]
+        return AIMORA.Lines.ComplexModalBergeronLine(
+            [1, 2],
+            [3, 4],
+            transform,
+            characteristic_admittance,
+            [250.0e-6, 325.0e-6],
+            100.0e-6;
+            attenuation = [0.98, 0.96],
+        )
+    end
+
+    function portable_sampled_line_coefficients()
+        return AIMORA.Lines.SampledLineWeightingCoefficients(
+            1.0e-6,
+            300.0,
+            inv(300.0),
+            2,
+            4,
+            [0.12, 0.08],
+            [0.15, 0.05],
+            (0.01, 0.005, 0.8),
+            (0.02, 0.01, 0.7),
+            1.0,
+            true,
+            0.0,
+            1.0e-8,
+            0.43,
+            0.9,
+        )
+    end
+
+    function portable_semlyen_line()
+        timestep_s = 50.0e-6
+        mode = AIMORA.Lines.SemlyenModeParameters(
+            5.0e-3,
+            2.3 * timestep_s,
+            1.0 + 0.2im,
+            0.01 + 0.002im,
+            60.0,
+            [
+                AIMORA.Lines.SemlyenRationalTerm(15_161.0, 0.75119),
+                AIMORA.Lines.SemlyenRationalTerm(1_710.5, 0.24881),
+            ],
+            [
+                AIMORA.Lines.SemlyenRationalTerm(595.84, -0.0011954),
+                AIMORA.Lines.SemlyenRationalTerm(39_933.0, -0.00074162),
+            ],
+        )
+        return AIMORA.Lines.semlyen_frequency_dependent_line(
+            [1],
+            [2],
+            [mode],
+            ones(1, 1),
+            ones(1, 1),
+            timestep_s,
+        )
+    end
+
+    @testset "portable mutable line and BREQIV owners" begin
+        breqiv = AIMORA.Branches.three_phase_breqiv_history_injection(
+            1,
+            0,
+            2,
+            0,
+            3,
+            0,
+            0.2,
+            2.0e-3,
+            1.0e-6,
+            10.0,
+            0.3,
+            3.0e-3,
+            2.0e-6,
+            12.0,
+            1.0,
+            -0.5,
+            -0.5,
+        )
+        AIMORA.Branches.initialize_breqiv_history_injection!(breqiv, 50.0e-6)
+        AIMORA.Branches.advance_breqiv_history_current!(
+            breqiv,
+            [1.1, -0.45, -0.55],
+            50.0e-6,
+        )
+        breqiv_candidate = AIMORA.Branches.three_phase_breqiv_history_injection(
+            1,
+            0,
+            2,
+            0,
+            3,
+            0,
+            0.2,
+            2.0e-3,
+            1.0e-6,
+            10.0,
+            0.3,
+            3.0e-3,
+            2.0e-6,
+            12.0,
+            1.0,
+            -0.5,
+            -0.5,
+        )
+        captured, restored = portable_element_owner_roundtrip(
+            breqiv,
+            breqiv_candidate,
+            :breqiv,
+        )
+        @test restored.signature_sha256 == captured.signature_sha256
+
+        complex_line = portable_complex_modal_line()
+        AIMORA.Lines.initialize_complex_modal_bergeron_steady_state!(
+            complex_line,
+            ComplexF64[100.0, 100.0cis(-2.0 * pi / 3.0)],
+            ComplexF64[95.0cis(-0.05), 95.0cis(-2.0 * pi / 3.0 - 0.05)],
+            60.0,
+        )
+        AIMORA.Lines.update!(complex_line, [100.0, -50.0, 95.0, -47.0], 100.0e-6)
+        captured, restored = portable_element_owner_roundtrip(
+            complex_line,
+            portable_complex_modal_line(),
+            :complex_modal_line,
+        )
+        @test restored.signature_sha256 == captured.signature_sha256
+
+        preparation = manufactured_coupled_line_runtime_preparation().preparation
+        coupled_line = AIMORA.Lines.coupled_frequency_dependent_line(
+            preparation,
+            [1, 2],
+            [3, 4],
+        )
+        AIMORA.Lines.update!(
+            coupled_line,
+            [100.0, -50.0, 20.0, -10.0],
+            preparation.settings.timestep_s,
+        )
+        coupled_candidate = AIMORA.Lines.coupled_frequency_dependent_line(
+            preparation,
+            [1, 2],
+            [3, 4],
+        )
+        captured, restored = portable_element_owner_roundtrip(
+            coupled_line,
+            coupled_candidate,
+            :coupled_line,
+        )
+        @test restored.signature_sha256 == captured.signature_sha256
+
+        sampled_line = AIMORA.Lines.sampled_frequency_dependent_line(
+            1,
+            2,
+            portable_sampled_line_coefficients(),
+        )
+        AIMORA.Lines.update!(sampled_line, [0.25, -0.4], 1.0e-6)
+        sampled_candidate = AIMORA.Lines.sampled_frequency_dependent_line(
+            1,
+            2,
+            portable_sampled_line_coefficients(),
+        )
+        captured, restored = portable_element_owner_roundtrip(
+            sampled_line,
+            sampled_candidate,
+            :sampled_line,
+        )
+        @test restored.signature_sha256 == captured.signature_sha256
+
+        modal_transform = [1.0 1.0; 1.0 -1.0] ./ sqrt(2.0)
+        sampled_group = AIMORA.Lines.sampled_frequency_dependent_line_group(
+            [1, 2],
+            [3, 4],
+            [portable_sampled_line_coefficients(), portable_sampled_line_coefficients()];
+            modal_to_phase = modal_transform,
+        )
+        AIMORA.Lines.update!(sampled_group, [0.25, -0.4, 0.1, -0.2], 1.0e-6)
+        sampled_group_candidate = AIMORA.Lines.sampled_frequency_dependent_line_group(
+            [1, 2],
+            [3, 4],
+            [portable_sampled_line_coefficients(), portable_sampled_line_coefficients()];
+            modal_to_phase = modal_transform,
+        )
+        captured, restored = portable_element_owner_roundtrip(
+            sampled_group,
+            sampled_group_candidate,
+            :sampled_line_group,
+        )
+        @test restored.signature_sha256 == captured.signature_sha256
+
+        semlyen_line = portable_semlyen_line()
+        AIMORA.Lines.initialize_semlyen_line_steady_state!(
+            semlyen_line,
+            ComplexF64[2.0 + 0.5im],
+            ComplexF64[-1.0 + 0.75im],
+            60.0,
+        )
+        AIMORA.Lines.update!(semlyen_line, [2.0, -1.0], 50.0e-6)
+        captured, restored = portable_element_owner_roundtrip(
+            semlyen_line,
+            portable_semlyen_line(),
+            :semlyen_line,
+        )
+        @test restored.signature_sha256 == captured.signature_sha256
+    end
+
+    function portable_semiconductor_energy_table()
+        current_axis_a = [0.0, 10.0]
+        voltage_axis_v = [0.0, 100.0]
+        temperature_axis_k = [250.0, 350.0]
+        values = reshape(collect(1.0:8.0) .* 1.0e-6, 2, 2, 2)
+        return AIMORA.Nonlinear.SwitchingEnergyTable(
+            current_axis_a,
+            voltage_axis_v,
+            temperature_axis_k;
+            turn_on_energy_j=values,
+            turn_off_energy_j=2.0 .* values,
+            reverse_recovery_energy_j=3.0 .* values,
+        )
+    end
+
+    function portable_extended_semiconductor_switch(a::Int=1, b::Int=0)
+        fidelity = AIMORA.Nonlinear.PowerSemiconductorExtendedFidelity(
+            recovered_charge=AIMORA.Nonlinear.RecoveredChargeFidelity(
+                2.0e-6;
+                initial_charge_c=1.0e-6,
+            ),
+            junction_charge=AIMORA.Nonlinear.NonlinearJunctionChargeFidelity(
+                1.0e-9,
+                100.0,
+                0.4;
+                voltage_domain_v=(-1.0e3, 1.0e3),
+            ),
+            turn_off_tail=AIMORA.Nonlinear.TurnOffTailFidelity(
+                4.0e-6;
+                cutoff_current_a=0.05,
+            ),
+            switching_energy=portable_semiconductor_energy_table(),
+            thermal=AIMORA.Nonlinear.CauerThermalFidelity(
+                [1.0, 2.0],
+                [0.5, 1.0];
+                initial_temperature_k=[300.0, 298.0],
+            ),
+        )
+        return AIMORA.Nonlinear.IGBTSwitch(
+            a,
+            b;
+            threshold_v=0.2,
+            forward_voltage_drop_v=0.1,
+            on_conductance=100.0,
+            off_conductance=1.0e-6,
+            gate_driver=AIMORA.Nonlinear.PowerSemiconductorGateDriver(
+                turn_on_delay_s=2.0e-6,
+                turn_off_delay_s=3.0e-6,
+                dead_time_s=1.0e-6,
+                minimum_pulse_width_s=0.5e-6,
+            ),
+            antiparallel_diode=AIMORA.Nonlinear.AntiparallelDiodeParameters(
+                forward_voltage_v=0.7,
+                holding_current_a=0.01,
+                on_conductance_s=80.0,
+            ),
+            snubber=AIMORA.Nonlinear.SeriesRCSnubber(10.0, 1.0e-6),
+            extended_fidelity=fidelity,
+        )
+    end
+
+    function seed_portable_semiconductor_state!(switch)
+        switch.closed = true
+        switch.last_voltage = 12.0
+        switch.last_current = 3.0
+        switch.last_conductance = 99.0
+        switch.reverse_diode_conducting = true
+        switch.event_localization_enabled = true
+        switch.last_evaluation_time_s = 7.0e-6
+        switch.last_history_current_a = 2.0
+        switch.last_forward_current_a = 2.5
+        switch.last_reverse_diode_current_a = -0.25
+        switch.last_snubber_current_a = 0.75
+        switch.last_semiconductor_loss_w = 1.2
+        switch.previous_semiconductor_loss_w = 1.1
+        switch.semiconductor_dissipated_energy_j = 4.0e-3
+        switch.topology_transition_count = 7
+        switch.last_transition_time_s = 6.5e-6
+        switch.conduction_direction = Int8(-1)
+        switch.gate_turn_off_disposition = :accepted
+
+        driver = something(switch.gate_driver)
+        driver.commanded_on = true
+        driver.applied_on = false
+        driver.pending_state = true
+        driver.pending_transition_time_s = 8.0e-6
+        driver.last_command_time_s = 6.0e-6
+        driver.last_turn_on_time_s = -Inf
+        driver.last_turn_off_time_s = 5.0e-6
+        driver.command_count = 4
+        driver.transition_count = 3
+        driver.filtered_pulse_count = 2
+
+        snubber = something(switch.snubber)
+        snubber.previous_current_a = 0.5
+        snubber.capacitor_voltage_v = 4.0
+        snubber.last_branch_voltage_v = 9.0
+        snubber.last_current_a = 0.6
+        snubber.last_resistor_loss_w = 3.6
+        snubber.dissipated_energy_j = 2.0e-4
+
+        fidelity = something(switch.extended_fidelity)
+        recovery = something(fidelity.recovered_charge)
+        recovery.stored_charge_c = 0.8e-6
+        recovery.previous_stored_charge_c = 0.9e-6
+        recovery.recovery_active = true
+        recovery.last_recovery_current_a = -0.4
+        recovery.peak_reverse_current_a = 0.6
+        recovery.cumulative_recovered_charge_c = 3.0e-6
+        recovery.recovery_start_time_s = 1.0e-6
+        recovery.last_recovery_duration_s = 2.0e-6
+        recovery.recovery_zero_event_count = 2
+        recovery.last_recovery_zero_time_s = 4.0e-6
+
+        charge = something(fidelity.junction_charge)
+        charge.previous_voltage_v = -2.0
+        charge.previous_charge_c = -1.0e-9
+        charge.last_capacitance_f = 0.8e-9
+        charge.last_charge_c = -1.1e-9
+        charge.last_displacement_current_a = 0.2
+
+        tail = something(fidelity.turn_off_tail)
+        tail.active = true
+        tail.current_a = 0.3
+        tail.initial_current_a = 1.0
+        tail.turn_off_time_s = 3.0e-6
+        tail.last_duration_s = 2.0e-6
+        tail.cutoff_event_count = 1
+        tail.last_cutoff_time_s = Inf
+
+        energy = something(fidelity.switching_energy)
+        energy.cumulative_turn_on_energy_j = 1.0e-3
+        energy.cumulative_turn_off_energy_j = 2.0e-3
+        energy.cumulative_reverse_recovery_energy_j = 3.0e-3
+        energy.last_event_kind = :turn_off
+        energy.last_event_energy_j = 5.0e-6
+        energy.last_event_transition_count = 7
+        energy.last_reverse_recovery_start_time_s = -Inf
+
+        thermal = something(fidelity.thermal)
+        thermal.node_temperature_k .= [305.0, 301.0]
+        thermal.last_loss_power_w = 4.0
+        thermal.last_ambient_heat_flow_w = 0.5
+        thermal.last_stored_energy_j = 2.0
+        thermal.cumulative_input_energy_j = 3.0
+        thermal.cumulative_ambient_energy_j = 1.0
+        thermal.trial_lower_conductance_w_per_k .= [0.25]
+        thermal.trial_diagonal_conductance_w_per_k .= [1.0, 2.0]
+        thermal.trial_upper_conductance_w_per_k .= [0.5]
+        thermal.trial_right_hand_side_w .= [3.0, 4.0]
+        thermal.trial_temperature_rise_k .= [5.0, 6.0]
+        thermal.trial_temperature_k .= [306.0, 302.0]
+        thermal.trial_storage_conductance_w_per_k .= [7.0, 8.0]
+        thermal.factorized_step_s = 10.0e-6
+
+        fidelity.candidate_time_s = 9.0e-6
+        fidelity.candidate_step_s = 1.0e-6
+        fidelity.candidate_method = :TrapezoidalCompanion
+        fidelity.candidate_prepared = true
+        fidelity.previous_terminal_voltage_v = 11.0
+        fidelity.previous_terminal_current_a = 2.0
+        fidelity.companion_energy_residual_j = 1.0e-8
+        fidelity.accepted_topology_transition_count = 6
+        fidelity.pending_event_current_a = 0.4
+        fidelity.pending_event_blocking_voltage_v = 100.0
+        fidelity.candidate_recovery_charge_c = 0.7e-6
+        return switch
+    end
+
+    function portable_bridge_leg()
+        return AIMORA.Nonlinear.PowerSemiconductorBridgeLeg(
+            portable_extended_semiconductor_switch(3, 1),
+            portable_extended_semiconductor_switch(1, 0);
+            commutation_dead_time_s=2.0e-6,
+        )
+    end
+
+    function portable_bridge_topology(; reverse_legs::Bool=false)
+        base = AIMORA.BridgeTopologies.full_bridge_topology(1, 2, 3, 0)
+        passive_position = AIMORA.BridgeTopologies.BridgePassivePosition(
+            :dc_link_capacitor,
+            3,
+            0,
+            :capacitor,
+        )
+        topology = AIMORA.BridgeTopologies.BridgeTopologyDescriptor(
+            :full_bridge,
+            base.nodes,
+            base.valve_positions,
+            [passive_position],
+            base.state_groups;
+            provenance=base.provenance,
+            licence=base.licence,
+            redistribution=base.redistribution,
+        )
+        valves = [portable_extended_semiconductor_switch(
+            position.from_node,
+            position.to_node,
+        ) for position in topology.valve_positions]
+        passives = [AIMORA.Branches.CapacitorBranch(3, 0, 20.0e-6)]
+        legs = [
+            AIMORA.Nonlinear.PowerSemiconductorBridgeLeg(valves[1], valves[2]),
+            AIMORA.Nonlinear.PowerSemiconductorBridgeLeg(valves[3], valves[4]),
+        ]
+        reverse_legs && reverse!(legs)
+        return AIMORA.Nonlinear.PowerSemiconductorBridgeTopology(
+            topology,
+            valves;
+            passives,
+            bridge_legs=legs,
+        )
+    end
+
+    @testset "portable semiconductor switch and bridge aggregates" begin
+        semiconductor = seed_portable_semiconductor_state!(
+            portable_extended_semiconductor_switch(),
+        )
+        semiconductor_candidate = portable_extended_semiconductor_switch()
+        driver_identity = objectid(semiconductor_candidate.gate_driver)
+        fidelity_identity = objectid(semiconductor_candidate.extended_fidelity)
+        captured, restored = portable_element_owner_roundtrip(
+            semiconductor,
+            semiconductor_candidate,
+            :extended_semiconductor,
+        )
+        @test restored.signature_sha256 == captured.signature_sha256
+        @test objectid(semiconductor_candidate.gate_driver) == driver_identity
+        @test objectid(semiconductor_candidate.extended_fidelity) == fidelity_identity
+        captured_fields = Dict(field.identity => field for field in captured.fields)
+        component_mismatch = portable_extended_semiconductor_switch()
+        component_mismatch.extended_fidelity = nothing
+        @test_throws AIMORA.PortableSnapshots.PortableSnapshotFailure AIMORA.EMTStudy._restore_portable_emt_element_state!(
+            component_mismatch,
+            captured_fields,
+            1,
+        )
+        temperature_identity = "model.i00000001.extended_fidelity.thermal.node_temperature"
+        temperature_field = captured_fields[temperature_identity]
+        corrupted_fields = copy(captured_fields)
+        corrupted_fields[temperature_identity] = AIMORA.PortableSnapshots.PortableSnapshotStateField(
+            temperature_identity,
+            temperature_field.owner,
+            temperature_field.family,
+            temperature_field.unit,
+            temperature_field.axes,
+            AIMORA.PortableSnapshots.portable_snapshot_array(
+                [300.0];
+                unit="K",
+                axes=["stage"],
+            ),
+        )
+        @test_throws AIMORA.PortableSnapshots.PortableSnapshotFailure AIMORA.EMTStudy._restore_portable_emt_element_state!(
+            portable_extended_semiconductor_switch(),
+            corrupted_fields,
+            1,
+        )
+
+        bridge = portable_bridge_leg()
+        seed_portable_semiconductor_state!(bridge.upper_switch)
+        bridge.blocked = true
+        bridge.requested_upper_on = true
+        bridge.last_command_time_s = 12.0e-6
+        bridge.command_count = 5
+        bridge.shoot_through_rejection_count = 2
+        bridge.block_count = 1
+        bridge.restart_count = 3
+        bridge.last_dc_positive_voltage_v = 400.0
+        bridge.last_ac_terminal_voltage_v = 20.0
+        bridge.last_dc_negative_voltage_v = -400.0
+        bridge_candidate = portable_bridge_leg()
+        upper_identity = objectid(bridge_candidate.upper_switch)
+        lower_identity = objectid(bridge_candidate.lower_switch)
+        captured, restored = portable_element_owner_roundtrip(
+            bridge,
+            bridge_candidate,
+            :complementary_bridge_leg,
+        )
+        @test restored.signature_sha256 == captured.signature_sha256
+        @test objectid(bridge_candidate.upper_switch) == upper_identity
+        @test objectid(bridge_candidate.lower_switch) == lower_identity
+
+        topology = portable_bridge_topology()
+        seed_portable_semiconductor_state!(topology.valves[1])
+        topology.position_faults[2] = AIMORA.Nonlinear.BRIDGE_POSITION_STUCK_OPEN
+        topology.transition_count = 8
+        topology.refusal_count = 3
+        topology.last_terminal_voltage_v .= [400.0, 20.0, -20.0, 0.0]
+        topology.last_terminal_current_a .= [2.0, -1.0, 1.0, -2.0]
+        topology.last_step_s = 5.0e-6
+        topology.dissipated_energy_j = 0.25
+        topology.passives[1].i_prev = 1.0
+        topology.passives[1].v_prev = 395.0
+        topology.passives[1].i_last = 1.5
+        topology.bridge_legs[1].command_count = 4
+        topology_candidate = portable_bridge_topology()
+        valve_identities = objectid.(topology_candidate.valves)
+        passive_identity = objectid(topology_candidate.passives[1])
+        captured, restored = portable_element_owner_roundtrip(
+            topology,
+            topology_candidate,
+            :full_bridge_topology,
+        )
+        @test restored.signature_sha256 == captured.signature_sha256
+        @test objectid.(topology_candidate.valves) == valve_identities
+        @test objectid(topology_candidate.passives[1]) == passive_identity
+        @test topology_candidate.bridge_legs[1].upper_switch === topology_candidate.valves[1]
+        @test topology_candidate.bridge_legs[1].lower_switch === topology_candidate.valves[2]
+        @test topology_candidate.bridge_legs[2].upper_switch === topology_candidate.valves[3]
+        @test topology_candidate.bridge_legs[2].lower_switch === topology_candidate.valves[4]
+        @test_throws AIMORA.PortableSnapshots.PortableSnapshotFailure AIMORA.EMTStudy._restore_portable_emt_element_state!(
+            portable_bridge_topology(reverse_legs=true),
+            Dict(field.identity => field for field in captured.fields),
+            1,
+        )
+    end
+
+    @testset "portable full-workspace semiconductor continuation" begin
+        timestep_s = 5.0e-6
+        parsed = AIMORA.DeckParser.parse_deck_lines(
+            [
+                "BEGIN NEW DATA CASE",
+                "source src BUS 1.0e3 1.0 60.0 0.0 1.0",
+                "resistor load BUS 0 20.0",
+            ];
+            source = "portable full-workspace semiconductor continuation",
+        )
+        semiconductor = portable_extended_semiconductor_switch(parsed.node_map[:BUS], 0)
+        AIMORA.Nonlinear.request_power_semiconductor_gate!(semiconductor, true, 0.0)
+        push!(parsed.elements, semiconductor)
+        push!(parsed.element_names, :switching_device)
+        push!(parsed.element_line_numbers, 0)
+
+        split_prepared = AIMORA.EMTStudy.prepare_emt_study(
+            parsed;
+            dt_s = timestep_s,
+            t_end_s = 3.0 * timestep_s,
+        )
+        split_workspace = AIMORA.EMTStudy.EMTStudyWorkspace(split_prepared)
+        AIMORA.EMTStudy.evaluate_emt_study!(split_workspace)
+        split_inventory = AIMORA.EMTStudy.portable_emt_state_inventory(split_workspace)
+        split_identities = Set(getfield.(split_inventory.fields, :identity))
+        @test "model.i00000003.extended_fidelity.thermal.node_temperature" in
+            split_identities
+        @test "model.i00000003.gate_driver.pending_transition_time" in split_identities
+
+        project_signature = bytes2hex(sha256("portable semiconductor project"))
+        model_signature = bytes2hex(sha256("portable semiconductor model"))
+        settings_signature = bytes2hex(sha256("portable semiconductor settings"))
+        mktempdir() do directory
+            path = joinpath(directory, "semiconductor.aimora-snapshot")
+            AIMORA.EMTStudy.write_portable_emt_workspace_snapshot(
+                path,
+                split_workspace;
+                project_signature_sha256 = project_signature,
+                model_signature_sha256 = model_signature,
+                settings_signature_sha256 = settings_signature,
+                provenance = "AIMORA-authored full-workspace semiconductor continuation",
+            )
+            restored = AIMORA.EMTStudy.read_portable_emt_workspace_snapshot(
+                path,
+                split_prepared;
+                project_signature_sha256 = project_signature,
+                model_signature_sha256 = model_signature,
+                settings_signature_sha256 = settings_signature,
+            )
+
+            full_prepared = AIMORA.EMTStudy.prepare_emt_study(
+                parsed;
+                dt_s = timestep_s,
+                t_end_s = 6.0 * timestep_s,
+            )
+            full_workspace = AIMORA.EMTStudy.EMTStudyWorkspace(full_prepared)
+            full_trace = AIMORA.EMTStudy.evaluate_emt_study!(full_workspace)
+            request = AIMORA.DeckParser.parse_emt_restart_request([
+                "START AGAIN",
+                lpad("9999", 8),
+            ])
+            resumed = AIMORA.EMTStudy.restart_emt_study!(
+                restored.workspace,
+                request;
+                additional_time_s = 3.0 * timestep_s,
+            )
+            @test resumed.trace.time_s == full_trace.time_s
+            @test resumed.trace.voltage_pu == full_trace.voltage_pu
+            @test resumed.trace.output_pu == full_trace.output_pu
+            @test resumed.checkpoint_state_error == 0.0
+            resumed_inventory = AIMORA.EMTStudy.portable_emt_state_inventory(
+                restored.workspace,
+            )
+            full_inventory = AIMORA.EMTStudy.portable_emt_state_inventory(
+                full_workspace,
+            )
+            resumed_fields = Dict(field.identity => field for field in resumed_inventory.fields)
+            full_fields = Dict(field.identity => field for field in full_inventory.fields)
+            mismatches = sort!(String[
+                identity for identity in union(keys(resumed_fields), keys(full_fields))
+                if !haskey(resumed_fields, identity) ||
+                   !haskey(full_fields, identity) ||
+                   AIMORA.PortableSnapshots.PortableSnapshotStateInventory([
+                       resumed_fields[identity],
+                   ]).signature_sha256 !=
+                   AIMORA.PortableSnapshots.PortableSnapshotStateInventory([
+                       full_fields[identity],
+                   ]).signature_sha256
+            ])
+            @test mismatches == ["workspace.evaluation_count"]
+        end
     end
 
     mutable struct PortableTaskReplayOwner
@@ -1109,9 +1962,52 @@ if AIMORA.solver_available()
         AIMORA.EMTStudy.evaluate_emt_study!(accepted)
         inventory = AIMORA.EMTStudy.portable_emt_state_inventory(accepted)
         @test inventory.scalar_count == 79
-        @test length(inventory.fields) == 68
+        @test length(inventory.fields) == 69
         @test any(field -> field.identity == "network.accepted_node_voltage", inventory.fields)
         @test any(field -> field.identity == "model.i00000002.from_wave_history", inventory.fields)
+        random_state_policy = only(filter(
+            field -> field.identity == "workspace.random_state_policy",
+            inventory.fields,
+        ))
+        @test random_state_policy.family == :random
+        @test random_state_policy.value == "not_applicable"
+
+        corrupted_fields = copy(inventory.fields)
+        random_state_policy_index = findfirst(
+            field -> field.identity == "workspace.random_state_policy",
+            corrupted_fields,
+        )
+        corrupted_fields[random_state_policy_index] =
+            AIMORA.PortableSnapshots.PortableSnapshotStateField(
+                random_state_policy.identity,
+                random_state_policy.owner,
+                random_state_policy.family,
+                random_state_policy.unit,
+                random_state_policy.axes,
+                "stateful_rng",
+            )
+        corrupted_inventory = AIMORA.PortableSnapshots.PortableSnapshotStateInventory(
+            corrupted_fields,
+        )
+        corrupted_candidate = AIMORA.EMTStudy.EMTStudyWorkspace(prepared)
+        AIMORA.EMTStudy.evaluate_emt_study!(corrupted_candidate)
+        before_corrupted_restore = AIMORA.EMTStudy.portable_emt_state_inventory(
+            corrupted_candidate,
+        ).signature_sha256
+        random_state_failure = try
+            AIMORA.EMTStudy.restore_portable_emt_state_inventory!(
+                corrupted_candidate,
+                corrupted_inventory,
+            )
+            nothing
+        catch error
+            error
+        end
+        @test random_state_failure isa AIMORA.PortableSnapshots.PortableSnapshotFailure
+        @test random_state_failure.code == :random_state_mismatch
+        @test AIMORA.EMTStudy.portable_emt_state_inventory(
+            corrupted_candidate,
+        ).signature_sha256 == before_corrupted_restore
 
         candidate = AIMORA.EMTStudy.EMTStudyWorkspace(prepared)
         AIMORA.EMTStudy.restore_portable_emt_state_inventory!(candidate, inventory)
@@ -1224,7 +2120,7 @@ if AIMORA.solver_available()
         accepted = AIMORA.EMTStudy.EMTStudyWorkspace(prepared)
         AIMORA.EMTStudy.evaluate_emt_study!(accepted)
         inventory = AIMORA.EMTStudy.portable_emt_state_inventory(accepted)
-        @test length(inventory.fields) == 82
+        @test length(inventory.fields) == 83
         @test inventory.scalar_count == 68
         @test length(accepted.runtime.context.series_rlc_alteration_records) == 1
 

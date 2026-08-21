@@ -14,6 +14,36 @@ portable_emt_task_state(value::Tuple) = tuple((portable_emt_task_state(item) for
 portable_emt_task_state(value::AbstractVector) =
     Any[portable_emt_task_state(item) for item in value]
 
+function portable_emt_task_state(
+    value::SwitchDetailedVSC.ExtendedVSCControlCommand,
+)
+    return PortableSnapshotRecord(
+        "aimora.emt.extended_vsc_control_command.v1",
+        Pair{String,Any}[
+            "active_power_w" => value.active_power_w,
+            "angle_rad" => value.angle_rad,
+            "controller_family" => Int64(Int(value.controller_family)),
+            "duties" => portable_emt_task_state(value.duties),
+            "frequency_hz" => value.frequency_hz,
+            "limited" => value.limited,
+            "mode" => Int64(Int(value.mode)),
+            "negative_sequence_voltage_v" => value.negative_sequence_voltage_v,
+            "phase_current_reference_a" => portable_emt_task_state(
+                value.phase_current_reference_a,
+            ),
+            "pole_voltage_reference_v" => portable_emt_task_state(
+                value.pole_voltage_reference_v,
+            ),
+            "positive_sequence_voltage_v" => value.positive_sequence_voltage_v,
+            "reactive_power_var" => value.reactive_power_var,
+            "request_disposition" => Int64(Int(value.request_disposition)),
+            "sequence_extractor_settled" => value.sequence_extractor_settled,
+            "wire_form" => Int64(Int(value.wire_form)),
+            "zero_sequence_voltage_v" => value.zero_sequence_voltage_v,
+        ],
+    )
+end
+
 function portable_emt_task_state(value::Base.RefValue)
     return PortableSnapshotRecord(
         "aimora.emt.task_ref.v1",
@@ -44,7 +74,10 @@ restore_portable_emt_task_state(::T, value::Rational) where {T<:Rational} =
 restore_portable_emt_task_state(::PortableSnapshotArray, value::PortableSnapshotArray) = value
 restore_portable_emt_task_state(::PortableSnapshotRecord, value::PortableSnapshotRecord) = value
 
-function restore_portable_emt_task_state(template::Tuple, value::AbstractVector)
+function restore_portable_emt_task_state(
+    template::Tuple,
+    value::Union{Tuple,AbstractVector},
+)
     length(template) == length(value) || _portable_emt_fail(
         :task_state_shape_mismatch,
         "portable task tuple state changed length",
@@ -68,6 +101,101 @@ function restore_portable_emt_task_state(template::AbstractVector{T}, value::Abs
         restored[index] = restore_portable_emt_task_state(exemplar, value[index])
     end
     return restored
+end
+
+function _restore_portable_emt_task_enum(template::T, value) where {T<:Enum}
+    value isa Signed || _portable_emt_fail(
+        :task_state_type_mismatch,
+        "portable task enumeration has the wrong type",
+    )
+    return try
+        T(value)
+    catch error
+        _portable_emt_fail(
+            :task_state_type_mismatch,
+            "portable task enumeration is invalid: $(sprint(showerror, error))",
+        )
+    end
+end
+
+function restore_portable_emt_task_state(
+    template::SwitchDetailedVSC.ExtendedVSCControlCommand,
+    value::PortableSnapshotRecord,
+)
+    required = [
+        "active_power_w",
+        "angle_rad",
+        "controller_family",
+        "duties",
+        "frequency_hz",
+        "limited",
+        "mode",
+        "negative_sequence_voltage_v",
+        "phase_current_reference_a",
+        "pole_voltage_reference_v",
+        "positive_sequence_voltage_v",
+        "reactive_power_var",
+        "request_disposition",
+        "sequence_extractor_settled",
+        "wire_form",
+        "zero_sequence_voltage_v",
+    ]
+    fields = _portable_emt_scheduler_record_fields(
+        value,
+        "aimora.emt.extended_vsc_control_command.v1",
+        required,
+    )
+    return SwitchDetailedVSC.ExtendedVSCControlCommand(
+        _restore_portable_emt_task_enum(
+            template.controller_family,
+            fields["controller_family"],
+        ),
+        _restore_portable_emt_task_enum(template.wire_form, fields["wire_form"]),
+        restore_portable_emt_task_state(template.duties, fields["duties"]),
+        restore_portable_emt_task_state(
+            template.pole_voltage_reference_v,
+            fields["pole_voltage_reference_v"],
+        ),
+        restore_portable_emt_task_state(
+            template.phase_current_reference_a,
+            fields["phase_current_reference_a"],
+        ),
+        restore_portable_emt_task_state(template.angle_rad, fields["angle_rad"]),
+        restore_portable_emt_task_state(
+            template.frequency_hz,
+            fields["frequency_hz"],
+        ),
+        restore_portable_emt_task_state(
+            template.active_power_w,
+            fields["active_power_w"],
+        ),
+        restore_portable_emt_task_state(
+            template.reactive_power_var,
+            fields["reactive_power_var"],
+        ),
+        restore_portable_emt_task_state(
+            template.positive_sequence_voltage_v,
+            fields["positive_sequence_voltage_v"],
+        ),
+        restore_portable_emt_task_state(
+            template.negative_sequence_voltage_v,
+            fields["negative_sequence_voltage_v"],
+        ),
+        restore_portable_emt_task_state(
+            template.zero_sequence_voltage_v,
+            fields["zero_sequence_voltage_v"],
+        ),
+        restore_portable_emt_task_state(
+            template.sequence_extractor_settled,
+            fields["sequence_extractor_settled"],
+        ),
+        restore_portable_emt_task_state(template.limited, fields["limited"]),
+        _restore_portable_emt_task_enum(template.mode, fields["mode"]),
+        _restore_portable_emt_task_enum(
+            template.request_disposition,
+            fields["request_disposition"],
+        ),
+    )
 end
 
 function _portable_emt_scheduler_record_fields(

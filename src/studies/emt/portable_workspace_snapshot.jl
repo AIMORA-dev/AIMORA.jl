@@ -853,6 +853,7 @@ function _portable_emt_state_inventory(workspace::EMTStudyWorkspace)
         _portable_emt_state_field("workspace.reset_count", "emt.workspace", :discrete, "1", workspace.reset_count),
         _portable_emt_state_field("workspace.ready", "emt.workspace", :discrete, "1", workspace.ready),
         _portable_emt_state_field("workspace.execution_mode", "emt.workspace", :discrete, "1", String(workspace.execution_mode)),
+        _portable_emt_state_field("workspace.random_state_policy", "emt.workspace", :random, "1", "not_applicable"),
         _portable_emt_state_field("workspace.reduced_output_indices", "emt.workspace", :checkpoint, "1", _portable_emt_integer_array(workspace.reduced_output_indices, "1", ["channel"]); axes = ["channel"]),
         _portable_emt_state_field("workspace.source_signal_plan_indices", "emt.workspace", :checkpoint, "1", _portable_emt_integer_array(workspace.source_signal_plan_indices, "1", ["source"]); axes = ["source"]),
     ])
@@ -1815,6 +1816,16 @@ function restore_portable_emt_state_inventory!(
 )
     fields = _portable_emt_inventory_fields(inventory)
     context = candidate.runtime.context
+    _portable_emt_scalar(
+        fields,
+        "workspace.random_state_policy",
+        :random,
+        "1",
+        String,
+    ) == "not_applicable" || _portable_emt_fail(
+        :random_state_mismatch,
+        "portable deterministic EMT workspace has an unsupported random-state policy",
+    )
     _portable_emt_identity_sequence(fields, "identity.node_order") == String.(context.node_names) ||
         _portable_emt_fail(:topology_mismatch, "portable EMT node order changed")
     _portable_emt_identity_sequence(fields, "identity.element_order") == String.(context.element_names) ||

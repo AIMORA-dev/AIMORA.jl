@@ -2302,7 +2302,8 @@ function _run_deck_emt(
         distributed_transposed_line_runtime_enabled &&
         (
             _deck_has_dynamic_distributed_line(parsed) ||
-            !isempty(DeckParser.deck_bergeron_line_rows(parsed))
+            !isempty(DeckParser.deck_bergeron_line_rows(parsed)) ||
+            _deck_has_frequency_dependent_line_runtime(parsed)
         ) ||
         saturated_transformer_dynamic_runtime ||
         ideal_transformer_source_runtime ||
@@ -2581,7 +2582,8 @@ function prepare_emt_study(
         distributed_transposed_line_runtime_enabled &&
         (
             _deck_has_dynamic_distributed_line(parsed) ||
-            !isempty(DeckParser.deck_bergeron_line_rows(parsed))
+            !isempty(DeckParser.deck_bergeron_line_rows(parsed)) ||
+            _deck_has_frequency_dependent_line_runtime(parsed)
         ) ||
         saturated_transformer_dynamic_runtime ||
         ideal_transformer_source_runtime ||
