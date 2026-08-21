@@ -2844,6 +2844,7 @@ function EMTStudyWorkspace(prepared::PreparedEMTStudy{R,P}) where {R,P}
         0,
         0,
         true,
+        :unselected,
         TimestepStateRestorer(),
     )
 end
@@ -2860,6 +2861,7 @@ function reset_emt_study!(
     workspace.parsed = prepared.parsed
     workspace.reset_count += 1
     workspace.ready = true
+    workspace.execution_mode = :unselected
     return workspace
 end
 
@@ -3249,6 +3251,10 @@ function evaluate_emt_study!(workspace::EMTStudyWorkspace)
     workspace.ready || throw(ArgumentError(
         "EMT study workspace must be reset before another evaluation",
     ))
+    workspace.execution_mode === :unselected || throw(ArgumentError(
+        "EMT study workspace is already owned by $(workspace.execution_mode) execution",
+    ))
+    workspace.execution_mode = :monolithic
     workspace.ready = false
     boundary_run = _run_prepared_dynamic_deck!(workspace.runtime)
     requested_trace =
