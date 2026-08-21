@@ -6,6 +6,7 @@ using ..EMTTaskPlatform: EMTLogicalTime
 export CausalLinearReconstruction,
        CausalZeroOrderReconstruction,
        DirectCoupledExchange,
+       EMTDeckPartitionCheckpoint,
        EMTDeckPartitionResult,
        EMTDeckRegion,
        EMTInterfacePort,
@@ -645,6 +646,39 @@ struct EMTPartitionCheckpoint
 end
 
 function partition_checkpoint_signature_sha256(checkpoint::EMTPartitionCheckpoint)
+    return checkpoint.signature_sha256
+end
+
+"""One accepted multi-region synchronization point with portable regional state."""
+struct EMTDeckPartitionCheckpoint
+    schema::Symbol
+    plan_signature_sha256::String
+    study_signature_sha256::String
+    region_identities::Tuple
+    port_identities::Tuple
+    accepted_window_count::Int
+    rejected_window_count::Int
+    regional_local_step_counts::Tuple
+    time_s::Float64
+    interface_current_a::Tuple
+    positive_terminal_voltage_v::Tuple
+    negative_terminal_voltage_v::Tuple
+    time_trace_s::Tuple
+    positive_terminal_voltage_trace_v::Tuple
+    negative_terminal_voltage_trace_v::Tuple
+    interface_current_trace_a::Tuple
+    voltage_residual_trace_v::Tuple
+    kcl_residual_trace_a::Tuple
+    interface_energy_defect_trace_j::Tuple
+    fixed_point_iteration_trace::Tuple
+    regional_snapshots::Tuple
+    last_failure::Union{Nothing,String}
+    signature_sha256::String
+end
+
+function partition_checkpoint_signature_sha256(
+    checkpoint::EMTDeckPartitionCheckpoint,
+)
     return checkpoint.signature_sha256
 end
 

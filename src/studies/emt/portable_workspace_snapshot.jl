@@ -1839,10 +1839,11 @@ function restore_portable_emt_state_inventory!(
         "1",
         String,
     ))
-    execution_mode in (:monolithic, :hybrid) || _portable_emt_fail(
-        :execution_mode_mismatch,
-        "portable EMT execution mode is unsupported",
-    )
+    execution_mode in (:monolithic, :hybrid, :partitioned_waveform) ||
+        _portable_emt_fail(
+            :execution_mode_mismatch,
+            "portable EMT execution mode is unsupported",
+        )
     if execution_mode === :hybrid && candidate.execution_mode !== :hybrid
         code = candidate.execution_mode === :unselected ?
             :hybrid_owner_required : :execution_mode_mismatch
@@ -1855,6 +1856,15 @@ function restore_portable_emt_state_inventory!(
         _portable_emt_fail(
             :execution_mode_mismatch,
             "portable monolithic state cannot replace a hybrid execution owner",
+        )
+    elseif execution_mode === :partitioned_waveform &&
+           !(
+               candidate.execution_mode === :partitioned_waveform &&
+               !candidate.ready
+           )
+        _portable_emt_fail(
+            :partition_owner_required,
+            "portable partition-region state requires its coordinating partition owner",
         )
     end
     context.dt_s = _portable_emt_scalar(fields, "execution.timestep", :checkpoint, "s", Float64)
@@ -2101,16 +2111,14 @@ function capture_portable_emt_snapshot(
     return snapshot
 end
 
-"""Restore a portable snapshot into a newly prepared isolated EMT workspace."""
-function restore_portable_emt_snapshot(
-    prepared::PreparedEMTStudy,
+function _restore_portable_emt_snapshot(
+    candidate::EMTStudyWorkspace,
     snapshot::PortableEMTSnapshot;
     project_signature_sha256::AbstractString,
     model_signature_sha256::AbstractString,
     settings_signature_sha256::AbstractString,
     source_descriptor::Union{Nothing,PortableSnapshotDescriptor}=nothing,
 )
-    candidate = EMTStudyWorkspace(prepared)
     _portable_emt_validate_metadata(
         snapshot.metadata,
         candidate;
@@ -2157,6 +2165,25 @@ function restore_portable_emt_snapshot(
         restored_public.signature_sha256,
         restored_backend.signature_sha256,
         true,
+    )
+end
+
+"""Restore a portable snapshot into a newly prepared isolated EMT workspace."""
+function restore_portable_emt_snapshot(
+    prepared::PreparedEMTStudy,
+    snapshot::PortableEMTSnapshot;
+    project_signature_sha256::AbstractString,
+    model_signature_sha256::AbstractString,
+    settings_signature_sha256::AbstractString,
+    source_descriptor::Union{Nothing,PortableSnapshotDescriptor}=nothing,
+)
+    return _restore_portable_emt_snapshot(
+        EMTStudyWorkspace(prepared),
+        snapshot;
+        project_signature_sha256,
+        model_signature_sha256,
+        settings_signature_sha256,
+        source_descriptor,
     )
 end
 
