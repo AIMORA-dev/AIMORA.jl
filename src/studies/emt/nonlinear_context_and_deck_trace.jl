@@ -1636,7 +1636,10 @@ function EMTStepTransaction(workspace::EMTStudyWorkspace)
     return EMTStepTransaction(runtime, TimestepTransaction(runtime))
 end
 
-function initialize_partitioned_emt_workspace!(workspace::EMTStudyWorkspace)
+function initialize_partitioned_emt_workspace!(
+    workspace::EMTStudyWorkspace;
+    execution_mode::Symbol=:partitioned_waveform,
+)
     workspace.ready || throw(ArgumentError(
         "EMT partition region must begin from an unclaimed prepared workspace",
     ))
@@ -1663,7 +1666,16 @@ function initialize_partitioned_emt_workspace!(workspace::EMTStudyWorkspace)
         context.step_index = 1
         context.t_s = context.dt_s
     end
-    workspace.execution_mode = :partitioned_waveform
+    execution_mode in (
+        :monolithic,
+        :local_subcycling,
+        :partitioned_lagged,
+        :partitioned_waveform,
+        :combined_local_partitioned,
+    ) || throw(ArgumentError(
+        "EMT partition region execution mode is unsupported",
+    ))
+    workspace.execution_mode = execution_mode
     workspace.ready = false
     return workspace
 end

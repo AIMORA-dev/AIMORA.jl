@@ -32,6 +32,7 @@ end
 
 @testset "public local multirate partition contracts" begin
     plan = public_partition_plan()
+    @test plan.execution_mode == CombinedLocalPartitionedExecution
     @test plan.rate_ratios == (4, 1)
     @test plan.communication_window_count == 20
     @test partition_plan_signature_sha256(plan) == plan.signature_sha256
@@ -140,6 +141,60 @@ end
         load_step = 1 // 1_000_000,
         method = DirectCoupledExchange,
     )
+
+    equal_rate_waveform = public_partition_plan(
+        source_step = 1 // 1_000_000,
+        load_step = 1 // 1_000_000,
+    )
+    @test equal_rate_waveform.execution_mode == PartitionedWaveformExecution
+    lagged = public_partition_plan(
+        source_step = 1 // 1_000_000,
+        load_step = 1 // 1_000_000,
+        method = LaggedCausalExchange,
+    )
+    @test lagged.execution_mode == PartitionedLaggedExecution
+    local_subcycling = emt_partition_plan(
+        (
+            EMTPartitionRegion(
+                "connected_network",
+                ["frequency_dependent_line"],
+                emt_logical_time(1 // 4_000_000),
+            ),
+        ),
+        ();
+        start=emt_logical_time(0),
+        stop=emt_logical_time(4 // 1_000_000),
+        communication_step=emt_logical_time(1 // 1_000_000),
+        exchange=EMTPartitionExchangePolicy(DirectCoupledExchange),
+        execution_mode=LocalSubcyclingExecution,
+    )
+    @test local_subcycling.execution_mode == LocalSubcyclingExecution
+
+    for kind in (
+        VoltageCurrentInterfacePort,
+        NortonInterfacePort,
+        TheveninInterfacePort,
+        ScatteringInterfacePort,
+        TravelingWaveInterfacePort,
+    )
+        equivalent_port = EMTInterfacePort(
+            "equivalent_port",
+            kind,
+            "positive",
+            "negative",
+            "positive_terminal",
+            "negative_terminal";
+            reference_impedance_ohm=12.8,
+        )
+        coordinates = emt_interface_coordinates(equivalent_port, 87.5, -3.25)
+        physical = emt_interface_physical_values(
+            equivalent_port,
+            coordinates.first,
+            coordinates.second,
+        )
+        @test physical.voltage_v ≈ 87.5 rtol=8eps(Float64)
+        @test physical.outward_current_a ≈ -3.25 rtol=8eps(Float64)
+    end
 
     if !AIMORA.solver_available()
         unavailable = AIMORA.prepare_partitioned_emt(study)

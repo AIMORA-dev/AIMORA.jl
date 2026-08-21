@@ -1839,7 +1839,13 @@ function restore_portable_emt_state_inventory!(
         "1",
         String,
     ))
-    execution_mode in (:monolithic, :hybrid, :partitioned_waveform) ||
+    partition_execution_modes = (
+        :local_subcycling,
+        :partitioned_lagged,
+        :partitioned_waveform,
+        :combined_local_partitioned,
+    )
+    execution_mode in (:monolithic, :hybrid, partition_execution_modes...) ||
         _portable_emt_fail(
             :execution_mode_mismatch,
             "portable EMT execution mode is unsupported",
@@ -1857,9 +1863,9 @@ function restore_portable_emt_state_inventory!(
             :execution_mode_mismatch,
             "portable monolithic state cannot replace a hybrid execution owner",
         )
-    elseif execution_mode === :partitioned_waveform &&
+    elseif execution_mode in partition_execution_modes &&
            !(
-               candidate.execution_mode === :partitioned_waveform &&
+               candidate.execution_mode === execution_mode &&
                !candidate.ready
            )
         _portable_emt_fail(
