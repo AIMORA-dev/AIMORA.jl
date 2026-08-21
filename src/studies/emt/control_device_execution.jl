@@ -2536,6 +2536,7 @@ function prepare_emt_study(
     time_horizon::Symbol = :arguments,
     output_schedule::Symbol = :all_steps,
     source_signal_provider::AbstractSourceSignalProvider = IdentitySourceSignalProvider(),
+    external_current_injection_provider = nothing,
 )
     parsed = deepcopy(parsed)
     time_horizon in (:arguments, :deck) ||
@@ -2595,7 +2596,8 @@ function prepare_emt_study(
             parsed.elements,
         ) ||
         !isempty(series_rlc_alterations) ||
-        initial_voltage_sample !== nothing
+        initial_voltage_sample !== nothing ||
+        external_current_injection_provider !== nothing
     dynamic_network_runtime || throw(ArgumentError(
         "prepared EMT execution currently requires the production dynamic network runtime",
     ))
@@ -2634,6 +2636,7 @@ function prepare_emt_study(
         series_rlc_alterations = series_rlc_alterations,
         store_step_updates = _deck_uses_dynamic_nonlinear_runtime(parsed),
         source_signal_provider = source_signal_provider,
+        over16_step_configs = external_current_injection_provider,
     )
     return PreparedEMTStudy(runtime, parsed)
 end

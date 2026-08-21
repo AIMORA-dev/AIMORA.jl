@@ -54,6 +54,64 @@ end
         load_capacitance_f = 2.0e-4,
     ).signature_sha256
 
+    source_region = EMTDeckRegion(
+        "source",
+        (
+            "source grid SOURCE 1.0e9 0.0 0.0 0.0 120.0",
+            "rl source_rl SOURCE SOURCE_TERMINAL 0.8 0.015",
+        );
+        source_identity = "source_region_deck",
+    )
+    load_region = EMTDeckRegion(
+        "load",
+        (
+            "resistor load_r LOAD_TERMINAL 0 12.0",
+            "capacitor load_c LOAD_TERMINAL 0 2.0e-4",
+        );
+        source_identity = "load_region_deck",
+    )
+    deck_plan = emt_partition_plan(
+        (
+            EMTPartitionRegion(
+                "source",
+                ["grid", "source_rl"],
+                emt_logical_time(1 // 4_000_000),
+            ),
+            EMTPartitionRegion(
+                "load",
+                ["load_c", "load_r"],
+                emt_logical_time(1 // 1_000_000),
+            ),
+        ),
+        (
+            EMTInterfacePort(
+                "interface",
+                VoltageCurrentInterfacePort,
+                "source",
+                "load",
+                "SOURCE_TERMINAL",
+                "LOAD_TERMINAL";
+                reference_impedance_ohm = 12.8,
+            ),
+        );
+        start = emt_logical_time(0),
+        stop = emt_logical_time(20 // 1_000_000),
+        communication_step = emt_logical_time(1 // 1_000_000),
+    )
+    deck_study = PartitionedDeckEMTStudy(
+        deck_plan,
+        (load_region, source_region),
+    )
+    @test getfield.(deck_study.regions, :identity) == ("source", "load")
+    @test deck_study.initial_interface_current_a == (0.0,)
+    @test partition_study_signature_sha256(deck_study) ==
+        deck_study.signature_sha256
+    @test occursin(r"^[0-9a-f]{64}$", source_region.signature_sha256)
+    @test_throws ArgumentError PartitionedDeckEMTStudy(
+        deck_plan,
+        (source_region,),
+    )
+
     duplicate_owner = (
         EMTPartitionRegion("one", ["shared_model"], emt_logical_time(1 // 1_000_000)),
         EMTPartitionRegion("two", ["shared_model"], emt_logical_time(1 // 1_000_000)),
@@ -88,5 +146,7 @@ end
         @test unavailable isa AIMORA.SolverUnavailableResult
         @test unavailable.operation == :prepare_partitioned_emt
         @test unavailable.required_capability == :local_multirate_partitioned_emt
+        unavailable_deck = AIMORA.prepare_partitioned_emt(deck_study)
+        @test unavailable_deck isa AIMORA.SolverUnavailableResult
     end
 end

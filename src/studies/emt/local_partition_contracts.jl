@@ -6,6 +6,8 @@ using ..EMTTaskPlatform: EMTLogicalTime
 export CausalLinearReconstruction,
        CausalZeroOrderReconstruction,
        DirectCoupledExchange,
+       EMTDeckPartitionResult,
+       EMTDeckRegion,
        EMTInterfacePort,
        EMTInterfacePortKind,
        EMTPartitionCheckpoint,
@@ -19,6 +21,7 @@ export CausalLinearReconstruction,
        EMTPartitionTolerancePolicy,
        IteratedWaveformExchange,
        NortonInterfacePort,
+       PartitionedDeckEMTStudy,
        PassiveTwoRegionRLCStudy,
        ScatteringInterfacePort,
        TheveninInterfacePort,
@@ -135,6 +138,7 @@ struct EMTInterfacePort
     current_unit::String
     voltage_base_v::Float64
     current_base_a::Float64
+    reference_impedance_ohm::Float64
 
     function EMTInterfacePort(
         identity::AbstractString,
@@ -147,6 +151,7 @@ struct EMTInterfacePort
         current_unit::AbstractString = "A",
         voltage_base_v::Real = 1.0,
         current_base_a::Real = 1.0,
+        reference_impedance_ohm::Real = 1.0,
     )
         positive = _partition_identity(positive_region, "positive port region")
         negative = _partition_identity(negative_region, "negative port region")
@@ -170,6 +175,10 @@ struct EMTInterfacePort
             String(current_unit),
             _positive_finite(voltage_base_v, "partition voltage base"),
             _positive_finite(current_base_a, "partition current base"),
+            _positive_finite(
+                reference_impedance_ohm,
+                "partition reference impedance",
+            ),
         )
     end
 end
@@ -282,9 +291,150 @@ function _partition_signature_lines(
         push!(lines, "region=$(region.identity)|$(join(region.model_identities, ','))|$(region.local_step.numerator)/$(region.local_step.denominator)|$ratio")
     end
     for port in ports
-        push!(lines, "port=$(port.identity)|$(UInt8(port.kind))|$(port.positive_region)|$(port.negative_region)|$(port.positive_terminal)|$(port.negative_terminal)|$(port.voltage_unit)|$(port.current_unit)|$(repr(port.voltage_base_v))|$(repr(port.current_base_a))")
+        push!(lines, "port=$(port.identity)|$(UInt8(port.kind))|$(port.positive_region)|$(port.negative_region)|$(port.positive_terminal)|$(port.negative_terminal)|$(port.voltage_unit)|$(port.current_unit)|$(repr(port.voltage_base_v))|$(repr(port.current_base_a))|$(repr(port.reference_impedance_ohm))")
     end
     return lines
+end
+
+"""Solver-free declaration of one canonical EMT deck owned by one partition region."""
+struct EMTDeckRegion
+    identity::String
+    deck_lines::Tuple
+    source_identity::String
+    initial_voltage_source::Symbol
+    saturated_transformer_runtime::Bool
+    coupled_lumped_history_runtime::Bool
+    distributed_line_runtime::Bool
+    signature_sha256::String
+
+    function EMTDeckRegion(
+        identity::AbstractString,
+        deck_lines;
+        source_identity::AbstractString = identity,
+        initial_voltage_source::Symbol = :none,
+        saturated_transformer_runtime::Bool = false,
+        coupled_lumped_history_runtime::Bool = false,
+        distributed_line_runtime::Bool = true,
+    )
+        region_identity = _partition_identity(identity, "deck region identity")
+        source = _partition_identity(
+            source_identity,
+            "deck region source identity",
+        )
+        initial_voltage_source in (:none, :steady_state) || throw(ArgumentError(
+            "deck region initial voltage source must be :none or :steady_state",
+        ))
+        lines = Tuple(String(line) for line in deck_lines)
+        isempty(lines) && throw(ArgumentError(
+            "deck region must contain at least one deck line",
+        ))
+        all(line -> !occursin('\0', line), lines) || throw(ArgumentError(
+            "deck region lines must not contain NUL bytes",
+        ))
+        signature_lines = String[
+            "schema=aimora.emt.deck_region.v1",
+            "identity=$region_identity",
+            "source_identity=$source",
+            "initial_voltage_source=$initial_voltage_source",
+            "saturated_transformer_runtime=$saturated_transformer_runtime",
+            "coupled_lumped_history_runtime=$coupled_lumped_history_runtime",
+            "distributed_line_runtime=$distributed_line_runtime",
+        ]
+        for (index, line) in enumerate(lines)
+            push!(
+                signature_lines,
+                "line=$index|$(ncodeunits(line))|$(bytes2hex(sha256(line)))",
+            )
+        end
+        return new(
+            region_identity,
+            lines,
+            source,
+            initial_voltage_source,
+            saturated_transformer_runtime,
+            coupled_lumped_history_runtime,
+            distributed_line_runtime,
+            bytes2hex(sha256(join(signature_lines, '\n'))),
+        )
+    end
+end
+
+"""A partition plan bound to complete canonical regional decks and initial port currents."""
+struct PartitionedDeckEMTStudy{P<:EMTPartitionPlan,R<:Tuple}
+    plan::P
+    regions::R
+    initial_interface_current_a::Tuple
+    signature_sha256::String
+
+    function PartitionedDeckEMTStudy(
+        plan::P,
+        regions;
+        initial_interface_current_a = zeros(length(plan.ports)),
+    ) where {P<:EMTPartitionPlan}
+        declarations = Tuple(regions)
+        all(region -> region isa EMTDeckRegion, declarations) || throw(
+            ArgumentError("partitioned deck regions must use EMTDeckRegion"),
+        )
+        declared_names = getfield.(declarations, :identity)
+        length(declared_names) == length(unique(declared_names)) || throw(
+            ArgumentError("partitioned deck study repeats a region identity"),
+        )
+        plan_names = getfield.(plan.regions, :identity)
+        Set(declared_names) == Set(plan_names) || throw(ArgumentError(
+            "partitioned deck declarations must match every plan region exactly",
+        ))
+        ordered = Tuple(
+            declarations[only(findall(==(name), declared_names))]
+            for name in plan_names
+        )
+        currents = Tuple(Float64.(initial_interface_current_a))
+        length(currents) == length(plan.ports) || throw(DimensionMismatch(
+            "partitioned deck initial currents must contain one value per interface",
+        ))
+        all(isfinite, currents) || throw(ArgumentError(
+            "partitioned deck initial interface currents must be finite",
+        ))
+        signature_lines = String[
+            "schema=aimora.emt.partitioned_deck_study.v1",
+            "plan=$(plan.signature_sha256)",
+        ]
+        for region in ordered
+            push!(signature_lines, "region=$(region.identity)|$(region.signature_sha256)")
+        end
+        for (port, current) in zip(plan.ports, currents)
+            push!(signature_lines, "initial_current=$(port.identity)|$(repr(current))")
+        end
+        return new{P,typeof(ordered)}(
+            plan,
+            ordered,
+            currents,
+            bytes2hex(sha256(join(signature_lines, '\n'))),
+        )
+    end
+end
+
+partition_study_signature_sha256(study::PartitionedDeckEMTStudy) =
+    study.signature_sha256
+
+"""Accepted synchronization samples and conservative interface diagnostics."""
+struct EMTDeckPartitionResult
+    plan_signature_sha256::String
+    study_signature_sha256::String
+    region_identities::Tuple
+    port_identities::Tuple
+    time_s::Vector{Float64}
+    positive_terminal_voltage_v::Matrix{Float64}
+    negative_terminal_voltage_v::Matrix{Float64}
+    interface_current_a::Matrix{Float64}
+    voltage_residual_v::Matrix{Float64}
+    kcl_residual_a::Matrix{Float64}
+    interface_energy_defect_j::Matrix{Float64}
+    fixed_point_iterations::Vector{Int}
+    regional_local_step_counts::Tuple
+    accepted_window_count::Int
+    rejected_window_count::Int
+    accepted::Bool
+    deterministic_signature_sha256::String
 end
 
 function emt_partition_plan(
