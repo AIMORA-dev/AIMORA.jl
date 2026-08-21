@@ -1,0 +1,92 @@
+using AIMORA.EMTPartitioning
+using AIMORA.EMTTaskPlatform
+
+function public_partition_plan(;
+    communication_step = 1 // 1_000_000,
+    source_step = 1 // 4_000_000,
+    load_step = 1 // 1_000_000,
+    stop = 20 // 1_000_000,
+    method = IteratedWaveformExchange,
+)
+    regions = (
+        EMTPartitionRegion("source", ["source_rl"], emt_logical_time(source_step)),
+        EMTPartitionRegion("load", ["load_rc"], emt_logical_time(load_step)),
+    )
+    port = EMTInterfacePort(
+        "interface",
+        VoltageCurrentInterfacePort,
+        "source",
+        "load",
+        "source_terminal",
+        "load_terminal",
+    )
+    return emt_partition_plan(
+        regions,
+        (port,);
+        start = emt_logical_time(0),
+        stop = emt_logical_time(stop),
+        communication_step = emt_logical_time(communication_step),
+        exchange = EMTPartitionExchangePolicy(method),
+    )
+end
+
+@testset "public local multirate partition contracts" begin
+    plan = public_partition_plan()
+    @test plan.rate_ratios == (4, 1)
+    @test plan.communication_window_count == 20
+    @test partition_plan_signature_sha256(plan) == plan.signature_sha256
+    @test occursin(r"^[0-9a-f]{64}$", plan.signature_sha256)
+    study = PassiveTwoRegionRLCStudy(
+        plan;
+        source_voltage_v = 120.0,
+        source_resistance_ohm = 0.8,
+        source_inductance_h = 0.015,
+        load_resistance_ohm = 12.0,
+        load_capacitance_f = 2.0e-4,
+    )
+    @test partition_study_signature_sha256(study) == study.signature_sha256
+    @test study.signature_sha256 == PassiveTwoRegionRLCStudy(
+        plan;
+        source_voltage_v = 120.0,
+        source_resistance_ohm = 0.8,
+        source_inductance_h = 0.015,
+        load_resistance_ohm = 12.0,
+        load_capacitance_f = 2.0e-4,
+    ).signature_sha256
+
+    duplicate_owner = (
+        EMTPartitionRegion("one", ["shared_model"], emt_logical_time(1 // 1_000_000)),
+        EMTPartitionRegion("two", ["shared_model"], emt_logical_time(1 // 1_000_000)),
+    )
+    duplicate_port = EMTInterfacePort(
+        "duplicate_interface",
+        VoltageCurrentInterfacePort,
+        "one",
+        "two",
+        "one_terminal",
+        "two_terminal",
+    )
+    @test_throws ArgumentError emt_partition_plan(
+        duplicate_owner,
+        (duplicate_port,);
+        start = emt_logical_time(0),
+        stop = emt_logical_time(1 // 1_000),
+        communication_step = emt_logical_time(1 // 1_000_000),
+    )
+    @test_throws ArgumentError public_partition_plan(
+        communication_step = 1 // 1_000_000,
+        source_step = 1 // 3_000_001,
+    )
+    @test_throws ArgumentError public_partition_plan(
+        source_step = 1 // 4_000_000,
+        load_step = 1 // 1_000_000,
+        method = DirectCoupledExchange,
+    )
+
+    if !AIMORA.solver_available()
+        unavailable = AIMORA.prepare_partitioned_emt(study)
+        @test unavailable isa AIMORA.SolverUnavailableResult
+        @test unavailable.operation == :prepare_partitioned_emt
+        @test unavailable.required_capability == :local_multirate_partitioned_emt
+    end
+end
