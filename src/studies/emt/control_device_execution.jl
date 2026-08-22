@@ -1949,6 +1949,21 @@ function _deck_requested_electrical_trace(
         trace_output_is_public(element) || continue
         trace_output_channel_names!(output_names, element_name, element)
     end
+    frequency_dependent_line_names = vcat(
+        DeckParser.deck_sampled_frequency_line_element_names(parsed),
+        DeckParser.deck_semlyen_line_element_names(parsed),
+        DeckParser.deck_rational_frequency_line_element_names(parsed),
+    )
+    for element_name in frequency_dependent_line_names
+        channel_prefix = string(element_name, '_')
+        append!(
+            output_names,
+            (
+                channel for channel in trace.output_channel_names
+                if startswith(String(channel), channel_prefix)
+            ),
+        )
+    end
     append!(output_names, _deck_requested_electrical_output_names(parsed))
     unique!(output_names)
     output_indices = Int[]
