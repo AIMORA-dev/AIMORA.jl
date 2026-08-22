@@ -47,6 +47,23 @@ end
     end
 end
 
+@testset "nonlinear nodal step callback admission" begin
+    callback = (context, injections, constraints) ->
+        (context, injections, constraints)
+    @test AIMORA.EMTStudy._execute_nonlinear_nodal_step_solver(
+        callback,
+        :context,
+        [1.0],
+        :constraints,
+    ) == (:context, [1.0], :constraints)
+    @test_throws ArgumentError AIMORA.EMTStudy._execute_nonlinear_nodal_step_solver(
+        :not_callable,
+        :context,
+        [1.0],
+        :constraints,
+    )
+end
+
 @testset "open engineering core" begin
     issue = AIMORA.ValidationCore.missing_data("line", "length is required")
     result = AIMORA.ValidationCore.validation_result(source = "public package test")
