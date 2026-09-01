@@ -1,7 +1,10 @@
 module AIMORA
 
 include("solver_api/backend.jl")
+include("solver_api/worker.jl")
+include("performance_execution.jl")
 include("studies/emt/portable_snapshot_io.jl")
+include("studies/emt/dassl_class_contracts.jl")
 
 # Public, dependency-light engineering core.
 include("core/study.jl")
@@ -15,6 +18,7 @@ include("io/project_io.jl")
 include("models/inverter.jl")
 include("models/switch_detailed_vsc.jl")
 include("models/bridge_topologies.jl")
+include("models/converter_systems.jl")
 include("models/nonlinear_network.jl")
 include("extensions/native_components.jl")
 include("models/inverter_assets.jl")
@@ -35,5 +39,6 @@ include("studies/power_flow.jl")
 include("studies/short_circuit.jl")
 include("studies/protection.jl")
 include("studies/arc_flash.jl")
+include("models/surge_insulation.jl")
 
 end

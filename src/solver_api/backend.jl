@@ -3,15 +3,21 @@ export AbstractAIMORASolverBackend,
        SolverUnavailableResult,
        activate_solver!,
        active_solver_backend,
+       advance_converter_system!,
        backend_metadata,
        advance_partitioned_emt!,
        execute_study!,
        execute_partitioned_emt!,
+       execute_converter_system!,
+       materialize_emt_breaker_poles,
        materialize_measurement_branches,
+       prepare_protection_task_pipeline,
+       advance_protection_task_pipeline!,
        partitioned_emt_checkpoint,
        partitioned_emt_status,
        prepare_line_fit,
        prepare_partitioned_emt,
+       prepare_converter_system,
        prepare_study,
        require_solver,
        restore_partitioned_emt_checkpoint!,
@@ -168,6 +174,31 @@ materialize_measurement_branches(::AbstractAIMORASolverBackend, definitions) =
         message = "The active backend does not implement measurement-network branches.",
     )
 
+materialize_emt_breaker_poles(
+    ::AbstractAIMORASolverBackend,
+    runtime,
+    specification,
+    terminal_nodes,
+) = _solver_unavailable_result(
+    :materialize_emt_breaker_poles,
+    :emt_protection_breaker;
+    message = "The active backend does not implement physical EMT breaker poles.",
+)
+
+prepare_protection_task_pipeline(::AbstractAIMORASolverBackend, pipeline) =
+    _solver_unavailable_result(
+        :prepare_protection_task_pipeline,
+        :emt_protection_breaker;
+        message = "The active backend does not implement exact protection-task dispatch.",
+    )
+
+advance_protection_task_pipeline!(::AbstractAIMORASolverBackend, prepared, instant) =
+    _solver_unavailable_result(
+        :advance_protection_task_pipeline,
+        :emt_protection_breaker;
+        message = "The active backend does not implement exact protection-task dispatch.",
+    )
+
 prepare_line_fit(::AbstractAIMORASolverBackend, request) =
     _solver_unavailable_result(
         :prepare_line_fit,
@@ -234,6 +265,30 @@ partitioned_emt_status(::AbstractAIMORASolverBackend, prepared) =
         message = "The active backend does not implement partitioned EMT status.",
     )
 
+prepare_converter_system(::AbstractAIMORASolverBackend, study) =
+    _solver_unavailable_result(
+        :prepare_converter_system,
+        :extended_converter_systems;
+        message = "The active backend does not implement converter-system preparation.",
+    )
+
+advance_converter_system!(
+    ::AbstractAIMORASolverBackend,
+    prepared,
+    accepted_step_count::Integer=1,
+) = _solver_unavailable_result(
+    :advance_converter_system,
+    :extended_converter_systems;
+    message = "The active backend does not implement bounded converter-system advancement.",
+)
+
+execute_converter_system!(::AbstractAIMORASolverBackend, prepared) =
+    _solver_unavailable_result(
+        :execute_converter_system,
+        :extended_converter_systems;
+        message = "The active backend does not implement converter-system execution.",
+    )
+
 function prepare_study(project, study)
     backend = active_solver_backend()
     return backend === nothing ?
@@ -255,6 +310,38 @@ function materialize_measurement_branches(definitions)
         :materialize_measurement_branches,
         :measurement_network_materialization,
     ) : materialize_measurement_branches(backend, definitions)
+end
+
+function materialize_emt_breaker_poles(runtime, specification, terminal_nodes)
+    backend = active_solver_backend()
+    return backend === nothing ?
+           _solver_unavailable_result(
+        :materialize_emt_breaker_poles,
+        :emt_protection_breaker,
+    ) : materialize_emt_breaker_poles(
+        backend,
+        runtime,
+        specification,
+        terminal_nodes,
+    )
+end
+
+function prepare_protection_task_pipeline(pipeline)
+    backend = active_solver_backend()
+    return backend === nothing ?
+           _solver_unavailable_result(
+        :prepare_protection_task_pipeline,
+        :emt_protection_breaker,
+    ) : prepare_protection_task_pipeline(backend, pipeline)
+end
+
+function advance_protection_task_pipeline!(prepared, instant)
+    backend = active_solver_backend()
+    return backend === nothing ?
+           _solver_unavailable_result(
+        :advance_protection_task_pipeline,
+        :emt_protection_breaker,
+    ) : advance_protection_task_pipeline!(backend, prepared, instant)
 end
 
 function prepare_line_fit(request)
@@ -330,4 +417,31 @@ function partitioned_emt_status(prepared)
         :partitioned_emt_status,
         :local_multirate_partitioned_emt,
     ) : partitioned_emt_status(backend, prepared)
+end
+
+function prepare_converter_system(study)
+    backend = active_solver_backend()
+    return backend === nothing ?
+           _solver_unavailable_result(
+        :prepare_converter_system,
+        :extended_converter_systems,
+    ) : prepare_converter_system(backend, study)
+end
+
+function advance_converter_system!(prepared, accepted_step_count::Integer=1)
+    backend = active_solver_backend()
+    return backend === nothing ?
+           _solver_unavailable_result(
+        :advance_converter_system,
+        :extended_converter_systems,
+    ) : advance_converter_system!(backend, prepared, accepted_step_count)
+end
+
+function execute_converter_system!(prepared)
+    backend = active_solver_backend()
+    return backend === nothing ?
+           _solver_unavailable_result(
+        :execute_converter_system,
+        :extended_converter_systems,
+    ) : execute_converter_system!(backend, prepared)
 end
