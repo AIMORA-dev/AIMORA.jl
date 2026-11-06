@@ -39,6 +39,36 @@ end
     @test nonlinear.power_semiconductor_gate_transition_residual(device,ContinuousEvaluationTime(1.0,1e-20))===nothing
 end
 
+@testset "scheduled switch stamps keep both sides of exact deadlines" begin
+    switches=AIMORA.Switches;branches=AIMORA.Branches
+    switch=switches.TimeSwitch(1,0;close_time_s=1.0,open_time_s=2.0,
+        on_conductance=20.0,off_conductance=1e-6)
+    before=deepcopy(switch)
+    for (deadline,low,expected) in ((1.0,-1e-20,false),(1.0,0.0,true),(1.0,1e-20,true),
+        (2.0,-1e-20,true),(2.0,0.0,false),(2.0,1e-20,false))
+        time=ContinuousEvaluationTime(deadline,low)
+        @test time.high_s==deadline
+        @test switches.switch_closed(switch,time)==expected
+        for method in (branches.TrapezoidalCompanion,branches.BackwardEulerCompanion)
+            matrix=zeros(1,1);rhs=zeros(1)
+            branches.stamp!(matrix,rhs,switch,time,1e-5,Val(method))
+            @test matrix[1,1]==(expected ? 20.0 : 1e-6)
+            @test iszero(rhs[1])
+        end
+    end
+    @test all(k->isequal(getfield(switch,k),getfield(before,k)),fieldnames(typeof(switch)))
+    simultaneous=switches.TimeSwitch(1,0;close_time_s=1.0,open_time_s=1.0)
+    @test !switches.switch_closed(simultaneous,ContinuousEvaluationTime(1.0,1e-20))
+    initially=switches.TimeSwitch(1,0;initially_closed=true,open_time_s=1.0)
+    @test switches.switch_closed(initially,ContinuousEvaluationTime(1.0,-1e-20))
+    @test !switches.switch_closed(initially,ContinuousEvaluationTime(1.0,1e-20))
+    for owner in (switches.IdealSwitch(1,0,true),switches.CurrentZeroSwitch(initially))
+        @test switches.switch_closed(owner,ContinuousEvaluationTime(1.0,1e-20))
+        matrix=zeros(1,1);branches.stamp!(matrix,zeros(1),owner,ContinuousEvaluationTime(1.0,-1e-20),1e-5)
+        @test matrix[1,1]==owner.on_conductance
+    end
+end
+
 if AIMORA.solver_available()
     @testset "continuous source stamps retain precision until RHS storage" begin
         branches = AIMORA.Branches

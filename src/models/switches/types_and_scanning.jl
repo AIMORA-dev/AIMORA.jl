@@ -1,3 +1,5 @@
+using ..StudyCore: ContinuousEvaluationTime
+
 import ..Branches: EMTElement,
                    backward_euler_companion_supported,
                    stamp!,
@@ -1271,3 +1273,19 @@ function over16_controlled_switch_scan_step(
         altered = true,
     )
 end
+
+# Scheduled switches compare the full normalized evaluation clock. In
+# particular, a low part below a deadline must not select its later topology.
+_switch_deadline_reached(time::ContinuousEvaluationTime, deadline::Float64) =
+    time.high_s > deadline || (time.high_s == deadline && time.low_s >= 0.0)
+
+function switch_closed(s::TimeSwitch, time::ContinuousEvaluationTime)::Bool
+    s.current_extinction === nothing || return s.current_extinction.closed
+    closed = s.initially_closed
+    isfinite(s.close_time_s) && _switch_deadline_reached(time,s.close_time_s) && (closed=true)
+    isfinite(s.open_time_s) && _switch_deadline_reached(time,s.open_time_s) && (closed=false)
+    closed
+end
+switch_closed(s::Union{IdealSwitch,CurrentZeroSwitch}, ::ContinuousEvaluationTime)::Bool = s.closed
+switch_conductance(s::Union{IdealSwitch,TimeSwitch,CurrentZeroSwitch}, time::ContinuousEvaluationTime)::Float64 =
+    switch_closed(s,time) ? s.on_conductance : s.off_conductance

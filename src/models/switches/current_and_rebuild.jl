@@ -768,3 +768,13 @@ update!(::Union{IdealSwitch,TimeSwitch}, _voltages::AbstractVector{Float64},
         _dt::Float64) = nothing
 
 update!(::CurrentZeroSwitch, _voltages::AbstractVector{Float64}, _dt::Float64) = nothing
+
+function stamp!(y::AbstractMatrix{<:Real}, _rhs::AbstractVector{<:Real},
+    switch::Union{IdealSwitch,TimeSwitch,CurrentZeroSwitch},
+    time::ContinuousEvaluationTime, _step::Float64)
+    stamp_conductance!(y,switch.a,switch.b,switch_conductance(switch,time))
+    nothing
+end
+stamp!(y::AbstractMatrix{<:Real}, rhs::AbstractVector{<:Real},
+    switch::Union{IdealSwitch,TimeSwitch,CurrentZeroSwitch},
+    time::ContinuousEvaluationTime, step::Float64, ::Val) = stamp!(y,rhs,switch,time,step)
