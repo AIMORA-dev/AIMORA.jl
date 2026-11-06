@@ -1,6 +1,7 @@
 using AIMORA.CoupledLineFitting
 using AIMORA.CoupledLineRuntime
 
+
 function manufactured_coupled_line_runtime_preparation(;
     timestep_s=10.0e-6,
     maximum_frequency_hz=1_000.0,
@@ -247,4 +248,81 @@ end
     report = coupled_line_runtime_report_text(state)
     @test occursin("runtime_signature_sha256=", report)
     @test occursin("accepted_step_count=20", report)
+end
+
+@testset "coupled line event-step realization and clock" begin
+    fixture = manufactured_coupled_line_runtime_preparation()
+    preparation, model = fixture.preparation, fixture.model
+    state = coupled_line_runtime_state(preparation)
+    ns, np = length(state.rational_state), length(state.incident_wave)
+    for (index, (duration, implicit)) in enumerate(
+        [(2.5e-6, true), (7.5e-6, true), (10.0e-6, false),
+            (1.0e-10, true), (4.0e-6, false), (6.0e-6, false)])
+        old_state = copy(state.rational_state)
+        old_incident = copy(state.previous_incident_wave)
+        voltage = [100sin(index), -30cos(index), 20sin(index), -10cos(index)]
+        theta = implicit ? 1.0 : 0.5
+        # Solve independent continuous state+wave equations simultaneously,
+        # not the production companion or its history reconstruction.
+        block = vcat(
+            hcat(Matrix{Float64}(I, ns, ns) - theta * duration * model.state_matrix_per_s,
+                -theta * duration * model.input_matrix),
+            hcat(model.output_matrix_per_s, Matrix{Float64}(I, np, np) + model.direct_term),
+        )
+        rhs_state = implicit ? old_state :
+            (Matrix{Float64}(I, ns, ns) + theta * duration * model.state_matrix_per_s) *
+                old_state + theta * duration * model.input_matrix * old_incident
+        reference = block \ vcat(rhs_state,
+            preparation.reference_impedance_inverse_sqrt_per_ohm_sqrt .* voltage)
+        expected_state = reference[1:ns]
+        incident = reference[ns+1:end]
+        outgoing = model.output_matrix_per_s * expected_state + model.direct_term * incident
+        current = preparation.reference_impedance_inverse_sqrt_per_ohm_sqrt .* (incident - outgoing)
+        step = coupled_line_runtime_step(preparation, duration; backward_euler=implicit)
+        before = coupled_line_runtime_snapshot(state).deterministic_signature_sha256
+        @test step.preparation_signature_sha256 == preparation.deterministic_signature_sha256
+        @test coupled_line_runtime_snapshot(state).deterministic_signature_sha256 == before
+        @test minimum(eigvals(Symmetric(step.companion_admittance_s))) > 0.0
+        @test accept_coupled_line_runtime_step!(state, voltage, step) === state
+        @test state.rational_state ≈ expected_state rtol=2e-13 atol=2e-14
+        @test state.incident_wave ≈ incident rtol=2e-13 atol=2e-14
+        @test state.terminal_current_a ≈ current rtol=2e-13 atol=2e-14
+        @test state.maximum_kcl_residual_a <= preparation.settings.kcl_absolute_tolerance_a
+        @test state.cumulative_supplied_energy_j >= -preparation.settings.energy_absolute_tolerance_j
+    end
+    @test state.accepted_step_count == 1
+    @test state.accepted_substep_count == 5
+    @test state.accepted_time_s ≈ 30e-6 + 1e-10 atol=1e-20
+    snapshot = coupled_line_runtime_snapshot(state)
+    @test snapshot.schema_version == 2
+    mktempdir() do directory
+        path = write_coupled_line_runtime_snapshot(joinpath(directory, "event_steps.toml"), snapshot)
+        replay = coupled_line_runtime_state(preparation)
+        restore_coupled_line_runtime_snapshot!(replay, read_coupled_line_runtime_snapshot(path))
+        @test coupled_line_runtime_snapshot(replay).deterministic_signature_sha256 == snapshot.deterministic_signature_sha256
+        for _ in 1:3
+            accept_coupled_line_runtime_step!(state, fill(10.0, np))
+            accept_coupled_line_runtime_step!(replay, fill(10.0, np))
+        end
+        @test coupled_line_runtime_snapshot(replay).deterministic_signature_sha256 ==
+            coupled_line_runtime_snapshot(state).deterministic_signature_sha256
+    end
+    for invalid in (0.0, -1e-6, Inf, NaN, 11e-6)
+        @test_throws ArgumentError coupled_line_runtime_step(preparation, invalid)
+    end
+    a, b = coupled_line_runtime_state(preparation), coupled_line_runtime_state(preparation)
+    nominal = coupled_line_runtime_step(preparation, preparation.settings.timestep_s)
+    for index in 1:20
+        voltage = fill(sin(index), np)
+        accept_coupled_line_runtime_step!(a, voltage)
+        accept_coupled_line_runtime_step!(b, voltage, nominal)
+    end
+    @test coupled_line_runtime_snapshot(a).deterministic_signature_sha256 ==
+        coupled_line_runtime_snapshot(b).deterministic_signature_sha256
+    @test coupled_line_runtime_snapshot(a).schema_version == 1
+    old_dictionary = CoupledLineRuntime._coupled_line_runtime_snapshot_dictionary(coupled_line_runtime_snapshot(a))
+    delete!(old_dictionary, "accepted_substep_count")
+    delete!(old_dictionary, "accepted_substep_duration_s")
+    old_snapshot = CoupledLineRuntime._coupled_line_runtime_snapshot_from_dictionary(old_dictionary)
+    @test restore_coupled_line_runtime_snapshot!(b, old_snapshot) === b
 end

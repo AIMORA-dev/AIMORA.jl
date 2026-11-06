@@ -336,7 +336,7 @@ function _complex_modal_history_phase_currents!(line::ComplexModalBergeronLine)
 end
 
 function _stamp_complex_modal_phase_admittance!(
-    y::AbstractMatrix{Float64},
+    y::AbstractMatrix{<:Real},
     nodes::Vector{Int},
     admittance::Matrix{Float64},
 )
@@ -351,8 +351,8 @@ function _stamp_complex_modal_phase_admittance!(
 end
 
 function stamp!(
-    y::AbstractMatrix{Float64},
-    rhs::AbstractVector{Float64},
+    y::AbstractMatrix{<:Real},
+    rhs::AbstractVector{<:Real},
     line::ComplexModalBergeronLine,
     _t::Float64,
     dt::Float64,

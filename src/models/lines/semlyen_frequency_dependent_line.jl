@@ -2014,8 +2014,8 @@ line_history_currents(line::SemlyenFrequencyDependentLine) =
     (from = copy(line.history_current_from), to = copy(line.history_current_to))
 
 function stamp!(
-    y::AbstractMatrix{Float64},
-    rhs::AbstractVector{Float64},
+    y::AbstractMatrix{<:Real},
+    rhs::AbstractVector{<:Real},
     line::SemlyenFrequencyDependentLine,
     _time_s::Float64,
     timestep_s::Float64,

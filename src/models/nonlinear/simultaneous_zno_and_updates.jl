@@ -1067,8 +1067,8 @@ function saturable_inductor_companion(b::SaturableInductorBranch, dt::Float64)
 end
 
 function stamp!(
-    y::AbstractMatrix{Float64},
-    rhs::AbstractVector{Float64},
+    y::AbstractMatrix{<:Real},
+    rhs::AbstractVector{<:Real},
     b::SaturableInductorBranch,
     _t::Float64,
     dt::Float64,

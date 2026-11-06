@@ -13,8 +13,105 @@ function _portable_emt_state_field(
     return PortableSnapshotStateField(identity, owner, family, unit, axes, value)
 end
 
+function _portable_dyadic_history_value(value::BigFloat)
+    isfinite(value) || _portable_emt_fail(:invalid_state_value,"nonfinite represented physical history")
+    exact=Rational{BigInt}(value)
+    return "represented_binary_v1:"*string(precision(value))*":"*string(numerator(exact))*":"*string(denominator(exact))
+end
+function _portable_dyadic_history_decode(value,identity)
+    value isa String || _portable_emt_fail(:state_type_mismatch,"represented binary history missing at $identity")
+    parts=split(value,':')
+    length(parts)==4 && parts[1]=="represented_binary_v1" || _portable_emt_fail(:state_type_mismatch,"unknown binary history at $identity")
+    try
+        bits=parse(Int,parts[2]);bits>0 || error("invalid precision")
+        n=parse(BigInt,parts[3]);d=parse(BigInt,parts[4]);d>0&&ispow2(d)||error("not dyadic")
+        exact=n//d
+        string(bits)==parts[2]&&string(numerator(exact))==parts[3]&&string(denominator(exact))==parts[4]||error("noncanonical")
+        result=setprecision(BigFloat,bits) do;BigFloat(numerator(exact))/BigFloat(denominator(exact));end
+        isfinite(result)&&Rational{BigInt}(result)==exact||error("precision loss")
+        return result
+    catch error
+        error isa PortableSnapshotFailure && rethrow()
+        _portable_emt_fail(:invalid_state_value,"invalid represented binary history at $identity")
+    end
+end
+
+# A tagged member codec preserves the fixed106 computational endpoint. Old
+# Float64-only decoders fail explicitly; they must not truncate physical lows.
+function _portable_fixed106_history_value(value::BigFloat)
+    isfinite(value) && precision(value) == 106 ||
+        _portable_emt_fail(:invalid_state_value, "accepted electrical history must be finite fixed106")
+    exact = Rational{BigInt}(value)
+    return "fixed106_v1:" * string(numerator(exact)) * ":" * string(denominator(exact))
+end
+
+function _portable_fixed106_history_decode(value, identity)
+    value isa String || _portable_emt_fail(:state_type_mismatch, "missing fixed106 history at $identity")
+    parts = split(value, ':')
+    length(parts) == 3 && parts[1] == "fixed106_v1" ||
+        _portable_emt_fail(:state_type_mismatch, "unsupported fixed106 history at $identity")
+    try
+        numerator_value = parse(BigInt, parts[2])
+        denominator_value = parse(BigInt, parts[3])
+        denominator_value > 0 && ispow2(denominator_value) || error("not dyadic")
+        exact = numerator_value // denominator_value
+        string(numerator(exact)) == parts[2] && string(denominator(exact)) == parts[3] || error("noncanonical")
+        result = setprecision(BigFloat,106) do
+            BigFloat(numerator(exact)) / BigFloat(denominator(exact))
+        end
+        isfinite(result) && Rational{BigInt}(result) == exact || error("not fixed106 representable")
+        return result
+    catch error
+        error isa PortableSnapshotFailure && rethrow()
+        _portable_emt_fail(:invalid_state_value, "invalid fixed106 history at $identity")
+    end
+end
+
 const _PORTABLE_EMT_POSITIVE_INFINITY = "positive_infinity"
 const _PORTABLE_EMT_NEGATIVE_INFINITY = "negative_infinity"
+
+# Member codec v2 is a canonical high-bit-pattern and exact dyadic residual.
+# The enclosing section v1.0 specifies String inventory values, not clock
+# semantics. This tagged member v2 includes the independent occurrence ID.
+# Legacy finite Float64 values migrate with zero low/unchanged ID; old generic
+# scalar-time readers reject this String explicitly rather than truncating it.
+# The unaccepted high/low-only member v1 cannot recover that ID and is rejected.
+function _portable_recovery_origin_value(value::Nonlinear.SemiconductorHistoryTime)
+    low = Nonlinear._semiconductor_time_exact(value.low_s)
+    return "semiconductor_history_v2:" * string(reinterpret(UInt64, value.high_s); base=16, pad=16) *
+        ":" * string(numerator(low)) * ":" * string(denominator(low)) *
+        ":" * string(reinterpret(UInt64,value.event_time_s);base=16,pad=16)
+end
+
+function _portable_recovery_origin_decode(value, identity::AbstractString)
+    if value isa Float64
+        isfinite(value) || _portable_emt_fail(:nonfinite_value, "nonfinite recovery origin $identity")
+        return Nonlinear.SemiconductorHistoryTime(value) # Explicit legacy low-zero migration.
+    elseif value == _PORTABLE_EMT_POSITIVE_INFINITY
+        return Inf
+    elseif value == _PORTABLE_EMT_NEGATIVE_INFINITY
+        return -Inf
+    end
+    value isa String || _portable_emt_fail(:state_type_mismatch, "invalid recovery origin $identity")
+    parts = split(value, ':')
+    length(parts) == 5 && parts[1] == "semiconductor_history_v2" ||
+        _portable_emt_fail(:state_type_mismatch, "unsupported recovery origin codec $identity")
+    try
+        high = reinterpret(Float64, parse(UInt64, parts[2]; base=16))
+        n, d = parse(BigInt, parts[3]), parse(BigInt, parts[4])
+        d > 0 && ispow2(d) || throw(ArgumentError("non-dyadic residual"))
+        origin = Nonlinear.SemiconductorHistoryTime(high,
+            Nonlinear._semiconductor_time_storage(n // d);
+            event_time_s=reinterpret(Float64,parse(UInt64,parts[5];base=16)))
+        _portable_recovery_origin_value(origin) == value || throw(ArgumentError("noncanonical origin"))
+        return origin
+    catch error
+        _portable_emt_fail(:state_type_mismatch, "invalid recovery origin $identity: $(sprint(showerror, error))")
+    end
+end
+
+_portable_emt_time_value(value::Nonlinear.SemiconductorHistoryTime, identity::AbstractString) =
+    _portable_recovery_origin_value(value)
 
 function _portable_emt_time_value(value::Real, identity::AbstractString)
     time = Float64(value)
@@ -184,16 +281,15 @@ function _portable_emt_element_state_fields(
 end
 
 function _portable_emt_element_state_fields(
-    element::SeriesRLBranch,
-    index::Integer,
-    name::Symbol,
+    element::SeriesRLBranch,index::Integer,name::Symbol,
 )
-    prefix = _portable_emt_element_prefix(index)
-    fields = _portable_emt_element_identity_field(index, name, "series_rl")
-    append!(fields, PortableSnapshotStateField[
-        _portable_emt_state_field("$prefix.previous_current", "emt.branch_history", :history, "A", element.i_prev),
-        _portable_emt_state_field("$prefix.previous_voltage", "emt.branch_history", :history, "V", element.v_prev),
-        _portable_emt_state_field("$prefix.last_current", "emt.branch_state", :algebraic, "A", element.i_last),
+    prefix=_portable_emt_element_prefix(index)
+    fields=_portable_emt_element_identity_field(index,name,"series_rl")
+    append!(fields,PortableSnapshotStateField[
+        _portable_emt_state_field("$prefix.physical_history_schema","emt.branch_history",:checkpoint,"1","series_rl_physical_history_v2"),
+        _portable_emt_state_field("$prefix.previous_current","emt.branch_history",:history,"A",element.i_prev isa BigFloat ? _portable_dyadic_history_value(element.i_prev) : element.i_prev),
+        _portable_emt_state_field("$prefix.previous_voltage","emt.branch_history",:history,"V",element.v_prev),
+        _portable_emt_state_field("$prefix.last_current","emt.branch_state",:algebraic,"A",element.i_last isa BigFloat ? _portable_dyadic_history_value(element.i_last) : element.i_last),
     ])
     return fields
 end
@@ -1162,14 +1258,24 @@ function _restore_portable_emt_element_state!(
 end
 
 function _restore_portable_emt_element_state!(
-    element::SeriesRLBranch,
-    fields::Dict{String,PortableSnapshotStateField},
-    index::Integer,
+    element::SeriesRLBranch,fields::Dict{String,PortableSnapshotStateField},index::Integer,
 )
-    prefix = _portable_emt_element_prefix(index)
-    element.i_prev = _portable_emt_scalar(fields, "$prefix.previous_current", :history, "A", Float64)
-    element.v_prev = _portable_emt_scalar(fields, "$prefix.previous_voltage", :history, "V", Float64)
-    element.i_last = _portable_emt_scalar(fields, "$prefix.last_current", :algebraic, "A", Float64)
+    prefix=_portable_emt_element_prefix(index)
+    _portable_emt_scalar(fields,"$prefix.physical_history_schema",:checkpoint,"1",String)=="series_rl_physical_history_v2" ||
+        _portable_emt_fail(:unsupported_section_version,"legacy R-L history requires an explicit pinned migration")
+    function current(identity,family)
+        field=get(fields,identity,nothing)
+        field===nothing && _portable_emt_fail(:missing_state_field,"R-L history field missing at $identity")
+        field.family==family && field.unit=="A" || _portable_emt_fail(:state_type_mismatch,"R-L history metadata changed")
+        value=field.value
+        value isa Float64 && isfinite(value) && return value
+        return _portable_dyadic_history_decode(value,identity)
+    end
+    previous=current("$prefix.previous_current",:history)
+    last=current("$prefix.last_current",:algebraic)
+    voltage=_portable_emt_scalar(fields,"$prefix.previous_voltage",:history,"V",Float64)
+    isfinite(voltage) || _portable_emt_fail(:invalid_state_value,"nonfinite R-L voltage")
+    element.i_prev=previous;element.i_last=last;element.v_prev=voltage
     return element
 end
 

@@ -634,6 +634,35 @@ end
 end
 
 if AIMORA.solver_available()
+    mutable struct PortableCommitModeFixture
+        mode::Symbol
+    end
+    mutable struct PortableCommitEmptyOwnerFixture end
+    mutable struct PortableCommitOwnerFixture
+        mode::Symbol
+        nested::PortableCommitModeFixture
+        history::Vector{Float64}
+        alias::Vector{Float64}
+        empty_owner::PortableCommitEmptyOwnerFixture
+    end
+    @testset "portable scalar commit preserves nested owner and array identities" begin
+        source_history=[1.0,2.0];destination_history=[0.0,0.0]
+        source=PortableCommitOwnerFixture(:turn_off,PortableCommitModeFixture(:TrapezoidalCompanion),
+            source_history,source_history,PortableCommitEmptyOwnerFixture())
+        destination=PortableCommitOwnerFixture(:none,PortableCommitModeFixture(:unprepared),
+            destination_history,destination_history,PortableCommitEmptyOwnerFixture())
+        nested=destination.nested;empty_owner=destination.empty_owner
+        AIMORA.EMTStudy._commit_portable_semiconductor_state!(destination,source)
+        @test destination.mode===:turn_off
+        @test destination.nested.mode===:TrapezoidalCompanion
+        @test destination.nested===nested && destination.nested!==source.nested
+        @test destination.history===destination_history===destination.alias
+        @test destination.history==[1.0,2.0]
+        @test destination.history!==source.history
+        @test destination.empty_owner===empty_owner && destination.empty_owner!==source.empty_owner
+        source.history[1]=3.0
+        @test destination.history[1]==1.0
+    end
     function portable_element_owner_roundtrip(source, candidate, name::Symbol)
         captured = AIMORA.PortableSnapshots.PortableSnapshotStateInventory(
             AIMORA.EMTStudy._portable_emt_element_state_fields(source, 1, name),
@@ -1073,7 +1102,7 @@ if AIMORA.solver_available()
         recovery.last_recovery_current_a = -0.4
         recovery.peak_reverse_current_a = 0.6
         recovery.cumulative_recovered_charge_c = 3.0e-6
-        recovery.recovery_start_time_s = 1.0e-6
+        recovery.recovery_start_time_s = AIMORA.Nonlinear.SemiconductorHistoryTime(1.0e-6)
         recovery.last_recovery_duration_s = 2.0e-6
         recovery.recovery_zero_event_count = 2
         recovery.last_recovery_zero_time_s = 4.0e-6
@@ -1089,7 +1118,7 @@ if AIMORA.solver_available()
         tail.active = true
         tail.current_a = 0.3
         tail.initial_current_a = 1.0
-        tail.turn_off_time_s = 3.0e-6
+        tail.turn_off_time_s = AIMORA.Nonlinear.SemiconductorHistoryTime(3.0e-6)
         tail.last_duration_s = 2.0e-6
         tail.cutoff_event_count = 1
         tail.last_cutoff_time_s = Inf
@@ -1104,10 +1133,19 @@ if AIMORA.solver_available()
         energy.last_reverse_recovery_start_time_s = -Inf
 
         thermal = something(fidelity.thermal)
-        thermal.node_temperature_k .= [305.0, 301.0]
+        intended_temperature_k = [305.0, 301.0]
+        for stage in eachindex(intended_temperature_k)
+            AIMORA.Nonlinear._set_cauer_accepted_temperature!(
+                thermal, stage, intended_temperature_k[stage])
+        end
+        AIMORA.Nonlinear._refresh_cauer_accepted_outputs!(thermal)
+        # Independent fixture equations check the canonical mutation/refresh.
+        expected_rise_k = intended_temperature_k .- thermal.ambient_temperature_k
+        @test thermal.node_temperature_k == intended_temperature_k
+        @test thermal.accepted_temperature_rise_k == expected_rise_k
+        @test thermal.last_stored_energy_j == sum(thermal.capacitance_j_per_k .* expected_rise_k)
+        @test thermal.last_ambient_heat_flow_w == expected_rise_k[end] / thermal.resistance_k_per_w[end]
         thermal.last_loss_power_w = 4.0
-        thermal.last_ambient_heat_flow_w = 0.5
-        thermal.last_stored_energy_j = 2.0
         thermal.cumulative_input_energy_j = 3.0
         thermal.cumulative_ambient_energy_j = 1.0
         thermal.trial_lower_conductance_w_per_k .= [0.25]
@@ -1193,6 +1231,29 @@ if AIMORA.solver_available()
         @test objectid(semiconductor_candidate.gate_driver) == driver_identity
         @test objectid(semiconductor_candidate.extended_fidelity) == fidelity_identity
         captured_fields = Dict(field.identity => field for field in captured.fields)
+        # Legacy finite Float64 timestamps migrate semantically, not bytewise.
+        legacy=deepcopy(semiconductor)
+        legacy.extended_fidelity.recovered_charge.recovery_start_time_s=1.0e-6
+        legacy.extended_fidelity.turn_off_tail.turn_off_time_s=3.0e-6
+        legacy_candidate=portable_extended_semiconductor_switch()
+        old_inventory,current_inventory=portable_element_owner_roundtrip(
+            legacy,legacy_candidate,:extended_semiconductor)
+        @test old_inventory.signature_sha256!=current_inventory.signature_sha256
+        @test current_inventory.signature_sha256==captured.signature_sha256
+        for (origin, intended) in (
+            (legacy_candidate.extended_fidelity.recovered_charge.recovery_start_time_s,1.0e-6),
+            (legacy_candidate.extended_fidelity.turn_off_tail.turn_off_time_s,3.0e-6))
+            @test origin isa AIMORA.Nonlinear.SemiconductorHistoryTime
+            @test origin.high_s===intended
+            @test iszero(origin.low_s)
+            @test origin.event_time_s===intended
+            @test AIMORA.Nonlinear._semiconductor_time_exact(origin)==Rational{BigInt}(intended)
+            encoded=AIMORA.EMTStudy._portable_recovery_origin_value(origin)
+            @test startswith(encoded,"semiconductor_history_v2:")
+            pieces=split(encoded,':');pieces[4]="2" # same value, noncanonical zero residual
+            @test_throws AIMORA.PortableSnapshots.PortableSnapshotFailure AIMORA.EMTStudy._portable_recovery_origin_decode(
+                join(pieces,':'),"test.recovery_origin")
+        end
         component_mismatch = portable_extended_semiconductor_switch()
         component_mismatch.extended_fidelity = nothing
         @test_throws AIMORA.PortableSnapshots.PortableSnapshotFailure AIMORA.EMTStudy._restore_portable_emt_element_state!(
@@ -1220,6 +1281,34 @@ if AIMORA.solver_available()
             corrupted_fields,
             1,
         )
+
+        # Same-shape corruption still fails the unchanged thermal guard and
+        # leaves both destination values and mutable array identities intact.
+        thermal_prefix = "model.i00000001.extended_fidelity.thermal"
+        energy_identity = "$thermal_prefix.last_stored_energy"
+        for corruption in (:reporting_temperature, :stored_energy)
+            inconsistent_fields = copy(captured_fields)
+            identity = corruption === :reporting_temperature ? temperature_identity : energy_identity
+            original_field = captured_fields[identity]
+            value = corruption === :reporting_temperature ?
+                AIMORA.PortableSnapshots.portable_snapshot_array([306.0,301.0]; unit="K", axes=["stage"]) :
+                original_field.value + 1.0
+            inconsistent_fields[identity] = AIMORA.PortableSnapshots.PortableSnapshotStateField(
+                identity, original_field.owner, original_field.family,
+                original_field.unit, original_field.axes, value)
+            destination = something(portable_extended_semiconductor_switch().extended_fidelity.thermal)
+            before = AIMORA.PortableSnapshots.PortableSnapshotStateInventory(
+                AIMORA.EMTStudy._portable_semiconductor_thermal_fields(destination, thermal_prefix)).signature_sha256
+            temperatures = destination.node_temperature_k
+            rises = destination.accepted_temperature_rise_k
+            @test_throws AIMORA.PortableSnapshots.PortableSnapshotFailure AIMORA.EMTStudy._restore_portable_semiconductor_thermal!(
+                destination, inconsistent_fields, thermal_prefix)
+            after = AIMORA.PortableSnapshots.PortableSnapshotStateInventory(
+                AIMORA.EMTStudy._portable_semiconductor_thermal_fields(destination, thermal_prefix)).signature_sha256
+            @test after == before
+            @test destination.node_temperature_k === temperatures
+            @test destination.accepted_temperature_rise_k === rises
+        end
 
         bridge = portable_bridge_leg()
         seed_portable_semiconductor_state!(bridge.upper_switch)
@@ -1647,6 +1736,21 @@ if AIMORA.solver_available()
         @test length(scheduler.tasks[2].samples) > 0
         @test length(scheduler.tasks[2].writes) > 0
         @test length(scheduler.tasks[3].occurrences) > 0
+
+        temporary_pattern_scheduler = portable_exact_scheduler()
+        temporary_pattern_scheduler.tasks[3].quantized_cycle_ticks = [1, 3]
+        temporary_pattern_failure = try
+            AIMORA.EMTStudy.portable_emt_task_scheduler_state_inventory(
+                temporary_pattern_scheduler;
+                program_signature_sha256 = program_signature,
+            )
+            nothing
+        catch error
+            error
+        end
+        @test temporary_pattern_failure isa
+            AIMORA.PortableSnapshots.PortableSnapshotFailure
+        @test temporary_pattern_failure.code == :unsupported_task_configuration
 
         restored = portable_exact_scheduler()
         AIMORA.EMTStudy.restore_portable_emt_task_scheduler_state_inventory!(

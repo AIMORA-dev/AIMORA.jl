@@ -792,6 +792,30 @@ function _vsc_rotating_sequence_sample(
     )
 end
 
+
+# The retained physical ring owns the samples. Each component uses the same
+# ascending storage-index Float64 reduction as restart and boundary restore.
+function _synchronize_vsc_sequence_sums!(state::VSCRotatingSequenceState)
+    positive_direct = positive_quadrature = 0.0
+    negative_direct = negative_quadrature = 0.0
+    zero_direct = zero_quadrature = 0.0
+    for sample in state.samples
+        positive_direct += sample.positive_direct_v
+        positive_quadrature += sample.positive_quadrature_v
+        negative_direct += sample.negative_direct_v
+        negative_quadrature += sample.negative_quadrature_v
+        zero_direct += sample.zero_direct_v
+        zero_quadrature += sample.zero_quadrature_v
+    end
+    state.positive_direct_sum_v = positive_direct
+    state.positive_quadrature_sum_v = positive_quadrature
+    state.negative_direct_sum_v = negative_direct
+    state.negative_quadrature_sum_v = negative_quadrature
+    state.zero_direct_sum_v = zero_direct
+    state.zero_quadrature_sum_v = zero_quadrature
+    return state
+end
+
 """
     advance_vsc_sequence_extractor!(state, phase_voltage_v, angle_rad)
 
@@ -811,26 +835,12 @@ function advance_vsc_sequence_extractor!(
     isfinite(angle) || throw(ArgumentError("VSC sequence angle must be finite"))
     sample = _vsc_rotating_sequence_sample(clarke_transform(phase_voltage_v), angle)
     index = state.next_sample_index
-    previous = state.samples[index]
-    window_full = state.retained_sample_count == length(state.samples)
-    if window_full
-        state.positive_direct_sum_v -= previous.positive_direct_v
-        state.positive_quadrature_sum_v -= previous.positive_quadrature_v
-        state.negative_direct_sum_v -= previous.negative_direct_v
-        state.negative_quadrature_sum_v -= previous.negative_quadrature_v
-        state.zero_direct_sum_v -= previous.zero_direct_v
-        state.zero_quadrature_sum_v -= previous.zero_quadrature_v
-    else
+    if state.retained_sample_count < length(state.samples)
         state.retained_sample_count += 1
     end
     state.samples[index] = sample
-    state.positive_direct_sum_v += sample.positive_direct_v
-    state.positive_quadrature_sum_v += sample.positive_quadrature_v
-    state.negative_direct_sum_v += sample.negative_direct_v
-    state.negative_quadrature_sum_v += sample.negative_quadrature_v
-    state.zero_direct_sum_v += sample.zero_direct_v
-    state.zero_quadrature_sum_v += sample.zero_quadrature_v
     state.next_sample_index = index == length(state.samples) ? 1 : index + 1
+    _synchronize_vsc_sequence_sums!(state)
     divisor = Float64(state.retained_sample_count)
     positive_direct = state.positive_direct_sum_v / divisor
     positive_quadrature = state.positive_quadrature_sum_v / divisor
@@ -1279,8 +1289,10 @@ function compute_extended_vsc_control!(
             dt * control.current_integral_gain_v_per_as * direct_error
         quadrature_integral_candidate = state.quadrature_current_integral_v +
             dt * control.current_integral_gain_v_per_as * quadrature_error
-        zero_integral_candidate = state.zero_current_integral_v +
-            dt * control.current_integral_gain_v_per_as * zero_error
+        zero_integral_candidate = p.wire_form === FourWireForm ?
+            state.zero_current_integral_v +
+                dt * control.current_integral_gain_v_per_as * zero_error :
+            state.zero_current_integral_v
         direct_voltage = voltage_dq.direct + resistance * current_dq.direct -
             omega * inductance * current_dq.quadrature +
             control.current_proportional_gain_v_per_a * direct_error +
@@ -1309,9 +1321,11 @@ function compute_extended_vsc_control!(
             state.quadrature_current_integral_v = quadrature_integral_candidate + dt *
                 control.current_antiwindup_gain_per_s *
                 (limited_quadrature - quadrature_voltage)
-            state.zero_current_integral_v = zero_integral_candidate + dt *
-                control.current_antiwindup_gain_per_s *
-                (limited_zero - zero_voltage)
+            state.zero_current_integral_v = p.wire_form === FourWireForm ?
+                zero_integral_candidate + dt *
+                    control.current_antiwindup_gain_per_s *
+                    (limited_zero - zero_voltage) :
+                zero_integral_candidate
             direct_voltage = limited_direct
             quadrature_voltage = limited_quadrature
             zero_voltage = limited_zero

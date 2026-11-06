@@ -1,3 +1,6 @@
+import ..NonlinearNetwork: _validate_nonlinear_current_correction_buffers
+import ..StudyCore: _encode_compensated_scalar_pair, _decode_compensated_scalar_pair
+
 export TransformerApparatusRuntime,
        TransformerApparatusRuntimeSnapshot,
        transformer_apparatus_runtime,
@@ -8,9 +11,9 @@ export TransformerApparatusRuntime,
 abstract type AbstractTransformerAcceptedRuntimeState end
 
 mutable struct TransformerTerminalMatrixRuntimeState <: AbstractTransformerAcceptedRuntimeState
-    coil_current_a::Vector{Float64}
-    capacitor_current_a::Vector{Float64}
-    coil_voltage_v::Vector{Float64}
+    coil_current_a::Union{Vector{Float64},Vector{BigFloat}}
+    capacitor_current_a::Union{Vector{Float64},Vector{BigFloat}}
+    coil_voltage_v::Union{Vector{Float64},Vector{BigFloat}}
     winding_loss_state::Vector{Float64}
     winding_loss_voltage_v::Vector{Float64}
     terminal_voltage_v::Vector{Float64}
@@ -104,10 +107,10 @@ mutable struct _TransformerTerminalMatrixCandidate
     winding_loss_impedance_ohm::Matrix{Float64}
     history_current_a::Vector{Float64}
     history_voltage_v::Vector{Float64}
-    coil_voltage_v::Vector{Float64}
-    coil_current_a::Vector{Float64}
+    coil_voltage_v::Union{Vector{Float64},Vector{BigFloat}}
+    coil_current_a::Union{Vector{Float64},Vector{BigFloat}}
     coil_current_workspace_a::Vector{Float64}
-    capacitor_current_a::Vector{Float64}
+    capacitor_current_a::Union{Vector{Float64},Vector{BigFloat}}
     terminal_current_a::Vector{Float64}
     terminal_jacobian_s::Matrix{Float64}
     coil_jacobian_s::Matrix{Float64}
@@ -364,6 +367,155 @@ function _transformer_terminal_matrices(preparation::TransformerApparatusPrepara
         preparation.specification.id,
         preparation.specification.tier,
         "selected transformer tier is not a coupled terminal-matrix runtime",
+    )
+end
+
+function _transformer_terminal_boundary_dependents(
+    runtime::TransformerApparatusRuntime,
+    network_terminal_voltage_v::AbstractVector{<:Real},
+    ; network_terminal_voltage_correction_v=nothing,
+)
+    state = runtime.accepted_state
+    state isa TransformerTerminalMatrixRuntimeState || throw(ArgumentError(
+        "terminal-boundary reconstruction requires a terminal-matrix transformer runtime",
+    ))
+    event_state = runtime.event_state
+    length(network_terminal_voltage_v) == length(event_state.terminal_closed) ||
+        throw(DimensionMismatch(
+            "transformer boundary voltage changed terminal dimension",
+        ))
+    all(event_state.terminal_closed) || throw(ArgumentError(
+        "transformer boundary reconstruction requires every terminal to be closed",
+    ))
+    network_voltage = Float64.(network_terminal_voltage_v)
+    if _transformer_has_extended_histories(state)
+        correction = network_terminal_voltage_correction_v === nothing ? zeros(length(network_voltage)) :
+            network_terminal_voltage_correction_v
+        length(correction) == length(network_voltage) && all(isfinite,correction) ||
+            throw(ArgumentError("transformer boundary voltage correction is incompatible"))
+        apparatus_voltage,coil_voltage_v = setprecision(BigFloat,106) do
+            physical = BigFloat.(network_terminal_voltage_v)+BigFloat.(correction)
+            apparatus = BigFloat.(event_state.terminal_transform)*physical
+            coil = transpose(BigFloat.(runtime.preparation.specification.connection.incidence))*apparatus
+            apparatus,coil
+        end
+        terminal_voltage_v = Float64.(apparatus_voltage)
+    else
+        terminal_voltage_v = event_state.terminal_transform * network_voltage
+        coil_voltage_v = similar(state.coil_voltage_v)
+        transformer_coil_voltages!(coil_voltage_v,
+            runtime.preparation.specification.connection,terminal_voltage_v)
+    end
+    winding_loss_voltage_v = zeros(length(state.winding_loss_voltage_v))
+    model = runtime.preparation.specification.model
+    if model isa HybridTransformerModel
+        mul!(
+            winding_loss_voltage_v,
+            model.winding_loss_output_matrix_ohm_per_s,
+            state.winding_loss_state,
+        )
+        mul!(
+            winding_loss_voltage_v,
+            model.winding_loss_direct_ohm,
+            state.coil_current_a,
+            1.0,
+            1.0,
+        )
+    end
+    matrices = _transformer_terminal_matrices(runtime.preparation)
+    terminal_current_a = similar(state.terminal_current_a)
+    if _transformer_has_extended_histories(state)
+        terminal_current_a .= setprecision(BigFloat,106) do
+            incidence = BigFloat.(runtime.preparation.specification.connection.incidence)
+            Float64.(incidence*(BigFloat.(state.coil_current_a)+BigFloat.(state.capacitor_current_a)+
+                BigFloat.(matrices.conductance_s)*coil_voltage_v))
+        end
+    else
+        transformer_terminal_currents!(terminal_current_a,
+            runtime.preparation.specification.connection,
+            state.coil_current_a .+ state.capacitor_current_a .+ matrices.conductance_s*coil_voltage_v)
+    end
+    previous_fault_current_a =
+        event_state.terminal_fault_admittance_s * network_voltage
+    return (;
+        terminal_voltage_v,
+        coil_voltage_v,
+        winding_loss_voltage_v,
+        terminal_current_a,
+        previous_network_voltage_v=network_voltage,
+        previous_fault_current_a,
+    )
+end
+
+"""Rebuild dependent accepted transformer endpoint state from its causal histories and network boundary voltage."""
+function reconstruct_transformer_terminal_boundary_state!(
+    runtime::TransformerApparatusRuntime,
+    network_terminal_voltage_v::AbstractVector{<:Real},
+    ; network_terminal_voltage_correction_v=nothing,
+)
+    dependents = _transformer_terminal_boundary_dependents(
+        runtime,
+        network_terminal_voltage_v,
+        ; network_terminal_voltage_correction_v,
+    )
+    state = runtime.accepted_state::TransformerTerminalMatrixRuntimeState
+    copyto!(state.terminal_voltage_v, dependents.terminal_voltage_v)
+    _store_transformer_companion_history!(state,:coil_voltage_v,dependents.coil_voltage_v)
+    copyto!(state.winding_loss_voltage_v, dependents.winding_loss_voltage_v)
+    copyto!(state.terminal_current_a, dependents.terminal_current_a)
+    copyto!(
+        runtime.event_state.previous_network_voltage_v,
+        dependents.previous_network_voltage_v,
+    )
+    copyto!(
+        runtime.event_state.previous_fault_current_a,
+        dependents.previous_fault_current_a,
+    )
+    return runtime
+end
+
+function _transformer_terminal_boundary_maximum_error(current, expected)
+    length(current) == length(expected) || return Inf
+    return maximum(abs.(current .- expected); init=0.0)
+end
+
+"""Return exact relational errors for every reconstructed transformer endpoint family."""
+function transformer_terminal_boundary_state_errors(
+    runtime::TransformerApparatusRuntime,
+    network_terminal_voltage_v::AbstractVector{<:Real},
+    ; network_terminal_voltage_correction_v=nothing,
+)
+    dependents = _transformer_terminal_boundary_dependents(
+        runtime,
+        network_terminal_voltage_v,
+        ; network_terminal_voltage_correction_v,
+    )
+    state = runtime.accepted_state::TransformerTerminalMatrixRuntimeState
+    return (
+        terminal_voltage=_transformer_terminal_boundary_maximum_error(
+            state.terminal_voltage_v,
+            dependents.terminal_voltage_v,
+        ),
+        coil_voltage=_transformer_terminal_boundary_maximum_error(
+            state.coil_voltage_v,
+            dependents.coil_voltage_v,
+        ),
+        winding_loss_voltage=_transformer_terminal_boundary_maximum_error(
+            state.winding_loss_voltage_v,
+            dependents.winding_loss_voltage_v,
+        ),
+        terminal_current=_transformer_terminal_boundary_maximum_error(
+            state.terminal_current_a,
+            dependents.terminal_current_a,
+        ),
+        event_voltage=_transformer_terminal_boundary_maximum_error(
+            runtime.event_state.previous_network_voltage_v,
+            dependents.previous_network_voltage_v,
+        ),
+        event_fault_current=_transformer_terminal_boundary_maximum_error(
+            runtime.event_state.previous_fault_current_a,
+            dependents.previous_fault_current_a,
+        ),
     )
 end
 
@@ -1773,11 +1925,12 @@ function _prepare_transformer_network_candidate!(
     return candidate
 end
 
-function prepare_nonlinear_device_step!(
+function _prepare_transformer_nonlinear_step!(
     runtime::TransformerApparatusRuntime,
     time_s::Float64,
     step_s::Float64,
     companion_method::Symbol,
+    event_localized::Bool,
 )
     isfinite(time_s) && isfinite(step_s) && step_s > 0.0 || throw(ArgumentError(
         "transformer candidate time and step must be finite with a positive step",
@@ -1814,8 +1967,12 @@ function prepare_nonlinear_device_step!(
         diagnostics=(requested_method=companion_method,),
     )
     configured_step = runtime.preparation.specification.settings.timestep_s
-    step_tolerance = 64.0 * eps(Float64) * max(step_s, configured_step)
-    step_valid = normalized_companion_method === :trapezoidal ?
+    step_tolerance = 64.0 * eps(Float64) * max(
+        abs(step_s),
+        abs(configured_step),
+        1.0,
+    )
+    step_valid = normalized_companion_method === :trapezoidal && !event_localized ?
         abs(step_s - configured_step) <= step_tolerance :
         step_s <= configured_step + step_tolerance
     step_valid || _transformer_refusal(
@@ -1868,6 +2025,22 @@ function prepare_nonlinear_device_step!(
     runtime.preparation_count += 1
     return nothing
 end
+
+prepare_nonlinear_device_step!(
+    runtime::TransformerApparatusRuntime,
+    time_s::Float64,
+    step_s::Float64,
+    companion_method::Symbol,
+) = _prepare_transformer_nonlinear_step!(
+    runtime, time_s, step_s, companion_method, false)
+
+prepare_nonlinear_device_event_substep!(
+    runtime::TransformerApparatusRuntime,
+    time_s::Float64,
+    step_s::Float64,
+    companion_method::Symbol,
+) = _prepare_transformer_nonlinear_step!(
+    runtime, time_s, step_s, companion_method, true)
 
 function _transformer_terminal_trial!(
     runtime::TransformerApparatusRuntime,
@@ -2218,6 +2391,303 @@ function nonlinear_current_jacobian!(
     return nothing
 end
 
+"""Store a causal companion history without discarding an admitted low part.
+
+Exactly representable legacy vectors keep their storage and aliases. Extended
+histories use the same physical slot at 106-bit precision, never a second owner.
+"""
+function _store_transformer_companion_history!(owner, name::Symbol, values)
+    original = getfield(owner,name)
+    length(original) == length(values) || throw(DimensionMismatch(
+        "transformer companion history changed dimension"))
+    all(isfinite,values) || throw(ArgumentError("transformer companion history must be finite"))
+    if original isa Vector{Float64} && all(value->isequal(value,Float64(value)),values)
+        copyto!(original,values)
+    else
+        extended = setprecision(BigFloat,106) do
+            BigFloat.(values)
+        end
+        all(isequal(a,b) for (a,b) in zip(extended,values)) || throw(ArgumentError(
+            "transformer companion history exceeds its declared 106-bit storage precision"))
+        if original isa Vector{BigFloat}
+            copyto!(original,extended)
+        else
+            setfield!(owner,name,extended)
+        end
+    end
+    return owner
+end
+
+_transformer_has_extended_histories(state::TransformerTerminalMatrixRuntimeState) =
+    any(name->getfield(state,name) isa Vector{BigFloat},
+        (:coil_current_a,:capacitor_current_a,:coil_voltage_v))
+
+function _transformer_linear_compensated_trial!(
+    runtime::TransformerApparatusRuntime,
+    network_terminal_voltage_v::AbstractVector{Float64},
+    network_terminal_voltage_correction_v::AbstractVector{Float64},
+    ; terminal_current_correction_a=nothing, retain_history_precision::Bool=false,
+)
+    runtime.candidate isa _TransformerTerminalMatrixCandidate || throw(
+        ArgumentError(
+            "compensated transformer evaluation currently requires a terminal-matrix runtime",
+        ),
+    )
+    model = runtime.preparation.specification.model
+    model isa LowFrequencyTransformerModel ||
+        model isa BCTRANTransformerModel || throw(ArgumentError(
+            "compensated transformer evaluation requires an affine low-frequency or BCTRAN model",
+        ))
+    all(runtime.event_state.terminal_closed) || throw(ArgumentError(
+        "compensated transformer evaluation currently requires every terminal to be closed",
+    ))
+    all(iszero, runtime.event_state.terminal_fault_admittance_s) || throw(
+        ArgumentError(
+            "compensated transformer evaluation currently requires no active terminal fault admittance",
+        ),
+    )
+    _, network_jacobian = _transformer_event_trial!(
+        runtime,
+        network_terminal_voltage_v,
+    )
+    candidate = runtime.candidate::_TransformerTerminalMatrixCandidate
+    event_state = runtime.event_state
+    connection = runtime.preparation.specification.connection
+    matrices = _transformer_terminal_matrices(runtime.preparation)
+    state = runtime.accepted_state::TransformerTerminalMatrixRuntimeState
+    # Adding a low voltage to an already rounded affine current cannot recover
+    # companion-history cancellation. Evaluate the same prepared equations
+    # together, then round their physical outputs exactly once.
+    setprecision(BigFloat, 106) do
+        backward_euler = runtime.companion_method === :backward_euler
+        alpha = BigFloat((backward_euler ? 1.0 : 2.0) / runtime.candidate_step_s)
+        incidence = BigFloat.(connection.incidence)
+        transform = BigFloat.(event_state.terminal_transform)
+        apparatus_voltage = transform * (BigFloat.(network_terminal_voltage_v) .+
+            BigFloat.(network_terminal_voltage_correction_v))
+        coil_voltage = transpose(incidence) * apparatus_voltage
+        previous_voltage = BigFloat.(state.coil_voltage_v)
+        # Multiplying a large companion history by a rounded inverse creates
+        # a false current increment even at an exact resistive operating point.
+        # Solve the physical increment equation instead. Guard precision also
+        # preserves a small final current when the increment cancels its seed;
+        # the sole accepted history still has its declared 106-bit precision.
+        coil_current = setprecision(BigFloat, 212) do
+            resistance = BigFloat.(matrices.resistance_ohm)
+            inductance = BigFloat.(matrices.inductance_h)
+            represented_current = BigFloat.(state.coil_current_a)
+            represented_voltage = transpose(BigFloat.(connection.incidence)) *
+                BigFloat.(event_state.terminal_transform) * (
+                    BigFloat.(network_terminal_voltage_v) .+
+                    BigFloat.(network_terminal_voltage_correction_v)
+                )
+            rate = BigFloat((backward_euler ? 1.0 : 2.0) / runtime.candidate_step_s)
+            drive = represented_voltage .- resistance * represented_current
+            if !backward_euler
+                drive .+= BigFloat.(state.coil_voltage_v) .-
+                    resistance * represented_current
+            end
+            impedance = resistance .+ rate .* inductance
+            represented_current .+ impedance \ drive
+        end
+        coil_current = BigFloat.(coil_current)
+        capacitor_current = alpha .* (BigFloat.(matrices.capacitance_f) *
+            (coil_voltage .- previous_voltage))
+        backward_euler || (capacitor_current .-= BigFloat.(state.capacitor_current_a))
+        total_current = coil_current .+ capacitor_current .+
+            BigFloat.(matrices.conductance_s) * coil_voltage
+        apparatus_current = incidence * total_current
+        network_current = transpose(transform) * apparatus_current
+        runtime.candidate_apparatus_terminal_voltage_v .= Float64.(apparatus_voltage)
+        extended = retain_history_precision || terminal_current_correction_a !== nothing ||
+            _transformer_has_extended_histories(state)
+        for (name,values) in ((:coil_voltage_v,coil_voltage),(:coil_current_a,coil_current),
+            (:capacitor_current_a,capacitor_current))
+            if extended
+                _store_transformer_companion_history!(candidate,name,values)
+            else
+                original = getfield(candidate,name)
+                original isa Vector{Float64} ? copyto!(original,values) :
+                    setfield!(candidate,name,Float64.(values))
+            end
+        end
+        candidate.coil_current_workspace_a .= Float64.(total_current)
+        candidate.terminal_current_a .= Float64.(apparatus_current)
+        runtime.candidate_network_terminal_current_a .= Float64.(network_current)
+        if terminal_current_correction_a !== nothing
+            fill!(terminal_current_correction_a, 0.0)
+            for index in eachindex(network_current)
+                terminal_current_correction_a[index] = Float64(network_current[index]-
+                    BigFloat(runtime.candidate_network_terminal_current_a[index]))
+            end
+        end
+    end
+    all(values -> all(isfinite, values), (
+        runtime.candidate_apparatus_terminal_voltage_v, candidate.coil_voltage_v,
+        candidate.coil_current_a, candidate.capacitor_current_a,
+        candidate.terminal_current_a, runtime.candidate_network_terminal_current_a,
+    )) || throw(ArgumentError("transformer compensated affine output became nonfinite"))
+    return (
+        runtime.candidate_network_terminal_current_a,
+        network_jacobian,
+    )
+end
+
+function nonlinear_current_jacobian_compensated!(
+    terminal_current_a::AbstractVector{Float64},
+    terminal_jacobian_s::AbstractMatrix{Float64},
+    runtime::TransformerApparatusRuntime,
+    terminal_voltage_v::AbstractVector{Float64},
+    terminal_voltage_correction_v::AbstractVector{Float64},
+    time_s::Float64,
+    ; terminal_current_correction_a=nothing,
+)
+    terminal_current_correction_a === nothing || _validate_nonlinear_current_correction_buffers(
+        terminal_current_a, terminal_current_correction_a,
+        terminal_voltage_v, terminal_voltage_correction_v)
+    runtime.prepared || throw(ArgumentError(
+        "transformer apparatus step must be prepared before compensated trial evaluation",
+    ))
+    terminal_count = length(runtime.terminal_nodes)
+    length(terminal_voltage_v) == length(terminal_voltage_correction_v) ==
+        terminal_count || throw(DimensionMismatch(
+            "transformer compensated trial terminal voltage count is incompatible",
+        ))
+    length(terminal_current_a) >= terminal_count &&
+        size(terminal_jacobian_s, 1) >= terminal_count &&
+        size(terminal_jacobian_s, 2) >= terminal_count || throw(
+            DimensionMismatch(
+                "transformer compensated nonlinear workspaces are too small",
+            ),
+        )
+    all(isfinite, terminal_voltage_v) &&
+        all(isfinite, terminal_voltage_correction_v) && isfinite(time_s) ||
+        throw(ArgumentError(
+            "transformer compensated trial voltage and time must be finite",
+        ))
+    @inbounds for index in eachindex(
+        terminal_voltage_v,
+        terminal_voltage_correction_v,
+    )
+        terminal_voltage_v[index] + terminal_voltage_correction_v[index] ==
+            terminal_voltage_v[index] || throw(ArgumentError(
+                "transformer compensated voltage correction must be a nonoverlapping low part",
+            ))
+    end
+    current, jacobian = _transformer_linear_compensated_trial!(
+        runtime,
+        terminal_voltage_v,
+        terminal_voltage_correction_v,
+        ; terminal_current_correction_a,
+    )
+    terminal_current_a[1:terminal_count] .= current
+    terminal_jacobian_s[1:terminal_count, 1:terminal_count] .= jacobian
+    runtime.trial_evaluation_count += 1
+    return nothing
+end
+
+function nonlinear_current_jacobian_compensated!(
+    terminal_current_a::AbstractVector{Float64},
+    terminal_jacobian_s::AbstractMatrix{Float64},
+    terminal_current_correction_a::AbstractVector{Float64},
+    runtime::TransformerApparatusRuntime,
+    terminal_voltage_v::AbstractVector{Float64},
+    terminal_voltage_correction_v::AbstractVector{Float64},
+    time_s::Union{Float64,ContinuousEvaluationTime},
+)
+    _validate_nonlinear_current_correction_buffers(terminal_current_a,
+        terminal_current_correction_a, terminal_voltage_v, terminal_voltage_correction_v)
+    # This affine owner is time invariant; its existing continuous-time
+    # dispatch uses the same bookkeeping high part.
+    bookkeeping_time = time_s isa ContinuousEvaluationTime ? time_s.high_s : time_s
+    model = runtime.preparation.specification.model
+    supports_current_correction = runtime.candidate isa _TransformerTerminalMatrixCandidate &&
+        model isa Union{LowFrequencyTransformerModel,BCTRANTransformerModel} &&
+        all(runtime.event_state.terminal_closed) &&
+        all(iszero, runtime.event_state.terminal_fault_admittance_s)
+    if !supports_current_correction && all(iszero, terminal_voltage_correction_v)
+        nonlinear_current_jacobian!(terminal_current_a, terminal_jacobian_s,
+            runtime, terminal_voltage_v, bookkeeping_time)
+        fill!(terminal_current_correction_a, 0.0)
+        return nothing
+    end
+    return nonlinear_current_jacobian_compensated!(terminal_current_a,
+        terminal_jacobian_s, runtime, terminal_voltage_v,
+        terminal_voltage_correction_v, bookkeeping_time; terminal_current_correction_a)
+end
+
+function accept_nonlinear_device_compensated_state!(
+    runtime::TransformerApparatusRuntime,
+    terminal_voltage_v::AbstractVector{Float64},
+    terminal_voltage_correction_v::AbstractVector{Float64},
+    terminal_current_a::AbstractVector{Float64},
+    _terminal_jacobian_s::AbstractMatrix{Float64},
+    time_s::Float64,
+)
+    runtime.prepared || throw(ArgumentError(
+        "transformer apparatus step must be prepared before compensated state acceptance",
+    ))
+    abs(time_s - runtime.candidate_time_s) <=
+        64.0 * eps(Float64) * max(abs(time_s), abs(runtime.candidate_time_s), 1.0) ||
+        throw(ArgumentError(
+            "transformer compensated accepted time does not match the prepared candidate",
+        ))
+    _transformer_linear_compensated_trial!(
+        runtime,
+        terminal_voltage_v,
+        terminal_voltage_correction_v,
+        ; retain_history_precision=true,
+    )
+    candidate = runtime.candidate::_TransformerTerminalMatrixCandidate
+    state = runtime.accepted_state::TransformerTerminalMatrixRuntimeState
+    matrices = _transformer_terminal_matrices(runtime.preparation)
+    _accept_transformer_linear_terminal_state!(
+        runtime,
+        candidate,
+        state,
+        matrices,
+        runtime.candidate_apparatus_terminal_voltage_v,
+        candidate.terminal_current_a,
+    )
+    _accept_transformer_event_state!(
+        runtime,
+        terminal_voltage_v,
+        terminal_current_a,
+    )
+    runtime.accepted_evaluation_count += 1
+    return nothing
+end
+
+# Absolute time is bookkeeping for this prepared companion; its constitutive
+function accept_nonlinear_device_compensated_state!(
+    runtime::TransformerApparatusRuntime,voltage::AbstractVector{Float64},
+    voltage_correction::AbstractVector{Float64},current::AbstractVector{Float64},
+    current_correction::AbstractVector{Float64},jacobian::AbstractMatrix{Float64},
+    time::Union{Float64,ContinuousEvaluationTime},
+)
+    _validate_nonlinear_current_correction_buffers(current,current_correction,voltage,voltage_correction)
+    all(isfinite,current_correction) && all(i->current[i]+current_correction[i]==current[i],eachindex(current)) ||
+        throw(ArgumentError("transformer accepted current correction is nonfinite or overlapping"))
+    bookkeeping_time = time isa ContinuousEvaluationTime ? time.high_s : time
+    return accept_nonlinear_device_compensated_state!(runtime,voltage,voltage_correction,
+        current,jacobian,bookkeeping_time)
+end
+
+# Absolute time is bookkeeping for this prepared companion; its constitutive
+# state and histories depend on the separately prepared elapsed step.
+nonlinear_current_jacobian!(current,jacobian,runtime::TransformerApparatusRuntime,
+    voltage,time::ContinuousEvaluationTime) =
+    nonlinear_current_jacobian!(current,jacobian,runtime,voltage,time.high_s)
+nonlinear_current_jacobian_compensated!(current,jacobian,runtime::TransformerApparatusRuntime,
+    voltage,correction,time::ContinuousEvaluationTime) =
+    nonlinear_current_jacobian_compensated!(current,jacobian,runtime,voltage,correction,time.high_s)
+accept_nonlinear_device_compensated_state!(runtime::TransformerApparatusRuntime,voltage,
+    correction,current,jacobian,time::ContinuousEvaluationTime) =
+    accept_nonlinear_device_compensated_state!(runtime,voltage,correction,current,jacobian,time.high_s)
+accept_nonlinear_device_state!(runtime::TransformerApparatusRuntime,voltage,current,
+    jacobian,time::ContinuousEvaluationTime) =
+    accept_nonlinear_device_state!(runtime,voltage,current,jacobian,time.high_s)
+
 function _transformer_endpoint_inner_product(
     previous_left,
     accepted_left,
@@ -2345,9 +2815,9 @@ function _accept_transformer_linear_terminal_state!(
         runtime.preparation.specification.settings,
         runtime.companion_method,
     )
-    state.coil_current_a .= candidate.coil_current_a
-    state.capacitor_current_a .= candidate.capacitor_current_a
-    state.coil_voltage_v .= candidate.coil_voltage_v
+    _store_transformer_companion_history!(state,:coil_current_a,candidate.coil_current_a)
+    _store_transformer_companion_history!(state,:capacitor_current_a,candidate.capacitor_current_a)
+    _store_transformer_companion_history!(state,:coil_voltage_v,candidate.coil_voltage_v)
     state.terminal_voltage_v .= voltage
     state.terminal_current_a .= current
     state.stored_magnetic_energy_j = magnetic_energy
@@ -2841,6 +3311,11 @@ function accept_nonlinear_device_state!(
     _terminal_jacobian_s::AbstractMatrix{Float64},
     time_s::Float64,
 )
+    if runtime.accepted_state isa TransformerTerminalMatrixRuntimeState &&
+        _transformer_has_extended_histories(runtime.accepted_state)
+        return accept_nonlinear_device_compensated_state!(runtime,terminal_voltage_v,
+            zeros(length(terminal_voltage_v)),_terminal_current_a,_terminal_jacobian_s,time_s)
+    end
     runtime.prepared || throw(ArgumentError(
         "transformer apparatus step must be prepared before state acceptance",
     ))
@@ -2879,11 +3354,11 @@ struct TransformerApparatusRuntimeSnapshot
 end
 
 function _transformer_runtime_state_tuple(state::TransformerTerminalMatrixRuntimeState)
-    return (
+    basic = (
         kind=:terminal_matrix,
-        coil_current_a=copy(state.coil_current_a),
-        capacitor_current_a=copy(state.capacitor_current_a),
-        coil_voltage_v=copy(state.coil_voltage_v),
+        coil_current_a=Float64.(state.coil_current_a),
+        capacitor_current_a=Float64.(state.capacitor_current_a),
+        coil_voltage_v=Float64.(state.coil_voltage_v),
         winding_loss_state=copy(state.winding_loss_state),
         winding_loss_voltage_v=copy(state.winding_loss_voltage_v),
         terminal_voltage_v=copy(state.terminal_voltage_v),
@@ -2903,6 +3378,16 @@ function _transformer_runtime_state_tuple(state::TransformerTerminalMatrixRuntim
         accepted_time_s=state.accepted_time_s,
         accepted_step_count=state.accepted_step_count,
     )
+    corrections = Dict{Symbol,Vector{Float64}}()
+    for name in (:coil_current_a,:capacitor_current_a,:coil_voltage_v)
+        values = getfield(state,name)
+        values isa Vector{BigFloat} || continue
+        pairs = _encode_compensated_scalar_pair.(values)
+        all(pair->pair.status === :ok,pairs) || throw(ArgumentError(
+            "transformer snapshot cannot represent a companion history at declared 106-bit precision"))
+        corrections[name] = getproperty.(pairs,:low)
+    end
+    return isempty(corrections) ? basic : merge(basic,(;extended_history_corrections=corrections))
 end
 
 function _transformer_runtime_state_tuple(state::TransformerMagneticRuntimeState)
@@ -3091,7 +3576,7 @@ function transformer_apparatus_runtime_snapshot(runtime::TransformerApparatusRun
         state,
     )
     return TransformerApparatusRuntimeSnapshot(
-        1,
+        hasproperty(state,:extended_history_corrections) ? 2 : 1,
         runtime.preparation.preparation_signature_sha256,
         state,
         signature,
@@ -3159,6 +3644,28 @@ function _restore_transformer_state!(
     snapshot.kind === :terminal_matrix || throw(ArgumentError(
         "transformer snapshot state family is incompatible",
     ))
+    corrections = hasproperty(snapshot,:extended_history_corrections) ?
+        snapshot.extended_history_corrections : Dict{Symbol,Vector{Float64}}()
+    corrections isa AbstractDict && all(name->name in
+        (:coil_current_a,:capacitor_current_a,:coil_voltage_v),keys(corrections)) ||
+        throw(ArgumentError("transformer snapshot has unsupported extended histories"))
+    restored = Dict{Symbol,Union{Vector{Float64},Vector{BigFloat}}}()
+    for name in (:coil_current_a,:capacitor_current_a,:coil_voltage_v)
+        high = getfield(snapshot,name)
+        high isa Vector{Float64} && length(high) == length(getfield(state,name)) && all(isfinite,high) ||
+            throw(ArgumentError("transformer snapshot companion high vector is incompatible"))
+        if haskey(corrections,name)
+            low = corrections[name]
+            low isa Vector{Float64} && length(low) == length(high) || throw(ArgumentError(
+                "transformer snapshot companion correction vector is incompatible"))
+            decoded = _decode_compensated_scalar_pair.(high,low)
+            all(value->value.status === :ok,decoded) || throw(ArgumentError(
+                "transformer snapshot companion pair is noncanonical or loses precision"))
+            restored[name] = BigFloat[value.value for value in decoded]
+        else
+            restored[name] = copy(high)
+        end
+    end
     for name in (
         :coil_current_a,
         :capacitor_current_a,
@@ -3169,11 +3676,15 @@ function _restore_transformer_state!(
         :terminal_current_a,
     )
         target = getfield(state, name)
-        source = getfield(snapshot, name)
+        source = haskey(restored,name) ? restored[name] : getfield(snapshot, name)
         length(target) == length(source) || throw(DimensionMismatch(
             "transformer snapshot vector size is incompatible",
         ))
-        target .= source
+        if haskey(restored,name) && typeof(target) !== typeof(source)
+            setfield!(state,name,source)
+        else
+            copyto!(target,source)
+        end
     end
     for name in (
         :previous_terminal_power_w,
@@ -3322,9 +3833,15 @@ function restore_transformer_apparatus_runtime_snapshot!(
     runtime.prepared && throw(ArgumentError(
         "transformer snapshot cannot be restored during an active trial step",
     ))
-    snapshot.schema_version == 1 || throw(ArgumentError(
+    snapshot.schema_version in (1,2) || throw(ArgumentError(
         "transformer snapshot schema version is unsupported",
     ))
+    extended = hasproperty(snapshot.state,:extended_history_corrections)
+    extended == (snapshot.schema_version == 2) || throw(ArgumentError(
+        "transformer snapshot schema does not match its history representation"))
+    extended && (snapshot.state.kind !== :terminal_matrix ||
+        isempty(snapshot.state.extended_history_corrections)) && throw(ArgumentError(
+            "transformer snapshot has an incompatible extended-history family"))
     snapshot.preparation_signature_sha256 ==
         runtime.preparation.preparation_signature_sha256 || throw(ArgumentError(
             "transformer snapshot preparation identity is stale",

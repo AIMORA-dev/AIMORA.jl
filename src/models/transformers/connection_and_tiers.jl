@@ -32,6 +32,7 @@ export TransformerApparatusTier,
        transformer_apparatus_contract,
        transformer_coil_voltages!,
        transformer_terminal_currents!,
+       transformer_terminal_current_cutset,
        transformer_connection_rank,
        transformer_connection_signature,
        transformer_connection_phase_shift
@@ -568,15 +569,45 @@ function TransformerConnectionTopology(;
 end
 
 transformer_connection_rank(topology::TransformerConnectionTopology) = topology.rank
+
+"""Certify an exact terminal-current cutset of the declared winding graph.
+
+For terminal currents `i = B*j`, a nonzero weight vector `w` with
+`B' * w == 0` requires `w' * i == 0` for every winding current. This
+also annihilates storage and dielectric currents represented on those
+same winding ports. It says nothing about other network elements: the
+caller must include their physical current paths separately. Exact
+rational arithmetic certifies the represented incidence, without a
+rank threshold that could discard a small physical connection.
+"""
+function transformer_terminal_current_cutset(
+    topology::TransformerConnectionTopology,
+    terminal_weights::AbstractVector{<:Real},
+)
+    length(terminal_weights) == size(topology.incidence, 1) ||
+        throw(DimensionMismatch("transformer cutset weights must cover every terminal"))
+    weights = Float64.(terminal_weights)
+    all(isfinite, weights) && any(!iszero, weights) || throw(ArgumentError(
+        "transformer cutset weights must be finite and nonzero",
+    ))
+    exact_weights = Rational{BigInt}.(weights)
+    for coil in axes(topology.incidence, 2)
+        current_weight = sum(axes(topology.incidence, 1)) do terminal
+            Rational{BigInt}(topology.incidence[terminal, coil]) * exact_weights[terminal]
+        end
+        iszero(current_weight) || return false
+    end
+    return true
+end
 transformer_connection_signature(topology::TransformerConnectionTopology) =
     topology.deterministic_signature_sha256
 transformer_connection_phase_shift(topology::TransformerConnectionTopology) =
     topology.phase_shift_rad
 
 function transformer_coil_voltages!(
-    coil_voltage_v::AbstractVector{Float64},
+    coil_voltage_v::AbstractVector{<:Real},
     topology::TransformerConnectionTopology,
-    node_voltage_v::AbstractVector{Float64},
+    node_voltage_v::AbstractVector{<:Real},
 )
     length(node_voltage_v) == length(topology.node_order) || throw(DimensionMismatch(
         "transformer node voltage count must match the connection topology",
@@ -589,9 +620,9 @@ function transformer_coil_voltages!(
 end
 
 function transformer_terminal_currents!(
-    node_current_a::AbstractVector{Float64},
+    node_current_a::AbstractVector{<:Real},
     topology::TransformerConnectionTopology,
-    coil_current_a::AbstractVector{Float64},
+    coil_current_a::AbstractVector{<:Real},
 )
     length(coil_current_a) == length(topology.coil_order) || throw(DimensionMismatch(
         "transformer coil current count must match the connection topology",

@@ -1,6 +1,7 @@
 module NonlinearNetwork
 
 using ..StudyCore: ParameterNature,
+                   ContinuousEvaluationTime,
                    PhysicalModelParameter,
                    ScalingBasisParameter,
                    NumericalPolicyParameter,
@@ -35,13 +36,24 @@ export AbstractNonlinearCurrentDevice,
        nonlinear_device_provenance,
        nonlinear_terminal_nodes,
        nonlinear_current_jacobian!,
+       nonlinear_current_jacobian_compensated!,
        prepare_nonlinear_device_step!,
+       prepare_nonlinear_device_event_substep!,
        accept_nonlinear_device_state!,
+       accept_nonlinear_device_compensated_state!,
        finish_nonlinear_device_step!,
        nonlinear_device_event_surfaces,
        nonlinear_device_event_value,
+       nonlinear_device_event_value_tolerance,
        nonlinear_device_event_candidate_time,
        apply_nonlinear_device_event!,
+       refresh_nonlinear_device_event_dependents!,
+       nonlinear_device_event_boundary_context,
+       nonlinear_device_event_transition_snapshot,
+       record_nonlinear_device_event_transition_observation!,
+       nonlinear_device_event_capacitance,
+       nonlinear_device_event_current,
+       rebase_nonlinear_device_event_derivative!,
        classify_numerical_chatter,
        validate_nonlinear_solve_options,
        nonlinear_result_accepted
@@ -128,6 +140,83 @@ function nonlinear_current_jacobian!(
     ))
 end
 
+"""Evaluate a nonlinear device at a compensated terminal-voltage state.
+
+`terminal_voltage_v + terminal_voltage_correction_v` is one state represented
+as a nonoverlapping high/low pair.  The default admits only an exactly zero low
+part; device owners must implement their physical equation explicitly before a
+nonzero correction can participate in an accepted nonlinear solve.
+"""
+function nonlinear_current_jacobian_compensated!(
+    terminal_current_a::AbstractVector{Float64},
+    terminal_jacobian_s::AbstractMatrix{Float64},
+    device::AbstractNonlinearCurrentDevice,
+    terminal_voltage_v::AbstractVector{Float64},
+    terminal_voltage_correction_v::AbstractVector{Float64},
+    time_s::Float64,
+)
+    length(terminal_voltage_correction_v) == length(terminal_voltage_v) ||
+        throw(DimensionMismatch(
+            "nonlinear compensated terminal-voltage vectors must have equal length",
+        ))
+    all(iszero, terminal_voltage_correction_v) || throw(ArgumentError(
+        "nonlinear device $(typeof(device)) does not implement compensated terminal-voltage evaluation",
+    ))
+    return nonlinear_current_jacobian!(
+        terminal_current_a,
+        terminal_jacobian_s,
+        device,
+        terminal_voltage_v,
+        time_s,
+    )
+end
+
+function _validate_nonlinear_current_correction_buffers(current, correction, voltage, voltage_correction)
+    length(voltage) == length(voltage_correction) || throw(DimensionMismatch(
+        "nonlinear terminal-voltage high/low buffers must cover the same terminals"))
+    length(current) == length(correction) && length(current) >= length(voltage) ||
+        throw(DimensionMismatch("nonlinear terminal-current high/low buffers must cover the same terminals"))
+    any(values -> Base.mightalias(correction, values), (current, voltage, voltage_correction)) &&
+        throw(ArgumentError("nonlinear terminal-current correction must not alias current or voltage buffers"))
+    return nothing
+end
+
+"""Evaluate terminal current with a separate nonoverlapping current low part.
+
+The existing current/Jacobian outputs keep their Float64 representation. Owners
+with compensated physical-current arithmetic can supply its rounding remainder
+to KCL without introducing a second accepted state. The default preserves the
+existing device evaluation and returns zero current corrections; it does not
+admit a voltage correction unsupported by that owner.
+"""
+function nonlinear_current_jacobian_compensated!(
+    terminal_current_a::AbstractVector{Float64},
+    terminal_jacobian_s::AbstractMatrix{Float64},
+    terminal_current_correction_a::AbstractVector{Float64},
+    device,
+    terminal_voltage_v::AbstractVector{Float64},
+    terminal_voltage_correction_v::AbstractVector{Float64},
+    time_s::Union{Float64,ContinuousEvaluationTime},
+)
+    _validate_nonlinear_current_correction_buffers(terminal_current_a,
+        terminal_current_correction_a, terminal_voltage_v, terminal_voltage_correction_v)
+    if all(iszero, terminal_voltage_correction_v)
+        evaluation_time = time_s isa ContinuousEvaluationTime && iszero(time_s.low_s) &&
+            !applicable(nonlinear_current_jacobian!, terminal_current_a, terminal_jacobian_s,
+                device, terminal_voltage_v, time_s) ? time_s.high_s : time_s
+        nonlinear_current_jacobian!(terminal_current_a, terminal_jacobian_s,
+            device, terminal_voltage_v, evaluation_time)
+    else
+        evaluation_time = time_s isa ContinuousEvaluationTime && iszero(time_s.low_s) &&
+            !applicable(nonlinear_current_jacobian_compensated!, terminal_current_a, terminal_jacobian_s,
+                device, terminal_voltage_v, terminal_voltage_correction_v, time_s) ? time_s.high_s : time_s
+        nonlinear_current_jacobian_compensated!(terminal_current_a, terminal_jacobian_s,
+            device, terminal_voltage_v, terminal_voltage_correction_v, evaluation_time)
+    end
+    fill!(terminal_current_correction_a, 0.0)
+    return nothing
+end
+
 """Prepare one non-mutating nonlinear companion evaluation for an exact candidate substep.
 
 Stateful devices may cache only candidate-step metadata here. The surrounding solver transaction owns rollback, and physical state is accepted only through `accept_nonlinear_device_state!` after network convergence.
@@ -141,6 +230,14 @@ function prepare_nonlinear_device_step!(
     return nothing
 end
 
+"""Prepare an event-localized companion; unqualified devices keep their normal step guard."""
+prepare_nonlinear_device_event_substep!(
+    device,
+    time_s::Float64,
+    step_s::Float64,
+    companion_method::Symbol,
+) = prepare_nonlinear_device_step!(device, time_s, step_s, companion_method)
+
 """Accept device state only after the coupled network solution has converged; stateless devices use the default no-op."""
 function accept_nonlinear_device_state!(
     device::AbstractNonlinearCurrentDevice,
@@ -148,6 +245,64 @@ function accept_nonlinear_device_state!(
     terminal_current_a::AbstractVector{Float64},
     time_s::Float64,
 )
+    return nothing
+end
+
+
+"""Accept a converged compensated terminal-voltage state without hiding low-part ownership."""
+function accept_nonlinear_device_compensated_state!(
+    device::AbstractNonlinearCurrentDevice,
+    terminal_voltage_v::AbstractVector{Float64},
+    terminal_voltage_correction_v::AbstractVector{Float64},
+    terminal_current_a::AbstractVector{Float64},
+    terminal_jacobian_s::AbstractMatrix{Float64},
+    time_s::Float64,
+)
+    length(terminal_voltage_correction_v) == length(terminal_voltage_v) ||
+        throw(DimensionMismatch(
+            "accepted compensated terminal-voltage vectors must have equal length",
+        ))
+    all(iszero, terminal_voltage_correction_v) || throw(ArgumentError(
+        "nonlinear device $(typeof(device)) does not implement compensated state acceptance",
+    ))
+    return accept_nonlinear_device_state!(
+        device,
+        terminal_voltage_v,
+        terminal_current_a,
+        terminal_jacobian_s,
+        time_s,
+    )
+end
+
+"""Accept one compensated current/voltage state; nonzero current lows require an explicit owner contract."""
+function accept_nonlinear_device_compensated_state!(
+    device,terminal_voltage_v::AbstractVector{Float64},
+    terminal_voltage_correction_v::AbstractVector{Float64},
+    terminal_current_a::AbstractVector{Float64},terminal_current_correction_a::AbstractVector{Float64},
+    terminal_jacobian_s::AbstractMatrix{Float64},time_s::Union{Float64,ContinuousEvaluationTime},
+)
+    _validate_nonlinear_current_correction_buffers(terminal_current_a,
+        terminal_current_correction_a,terminal_voltage_v,terminal_voltage_correction_v)
+    all(iszero,terminal_current_correction_a) || throw(ArgumentError(
+        "nonlinear owner $(typeof(device)) does not implement compensated-current acceptance"))
+    if any(!iszero,terminal_voltage_correction_v)
+        evaluation_time = time_s isa ContinuousEvaluationTime && iszero(time_s.low_s) &&
+            !applicable(accept_nonlinear_device_compensated_state!,device,terminal_voltage_v,
+                terminal_voltage_correction_v,terminal_current_a,terminal_jacobian_s,time_s) ? time_s.high_s : time_s
+        accept_nonlinear_device_compensated_state!(device,terminal_voltage_v,
+            terminal_voltage_correction_v,terminal_current_a,terminal_jacobian_s,evaluation_time)
+    else
+        evaluation_time = time_s isa ContinuousEvaluationTime && iszero(time_s.low_s) &&
+            !applicable(accept_nonlinear_device_state!,device,terminal_voltage_v,
+                terminal_current_a,terminal_jacobian_s,time_s) ? time_s.high_s : time_s
+        if applicable(accept_nonlinear_device_state!,device,terminal_voltage_v,
+            terminal_current_a,terminal_jacobian_s,evaluation_time)
+            accept_nonlinear_device_state!(device,terminal_voltage_v,
+                terminal_current_a,terminal_jacobian_s,evaluation_time)
+        elseif time_s isa ContinuousEvaluationTime
+            throw(ArgumentError("nonlinear owner does not implement continuous-time acceptance"))
+        end
+    end
     return nothing
 end
 
@@ -170,6 +325,7 @@ end
 function finish_nonlinear_device_step!(device::AbstractNonlinearCurrentDevice)
     return nothing
 end
+
 
 """One solver-neutral, directed event surface owned by a nonlinear physical device.
 
@@ -237,6 +393,23 @@ function nonlinear_device_event_value(
     return value
 end
 
+"""Return the largest event-root residual that its physical transition accepts.
+
+Devices may narrow the solver policy's value tolerance, but cannot widen it.
+The same effective tolerance is used for bracket detection and localization.
+"""
+function nonlinear_device_event_value_tolerance(
+    ::NonlinearDeviceEventSurface,
+    _device,
+    policy_value_tolerance::Real,
+)
+    tolerance = Float64(policy_value_tolerance)
+    isfinite(tolerance) && tolerance >= 0.0 || throw(ArgumentError(
+        "nonlinear-device event value tolerance must be finite and nonnegative",
+    ))
+    return tolerance
+end
+
 function nonlinear_device_event_candidate_time(
     surface::NonlinearDeviceEventSurface,
     device,
@@ -261,6 +434,51 @@ function apply_nonlinear_device_event!(
     ))
     surface.transition(device, time)
     return surface
+end
+
+"""Rebuild algebraic dependents after an accepted device event without advancing continuous state."""
+refresh_nonlinear_device_event_dependents!(
+    ::AbstractNonlinearCurrentDevice,
+    ::Float64,
+) = nothing
+
+"""Capture a transient current-boundary context before one device event."""
+nonlinear_device_event_boundary_context(::AbstractNonlinearCurrentDevice, _time_s) = nothing
+
+refresh_nonlinear_device_event_dependents!(device, time_s, ::Nothing) =
+    refresh_nonlinear_device_event_dependents!(device, time_s)
+
+"""Read causal state before an event for optional derivative observations.
+
+This hook must not mutate accepted state. Its result is transient observation
+data, not a second physical owner or a checkpoint representation.
+"""
+nonlinear_device_event_transition_snapshot(::AbstractNonlinearCurrentDevice) = nothing
+
+"""Append post-event observations paired with the exact pre-event causal state.
+
+The endpoint owner is `:left` for an event following an accepted substep and
+`:right` for a declared endpoint jump applied before that substep's solve.
+Devices without derivative observations need not implement this hook.
+"""
+record_nonlinear_device_event_transition_observation!(
+    _journal::AbstractVector, ::AbstractNonlinearCurrentDevice, _before, _after,
+    ::NonlinearDeviceEventSurface, ::Float64, ::Symbol,
+) = nothing
+
+"""Return an optional direct terminal capacitance for one-sided event derivative balance."""
+nonlinear_device_event_capacitance(::AbstractNonlinearCurrentDevice) = nothing
+nonlinear_device_event_current(::AbstractNonlinearCurrentDevice) = nothing
+
+"""Rebase an accepted device derivative without changing its physical stored state."""
+function rebase_nonlinear_device_event_derivative!(
+    device::AbstractNonlinearCurrentDevice,
+    current_increment_a::Float64,
+)
+    iszero(current_increment_a) || throw(ArgumentError(
+        "nonlinear device $(typeof(device)) has no event derivative rebase",
+    ))
+    return nothing
 end
 
 function _validate_two_terminal_nodes(positive_node::Integer, negative_node::Integer)
@@ -443,6 +661,63 @@ function nonlinear_current_jacobian!(
     return nothing
 end
 
+function nonlinear_current_jacobian_compensated!(
+    terminal_current_a::AbstractVector{Float64},
+    terminal_jacobian_s::AbstractMatrix{Float64},
+    device::CubicCurrentBranch,
+    terminal_voltage_v::AbstractVector{Float64},
+    terminal_voltage_correction_v::AbstractVector{Float64},
+    time_s::Float64,
+)
+    length(terminal_voltage_v) == length(terminal_voltage_correction_v) ||
+        throw(DimensionMismatch("cubic branch compensated voltage inventories disagree"))
+    length(terminal_current_a) >= 2 && length(terminal_voltage_v) >= 2 ||
+        throw(DimensionMismatch("cubic branch requires two terminal workspaces"))
+    size(terminal_jacobian_s, 1) >= 2 && size(terminal_jacobian_s, 2) >= 2 ||
+        throw(DimensionMismatch("cubic branch Jacobian workspace must be at least 2x2"))
+    isfinite(time_s) && all(isfinite, terminal_voltage_v) &&
+        all(isfinite, terminal_voltage_correction_v) ||
+        throw(ArgumentError("cubic branch compensated voltage and time must be finite"))
+    all(iszero, terminal_voltage_correction_v) && return nonlinear_current_jacobian!(
+        terminal_current_a, terminal_jacobian_s, device, terminal_voltage_v, time_s)
+    current, conductance = setprecision(BigFloat, 106) do
+        # Subtract common-mode high parts first so tiny differential low parts
+        # are not lost beside the common-mode voltage, even in wider arithmetic.
+        voltage = (BigFloat(terminal_voltage_v[1]) - BigFloat(terminal_voltage_v[2])) +
+            (BigFloat(terminal_voltage_correction_v[1]) - BigFloat(terminal_voltage_correction_v[2]))
+        linear = BigFloat(device.linear_conductance_s)
+        cubic = BigFloat(device.cubic_coefficient_a_per_v3)
+        Float64(linear * voltage + cubic * voltage^3),
+            Float64(linear + 3cubic * voltage^2)
+    end
+    terminal_current_a[1], terminal_current_a[2] = current, -current
+    terminal_jacobian_s[1, 1] = terminal_jacobian_s[2, 2] = conductance
+    terminal_jacobian_s[1, 2] = terminal_jacobian_s[2, 1] = -conductance
+    return nothing
+end
+
+function accept_nonlinear_device_compensated_state!(
+    device::CubicCurrentBranch,
+    terminal_voltage_v::AbstractVector{Float64},
+    terminal_voltage_correction_v::AbstractVector{Float64},
+    terminal_current_a::AbstractVector{Float64},
+    terminal_jacobian_s::AbstractMatrix{Float64},
+    time_s::Float64,
+)
+    length(terminal_voltage_v) == length(terminal_voltage_correction_v) ||
+        throw(DimensionMismatch("accepted cubic compensated voltage inventories disagree"))
+    length(terminal_voltage_v) >= 2 && length(terminal_current_a) >= 2 &&
+        size(terminal_jacobian_s, 1) >= 2 && size(terminal_jacobian_s, 2) >= 2 ||
+        throw(DimensionMismatch("accepted cubic branch requires two terminal workspaces"))
+    isfinite(time_s) && all(isfinite, terminal_voltage_v) &&
+        all(isfinite, terminal_voltage_correction_v) && all(isfinite, terminal_current_a) &&
+        all(isfinite, terminal_jacobian_s) ||
+        throw(ArgumentError("accepted cubic compensated state must be finite"))
+    # This constitutive polynomial has no physical history to accept. Its
+    # terminal high/low state belongs to the coupled network, not this device.
+    return nothing
+end
+
 """Linear ideal-voltage equation `sum(coefficients .* terminal_voltage) = value_v` with an MNA current unknown."""
 struct IdealVoltageConstraint{N}
     terminal_nodes::NTuple{N,Int}
@@ -550,6 +825,22 @@ function NonlinearNetworkScales(
         fill(voltage, constraints),
         fill(current, constraints),
     )
+end
+
+"""Explicit three-wire branch indices; no topology inference or new state DOF."""
+struct ThreeWireRLAcceptanceConstraint
+    branch_indices::NTuple{3,Int}
+    kcl_bound_a::Float64
+    relative_flux_bound::Float64
+    relative_energy_bound::Float64
+    function ThreeWireRLAcceptanceConstraint(indices::NTuple{3,Int},kcl_bound_a::Real;relative_flux_bound::Real=2.0e-6,relative_energy_bound::Real=2.0e-6)
+        all(>(0),indices) && length(unique(indices))==3 || throw(ArgumentError("three-wire branch indices must be distinct and positive"))
+        bound=Float64(kcl_bound_a)
+        isfinite(bound) && bound>0 || throw(ArgumentError("three-wire KCL bound must be finite and positive"))
+        flux=Float64(relative_flux_bound);energy=Float64(relative_energy_bound)
+        all(x->isfinite(x)&&x>0,(flux,energy)) || throw(ArgumentError("three-wire physical bounds must be finite and positive"))
+        new(indices,bound,flux,energy)
+    end
 end
 
 """Numerical policy for scaled safeguarded Newton solution of physical nonlinear KCL/MNA equations."""
@@ -876,5 +1167,50 @@ struct NonlinearSolveResult
 end
 
 nonlinear_result_accepted(result::NonlinearSolveResult) = result.accepted
+
+# These analytic owners have no temporal constitutive coordinate. Preserve
+# their existing compensated voltage law, never approximate a timed owner.
+for Device in (ExponentialCurrentBranch,CubicCurrentBranch)
+    @eval begin
+        nonlinear_current_jacobian!(current,jacobian,device::$Device,voltage,
+            time::ContinuousEvaluationTime) =
+            nonlinear_current_jacobian!(current,jacobian,device,voltage,time.high_s)
+        nonlinear_current_jacobian_compensated!(current,jacobian,device::$Device,voltage,correction,
+            time::ContinuousEvaluationTime) =
+            nonlinear_current_jacobian_compensated!(current,jacobian,device,voltage,correction,time.high_s)
+        accept_nonlinear_device_compensated_state!(device::$Device,voltage,correction,current,jacobian,
+            time::ContinuousEvaluationTime) =
+            accept_nonlinear_device_compensated_state!(device,voltage,correction,current,jacobian,time.high_s)
+        accept_nonlinear_device_state!(device::$Device,voltage,current,jacobian,
+            time::ContinuousEvaluationTime) =
+            accept_nonlinear_device_state!(device,voltage,current,jacobian,time.high_s)
+    end
+end
+
+function nonlinear_device_event_value(surface::NonlinearDeviceEventSurface,device,
+    time::ContinuousEvaluationTime)
+    raw_value = if applicable(surface.value,device,time)
+        surface.value(device,time)
+    elseif applicable(surface.value,device)
+        surface.value(device)
+    elseif iszero(time.low_s)
+        surface.value(device,time.high_s)
+    else
+        throw(ArgumentError("nonlinear event owner does not implement continuous-time evaluation"))
+    end
+    raw_value===nothing && return nothing
+    value = Float64(raw_value)
+    isfinite(value) || throw(ArgumentError("nonlinear event returned a nonfinite value"))
+    value
+end
+
+function apply_nonlinear_device_event!(surface::NonlinearDeviceEventSurface, device,
+    time::ContinuousEvaluationTime)
+    isfinite(time) || throw(ArgumentError("nonlinear event transition time must be finite"))
+    applicable(surface.transition, device, time) || throw(ArgumentError(
+        "nonlinear event owner does not implement continuous-time transition"))
+    surface.transition(device, time)
+    surface
+end
 
 end

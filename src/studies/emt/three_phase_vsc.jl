@@ -152,6 +152,7 @@ struct ConstantDCVoltageSignal
 end
 
 (signal::ConstantDCVoltageSignal)(_time_s::Real) = signal.voltage_v
+(signal::ConstantDCVoltageSignal)(_time::StudyCore.ContinuousEvaluationTime) = signal.voltage_v
 
 mutable struct ThreePhaseVSCRuntime{S,B,C,F}
     parameters::SwitchDetailedVSC.ThreePhaseTwoLevelVSCParameters

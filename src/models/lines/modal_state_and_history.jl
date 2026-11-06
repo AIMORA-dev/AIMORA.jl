@@ -244,8 +244,8 @@ function line_traveling_waves(line::BergeronLine)
 end
 
 function stamp!(
-    y::AbstractMatrix{Float64},
-    rhs::AbstractVector{Float64},
+    y::AbstractMatrix{<:Real},
+    rhs::AbstractVector{<:Real},
     line::BergeronLine,
     _t::Float64,
     _dt::Float64,

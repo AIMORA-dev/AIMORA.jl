@@ -379,6 +379,10 @@ function _portable_emt_exact_task_record(task::ExactSampledControlTask)
 end
 
 function _portable_emt_exact_task_record(task::ExactPWMTask)
+    task.quantized_cycle_ticks === nothing || _portable_emt_fail(
+        :unsupported_task_configuration,
+        "portable PWM snapshots refuse a temporary quantized-cycle override",
+    )
     return PortableSnapshotRecord(
         "aimora.emt.exact_pwm_task.v1",
         Pair{String,Any}[

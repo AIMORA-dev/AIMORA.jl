@@ -1,6 +1,7 @@
 module Branches
 
 using ..Companion
+using ..StudyCore: ContinuousEvaluationTime, continuous_time_seconds
 using LinearAlgebra: I, Symmetric, cholesky, isposdef, mul!
 
 export ConductanceBranch,
@@ -31,9 +32,20 @@ export ConductanceBranch,
        trace_output_values!,
        advance_breqiv_history_current!,
        stamp!,
-       update!
+       update!,
+       refresh_accepted_dependents!
 
 abstract type EMTElement end
+
+"""Whether a stamp depends on step/history/topology, but not on absolute time.
+
+Unknown owners must implement precise timed stamping or explicitly establish
+this property; the nonlinear solver never drops a nonzero time correction.
+"""
+continuous_time_invariant(::EMTElement) = false
+
+"""Refresh cached dependent fields after all coupled nonlinear devices accept a step."""
+refresh_accepted_dependents!(::EMTElement, _voltages, _dt_s::Float64) = nothing
 
 @enum CompanionIntegrationMethod begin
     TrapezoidalCompanion
@@ -122,9 +134,12 @@ mutable struct SeriesRLBranch <: EMTElement
     b::Int
     r::Float64
     l::Float64
-    i_prev::Float64
+    # The compensated path retains the physical current before Float64 history
+    # rounding. Keep the same seven-field layout for existing raw checkpoints;
+    # ordinary starts and compatibility updates still use Float64.
+    i_prev::Union{Float64,BigFloat}
     v_prev::Float64
-    i_last::Float64
+    i_last::Union{Float64,BigFloat}
 
     function SeriesRLBranch(
         a::Int,
@@ -458,7 +473,7 @@ backward_euler_companion_supported(
     },
 ) = true
 
-function stamp_conductance!(y::AbstractMatrix{Float64}, a::Int, b::Int, g::Float64)
+function stamp_conductance!(y::AbstractMatrix{<:Real}, a::Int, b::Int, g::Float64)
     if a != 0
         y[a, a] += g
     end
@@ -471,8 +486,14 @@ function stamp_conductance!(y::AbstractMatrix{Float64}, a::Int, b::Int, g::Float
     end
 end
 
-function stamp_history_current!(rhs::AbstractVector{Float64}, a::Int, b::Int, ih::Float64)
+function stamp_history_current!(rhs::AbstractVector{<:Real}, a::Int, b::Int, ih::Float64)
     # ih is positive from a to b. RHS is current injected into the node.
+    a != 0 && (rhs[a] -= ih)
+    b != 0 && (rhs[b] += ih)
+end
+
+function stamp_history_current!(rhs::AbstractVector{<:Real}, a::Int, b::Int, ih::BigFloat)
+    # Preserve the continuous source contribution until RHS storage rounds it.
     a != 0 && (rhs[a] -= ih)
     b != 0 && (rhs[b] += ih)
 end
@@ -1017,7 +1038,7 @@ function update_breqiv_phase_admittance!(phase_admittance::AbstractMatrix{Float6
     return phase_admittance
 end
 
-function stamp_admittance_entry!(y::AbstractMatrix{Float64}, a_row::Int, b_row::Int, a_col::Int, b_col::Int, value::Float64)
+function stamp_admittance_entry!(y::AbstractMatrix{<:Real}, a_row::Int, b_row::Int, a_col::Int, b_col::Int, value::Float64)
     if a_row != 0 && a_col != 0
         y[a_row, a_col] += value
     end
@@ -1197,7 +1218,7 @@ function _coupled_matrix_vector_mul!(
 end
 
 function stamp_history_current!(
-    rhs::AbstractVector{Float64},
+    rhs::AbstractVector{<:Real},
     b::CoupledInductiveBranch,
     dt::Float64,
 )
@@ -1219,7 +1240,7 @@ function stamp_history_current!(
 end
 
 function stamp_history_current!(
-    rhs::AbstractVector{Float64},
+    rhs::AbstractVector{<:Real},
     b::CoupledSeriesRLBranch,
     dt::Float64,
 )
@@ -1240,7 +1261,7 @@ function stamp_history_current!(
     return rhs
 end
 
-function stamp_breqiv_phase_admittance!(y::AbstractMatrix{Float64}, b::BreqivHistoryInjection)
+function stamp_breqiv_phase_admittance!(y::AbstractMatrix{<:Real}, b::BreqivHistoryInjection)
     for col in eachindex(b.a)
         for row in eachindex(b.a)
             stamp_admittance_entry!(
@@ -1265,13 +1286,13 @@ function companion(b::SeriesRLBranch, dt::Float64)
         throw(ArgumentError("series R-L inductance must be finite and nonnegative"))
     b.l > 0.0 || b.r > 0.0 ||
         throw(ArgumentError("series resistor-only branch resistance must be positive"))
-    all(isfinite, (b.i_prev, b.v_prev, b.i_last)) ||
+    (isfinite(b.i_prev) && isfinite(b.v_prev) && isfinite(b.i_last)) ||
         throw(ArgumentError("series R-L accepted state must be finite"))
     denominator = b.r + 2.0 * b.l / dt
     isfinite(denominator) && denominator != 0.0 ||
         throw(ArgumentError("series R-L companion denominator must be finite and nonzero"))
     conductance, history_current =
-        series_rl_companion(b.r, b.l, b.i_prev, b.v_prev, dt)
+        series_rl_companion(b.r, b.l, Float64(b.i_prev), b.v_prev, dt)
     all(isfinite, (conductance, history_current)) ||
         throw(ArgumentError("series R-L companion values must be finite"))
     return conductance, history_current
@@ -1313,7 +1334,7 @@ function companion(b::SeriesRLBranch, dt::Float64, ::Val{BackwardEulerCompanion}
     conductance, history_current = series_rl_backward_euler_companion(
         b.r,
         b.l,
-        b.i_prev,
+        Float64(b.i_prev),
         dt,
     )
     all(isfinite, (conductance, history_current)) || throw(ArgumentError(
@@ -1554,6 +1575,48 @@ function stamp!(y, rhs, s::CurrentInjection, t::Float64, dt::Float64)
     rhs[s.node] += s.value(t)
 end
 
+continuous_time_invariant(::Union{ConductanceBranch,IdealTransformerVoltageConstraint,
+    SeriesRLBranch,SeriesRLCBranch,CoupledInductiveBranch,CoupledSeriesRLBranch,CapacitorBranch}) = true
+
+function _continuous_source_value(signal, time::ContinuousEvaluationTime)
+    # An untyped numeric closure accepts metadata by dispatch but cannot do
+    # arithmetic with it. Dedicated metadata methods stay authoritative;
+    # otherwise evaluate numeric sources at the unrounded physical seconds.
+    metadata_method = applicable(signal,time) ? which(signal,(ContinuousEvaluationTime,)) : nothing
+    dedicated_metadata = metadata_method !== nothing &&
+        Base.unwrap_unionall(metadata_method.sig).parameters[2] !== Any
+    if dedicated_metadata
+        value = signal(time)
+    elseif applicable(signal,BigFloat(time.high_s))
+        value = setprecision(BigFloat,106) do
+            signal(continuous_time_seconds(time))
+        end
+    elseif iszero(time.low_s)
+        value = signal(time.high_s)
+    else
+        throw(ArgumentError("source signal does not implement continuous-time evaluation"))
+    end
+    isfinite(value) || throw(ArgumentError("continuous source value must be finite"))
+    value
+end
+
+function stamp!(y,rhs,source::TheveninSource,time::ContinuousEvaluationTime,step::Float64,method)
+    stamp_conductance!(y,source.node,0,source.g)
+    rhs[source.node] += source.g * _continuous_source_value(source.value,time)
+    nothing
+end
+
+function stamp!(y,rhs,source::TwoTerminalTheveninSource,time::ContinuousEvaluationTime,step::Float64,method)
+    stamp_conductance!(y,source.a,source.b,source.g)
+    stamp_history_current!(rhs,source.a,source.b,-source.g * _continuous_source_value(source.value,time))
+    nothing
+end
+
+function stamp!(y,rhs,source::CurrentInjection,time::ContinuousEvaluationTime,step::Float64,method)
+    rhs[source.node] += _continuous_source_value(source.value,time)
+    nothing
+end
+
 update!(b::ConductanceBranch, v, dt::Float64) = nothing
 update!(::IdealTransformerVoltageConstraint, _v, _dt::Float64) = nothing
 update!(s::TheveninSource, v, dt::Float64) = nothing
@@ -1663,6 +1726,167 @@ function update!(b::CapacitorBranch, v, dt::Float64)
     b.v_prev = vb
     b.i_prev = i
     b.i_last = i
+    return nothing
+end
+
+"""Recover terminal-subtraction bits only for a nodal-bound history high part."""
+function _companion_history_high_voltage(branch::Union{CapacitorBranch,SeriesRLBranch}, incoming_voltage)
+    # Explicit independently initialized history remains authoritative. When
+    # its high part is the accepted nodal branch voltage, retain the terminal
+    # subtraction's lost bits rather than treating the rounded difference as
+    # an additional physical voltage change.
+    incoming_voltage === nothing && return BigFloat(branch.v_prev)
+    branch.v_prev == branch_voltage(incoming_voltage,branch.a,branch.b) ||
+        return BigFloat(branch.v_prev)
+    high(node) = node == 0 ? BigFloat(0) : BigFloat(incoming_voltage[node])
+    high(branch.a)-high(branch.b)
+end
+
+_capacitor_history_high_voltage(branch::CapacitorBranch, incoming_voltage) =
+    _companion_history_high_voltage(branch,incoming_voltage)
+
+"""Evaluate R-L current as a change from its authoritative incoming current.
+
+Use the stamped conductance, but do not round the Norton history before
+combining it with the endpoint voltage. For an inductive branch this is
+`i₀ + g*(v-r*i₀)` (BE) or `i₀ + g*(v+v₀-2r*i₀)` (trapezoidal).
+The resistor-only limit has no incoming history.
+"""
+function _series_rl_companion_current(branch::SeriesRLBranch, conductance::Real,
+    endpoint_voltage::Real, incoming_voltage::Real, ::Val{M},
+) where {M}
+    M in (TrapezoidalCompanion,BackwardEulerCompanion) || throw(ArgumentError(
+        "unsupported compensated series R-L method"))
+    g,voltage = BigFloat(conductance),BigFloat(endpoint_voltage)
+    branch.l <= 0.0 && return g*voltage
+    current,resistance = BigFloat(branch.i_prev),BigFloat(branch.r)
+    drive = M === TrapezoidalCompanion ?
+        voltage+BigFloat(incoming_voltage)-2resistance*current :
+        voltage-resistance*current
+    return current+g*drive
+end
+
+"""Accept the same R-L current used by compensated nodal KCL, before history rounding."""
+function _series_rl_accepted_candidate(branch::SeriesRLBranch, voltage, endpoint_correction,
+    incoming_correction, dt::Float64, method::Val; incoming_voltage=nothing,
+)
+    conductance,_ = companion(branch,dt,method)
+    branch_voltage_v = branch_voltage(voltage,branch.a,branch.b)
+    physical = setprecision(BigFloat,106) do
+        high(node) = node == 0 ? BigFloat(0) : BigFloat(voltage[node])
+        low(values,node) = node == 0 ? BigFloat(0) : BigFloat(values[node])
+        endpoint = high(branch.a)+low(endpoint_correction,branch.a)-
+            high(branch.b)-low(endpoint_correction,branch.b)
+        previous = _companion_history_high_voltage(branch,incoming_voltage)+
+            low(incoming_correction,branch.a)-low(incoming_correction,branch.b)
+        current=_series_rl_companion_current(branch,conductance,endpoint,previous,method)
+        (;current_a=current,endpoint_voltage_v=endpoint,incoming_voltage_v=previous)
+    end
+    current=physical.current_a
+    all(isfinite,(branch_voltage_v,current)) || throw(ArgumentError(
+        "accepted compensated series R-L voltage and current must be finite"))
+    return (; voltage_v=branch_voltage_v,current_a=current,physical.endpoint_voltage_v,physical.incoming_voltage_v)
+end
+function update!(branch::SeriesRLBranch, voltage, endpoint_correction,
+    incoming_correction, dt::Float64, method::Val; incoming_voltage=nothing,
+)
+    candidate = _series_rl_accepted_candidate(branch,voltage,endpoint_correction,
+        incoming_correction,dt,method;incoming_voltage)
+    branch.v_prev = candidate.voltage_v
+    branch.i_prev = branch.i_last = candidate.current_a
+    return nothing
+end
+
+# Exact-sum STORAGE only: never evaluates a branch law above kernel106.
+function _three_wire_rl_current_storage(first::Real,second::Real)
+    exact = -Rational{BigInt}(first)-Rational{BigInt}(second)
+    bits = max(106,iszero(exact) ? 1 : ndigits(abs(numerator(exact));base=2))
+    setprecision(BigFloat,bits) do
+        value=BigFloat(numerator(exact))/BigFloat(denominator(exact))
+        Rational{BigInt}(value)==exact || error("dependent R-L current storage lost bits")
+        value
+    end
+end
+
+function _three_wire_rl_joint_candidate(branches,candidates,current_bounds_a,step_s::Float64,method::Val;relative_flux_bound::Float64,relative_energy_bound::Float64)
+    length(branches)==length(candidates)==length(current_bounds_a)==3 ||
+        throw(DimensionMismatch("three-wire R-L joint acceptance requires three phases"))
+    currents=[candidate.current_a for candidate in candidates]
+    constrained=copy(currents)
+    constrained[3]=_three_wire_rl_current_storage(currents[1],currents[2])
+    errors=[abs(Rational{BigInt}(constrained[i])-Rational{BigInt}(currents[i])) for i in 1:3]
+    all(i->errors[i]<=Rational{BigInt}(current_bounds_a[i]),1:3) ||
+        throw(DomainError(errors,"joint R-L acceptance exceeded original companion/current bounds"))
+    sum(Rational{BigInt}.(constrained))==0 || error("joint R-L acceptance violated exact KCL")
+    # Original public phase reports, resistive power and stored energy must be
+    # bitwise unchanged; physical bounds remain checked by ordinary integration.
+    Float64.(constrained)==Float64.(currents) ||
+        throw(DomainError(constrained,"joint R-L acceptance changed phase reporting"))
+    stored(values)=sum(i->0.5*branches[i].l*Float64(values[i])^2,1:3)
+    loss(values)=sum(i->branches[i].r*Float64(values[i])^2,1:3)
+    stored(constrained)==stored(currents) && loss(constrained)==loss(currents) ||
+        throw(DomainError(constrained,"joint R-L acceptance changed original energy/power report"))
+    # Exact represented-value conservation checks are guards, not a wider
+    # integration kernel or persistent Rational state. The staged candidate
+    # above is always106; only dependent current STORAGE may exceed106.
+    exact=Rational{BigInt}
+    dt=exact(step_s)
+    old=exact.([branch.i_prev for branch in branches]);accepted=exact.(constrained)
+    r=exact.([branch.r for branch in branches]);l=exact.([branch.l for branch in branches])
+    endpoint=exact.([candidate.endpoint_voltage_v for candidate in candidates])
+    incoming=exact.([candidate.incoming_voltage_v for candidate in candidates])
+    trap=method isa Val{TrapezoidalCompanion}
+    method isa Union{Val{TrapezoidalCompanion},Val{BackwardEulerCompanion}} || throw(ArgumentError("unknown joint R-L method"))
+    mean_current=trap ? (accepted.+old)./2 : accepted
+    drive=trap ? (endpoint.+incoming.-r.*(accepted.+old))./2 : endpoint.-r.*accepted
+    flux_change=l.*(accepted.-old);flux_integral=dt.*drive
+    flux_scales=max.(abs.(l.*accepted),abs.(l.*old),abs.(flux_integral),exact(eps(Float64)))
+    flux_errors=abs.(flux_change.-flux_integral)./flux_scales
+    all(x->x<=exact(relative_flux_bound),flux_errors) || throw(DomainError(flux_errors,"joint R-L acceptance exceeded original three flux/companion bounds"))
+    energy_change=sum(l.*(accepted.^2 .- old.^2))/2
+    mean_voltage=trap ? (endpoint.+incoming)./2 : endpoint
+    work=dt*sum(mean_voltage.*mean_current)
+    loss=dt*sum(r.*mean_current.^2)
+    numerical_loss=trap ? zero(exact) : sum(l.*(accepted.-old).^2)/2
+    energy_defect=energy_change-work+loss+numerical_loss
+    energy_scale=max(abs(work),abs(loss+numerical_loss),abs(energy_change),exact(eps(Float64)))
+    abs(energy_defect)<=exact(relative_energy_bound)*energy_scale ||
+        throw(DomainError(energy_defect,"joint R-L acceptance exceeded original energy bound"))
+    return (;currents=constrained,companion_errors_a=errors,flux_errors,energy_defect,energy_scale)
+end
+
+
+"""Accept the capacitor current of a compensated nodal solve.
+
+The incoming high/low pair belongs to the preceding accepted voltage. Use the
+same rounded conductance as the stamp, but form its physical voltage change
+before multiplying. Supplying the incoming high vector also retains terminal
+subtraction bits; independently initialized component history stays authoritative.
+Without it, the compatibility API uses the declared component history high part.
+"""
+function update!(branch::CapacitorBranch, voltage, endpoint_correction,
+    incoming_correction, dt::Float64, method::Val{M},
+    ; incoming_voltage=nothing,
+) where {M}
+    M in (TrapezoidalCompanion, BackwardEulerCompanion) || throw(ArgumentError(
+        "unsupported compensated capacitor acceptance method"))
+    conductance, _ = companion(branch, dt, method)
+    branch_voltage_v = branch_voltage(voltage, branch.a, branch.b)
+    current = setprecision(BigFloat, 106) do
+        high(node) = node == 0 ? BigFloat(0) : BigFloat(voltage[node])
+        low(values, node) = node == 0 ? BigFloat(0) : BigFloat(values[node])
+        endpoint = high(branch.a) + low(endpoint_correction, branch.a) -
+            high(branch.b) - low(endpoint_correction, branch.b)
+        previous = _capacitor_history_high_voltage(branch,incoming_voltage) + low(incoming_correction, branch.a) -
+            low(incoming_correction, branch.b)
+        Float64(BigFloat(conductance) * (endpoint - previous) -
+            (M === TrapezoidalCompanion ? BigFloat(branch.i_prev) : BigFloat(0)))
+    end
+    all(isfinite, (branch_voltage_v, current)) || throw(ArgumentError(
+        "accepted compensated capacitor voltage and current must be finite"))
+    branch.v_prev = branch_voltage_v
+    branch.i_prev = current
+    branch.i_last = current
     return nothing
 end
 

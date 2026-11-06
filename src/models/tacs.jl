@@ -224,8 +224,8 @@ function sync_controlled_switch!(s::TACSControlledSwitch, dt_s::Real=0.0)
 end
 
 function stamp!(
-    y::AbstractMatrix{Float64},
-    rhs::AbstractVector{Float64},
+    y::AbstractMatrix{<:Real},
+    rhs::AbstractVector{<:Real},
     s::TACSControlledSwitch,
     t::Float64,
     dt::Float64,

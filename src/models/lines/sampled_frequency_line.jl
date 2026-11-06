@@ -680,8 +680,8 @@ line_history_currents(line::SampledFrequencyDependentLine) =
     (from = line.history_current_from, to = line.history_current_to)
 
 function stamp!(
-    y::AbstractMatrix{Float64},
-    rhs::AbstractVector{Float64},
+    y::AbstractMatrix{<:Real},
+    rhs::AbstractVector{<:Real},
     line::SampledFrequencyDependentLine,
     _time_s::Float64,
     _timestep_s::Float64,
@@ -885,8 +885,8 @@ line_history_currents(line::SampledFrequencyDependentLineGroup) =
     (from = copy(line.history_current_from), to = copy(line.history_current_to))
 
 function stamp!(
-    y::AbstractMatrix{Float64},
-    rhs::AbstractVector{Float64},
+    y::AbstractMatrix{<:Real},
+    rhs::AbstractVector{<:Real},
     line::SampledFrequencyDependentLineGroup,
     _time_s::Float64,
     _timestep_s::Float64,

@@ -1,4 +1,53 @@
+using Test, AIMORA
+
 const ExtendedVSC = AIMORA.SwitchDetailedVSC
+
+@testset "VSC balance uses the actual accepted companion quadrature" begin
+    frame(voltage, current) = (
+        power=(;external_power_w=current, dissipated_power_w=current^2,
+            bridge=(;companion_energy_residual_j=0.0)),
+        stored_j=0.5voltage^2,
+        linear=(;capacitor_power_w=voltage * current,
+            capacitor_stored_energy_j=0.5voltage^2, inductor_power_w=0.0,
+            inductor_dissipated_power_w=0.0, inductor_stored_energy_j=0.0),
+    )
+    increment(left, right, step, method) = AIMORA.EMTStudy._extended_vsc_balance_increment(
+        left.power, right.power, left.stored_j, right.stored_j,
+        left.linear, right.linear, step, method)
+    # Analytic unit R-C apparatus driven by a constant unit source: the
+    # resistor's physical loss and the method's storage defect stay distinct.
+    for step in (0.1, 0.01), method in
+        (AIMORA.Branches.TrapezoidalCompanion, AIMORA.Branches.BackwardEulerCompanion)
+        implicit = method === AIMORA.Branches.BackwardEulerCompanion
+        left = frame(0.0, 1.0)
+        voltage = implicit ? step / (1 + step) : step / (1 + step / 2)
+        right = frame(voltage, 1 - voltage)
+        balance = increment(left, right, step, method)
+        @test abs(balance.residual_j) <= 4eps(Float64)
+        expected_external = step * (implicit ? right.power.external_power_w :
+            0.5 * (left.power.external_power_w + right.power.external_power_w))
+        expected_loss = step * (implicit ? right.power.dissipated_power_w :
+            0.5 * (left.power.dissipated_power_w + right.power.dissipated_power_w))
+        @test balance.external_work_j == expected_external
+        @test balance.dissipated_work_j == expected_loss
+        expected_defect = implicit ? 0.5voltage^2 :
+            step * voltage * (right.power.external_power_w - 1.0) / 4
+        @test balance.linear_defect_j ≈ expected_defect atol=4eps(Float64) rtol=0
+        if implicit
+            @test balance.linear_defect_j > 0
+            @test balance.external_work_j - balance.dissipated_work_j - right.stored_j > 0
+        end
+    end
+    left = frame(0.0, 1.0)
+    middle = frame(0.05 / 1.05, 1 / 1.05)
+    final_voltage = (middle.stored_j == 0 ? 0.0 : sqrt(2middle.stored_j))
+    final_voltage = (final_voltage + 0.05) / 1.05
+    right = frame(final_voltage, 1 - final_voltage)
+    first_half = increment(left, middle, 0.05, AIMORA.Branches.BackwardEulerCompanion)
+    second_half = increment(middle, right, 0.05, AIMORA.Branches.BackwardEulerCompanion)
+    @test abs(first_half.residual_j + second_half.residual_j) <= 4eps(Float64)
+    @test_throws ArgumentError increment(left, right, 0.1, :undeclared_companion)
+end
 
 function sequence_phase_sample(
     angle_rad;
@@ -319,6 +368,27 @@ end
         swing_control.virtual_inertia_w_s2_per_rad / (2.0 * pi)
     @test swing_command.frequency_hz ≈ expected_swing_frequency atol=1.0e-12
 
+    three_wire_state = ExtendedVSC.ExtendedVSCControlState(
+        ExtendedVSC.ExtendedVSCParameters(),
+    )
+    three_wire_state.zero_current_integral_v = 3.25
+    three_wire_measurement = ExtendedVSC.ExtendedVSCMeasurement(
+        droop_measurement.phase_voltage_v,
+        droop_measurement.converter_current_a,
+        (1.0, 1.0, 1.0),
+        droop_measurement.filter_voltage_v,
+        droop_measurement.neutral_current_a,
+        droop_measurement.dc_link_voltage_v,
+        droop_measurement.time_s,
+    )
+    ExtendedVSC.compute_extended_vsc_control!(
+        three_wire_state,
+        three_wire_measurement,
+        request,
+        ExtendedVSC.ExtendedVSCParameters(),
+    )
+    @test three_wire_state.zero_current_integral_v == 3.25
+
     pr_parameters = ExtendedVSC.ExtendedVSCParameters(
         controller=ExtendedVSC.ExtendedVSCControlParameters(
             family=ExtendedVSC.StationaryResonantGridFollowing,
@@ -346,6 +416,7 @@ end
         ),
     )
     four_wire_state = ExtendedVSC.ExtendedVSCControlState(four_wire_parameters)
+    four_wire_state.zero_current_integral_v = 3.25
     four_wire_voltage = sequence_phase_sample(
         0.0;
         positive_magnitude_v=325.0,
@@ -355,7 +426,7 @@ end
         four_wire_state,
         ExtendedVSC.ExtendedVSCMeasurement(
             four_wire_voltage,
-            (0.0, 0.0, 0.0),
+            (1.0, 1.0, 1.0),
             (0.0, 0.0, 0.0),
             four_wire_voltage,
             0.0,
@@ -367,4 +438,114 @@ end
     )
     @test abs(sum(four_wire_command.phase_current_reference_a)) > 0.0
     @test four_wire_command.duties[4] != 0.5
+    @test four_wire_state.zero_current_integral_v != 3.25
+end
+@testset "declared VSC source endpoints preserve boundary ownership" begin
+    emt = AIMORA.EMTStudy
+    endpoint = 0.7e-3
+    plan = [(:commanded_block, endpoint, true),
+        (:island_begins, endpoint, true), (:grid_reconnects, 0.8e-3, true)]
+    runtime = (; boundary_plan=plan, next_boundary_index=1)
+    @test !emt._extended_vsc_source_boundary_at(runtime, prevfloat(endpoint))
+    @test emt._extended_vsc_source_boundary_at(runtime, endpoint)
+    @test !emt._extended_vsc_source_boundary_at(runtime, nextfloat(endpoint))
+    @test emt._extended_vsc_source_boundary_at(runtime, 0.8e-3)
+    @test runtime.next_boundary_index == 1
+    @test runtime.boundary_plan == plan
+    consumed = (; boundary_plan=plan, next_boundary_index=3)
+    @test !emt._extended_vsc_source_boundary_at(consumed, endpoint)
+    @test emt._extended_vsc_source_boundary_at(consumed, 0.8e-3)
+    @test !emt._extended_vsc_is_source_boundary(:commanded_block)
+    @test !emt._extended_vsc_is_source_boundary(:commanded_restart)
+    for name in (:fault_begins, :fault_clears, :dc_sag_begins,
+                 :dc_sag_clears, :island_begins, :grid_reconnects)
+        @test emt._extended_vsc_is_source_boundary(name)
+    end
+end
+
+@testset "VSC accounting preserves compensated cancellation and numeric transitions" begin
+    E=AIMORA.EMTStudy;B=AIMORA.Branches
+    power(x)=(;external_power_w=x,dissipated_power_w=zero(x),bridge=(;companion_energy_residual_j=0.0))
+    linear(x)=(;capacitor_power_w=zero(x),capacitor_stored_energy_j=zero(x),
+        inductor_power_w=x,inductor_dissipated_power_w=x,inductor_stored_energy_j=zero(x))
+    for bits in (106,256), method in (B.TrapezoidalCompanion,B.BackwardEulerCompanion)
+        setprecision(BigFloat,bits) do
+            delta=BigFloat(2)^(-70);initial=BigFloat(1);final=initial+delta
+            @test Float64(final)-Float64(initial)==0.0
+            account=E.ExtendedVSCBalanceAccounting(power(delta),initial,linear(BigFloat(0)),0.0,0.0)
+            setprecision(BigFloat,53) do
+                E._accumulate_extended_vsc_balance!(account,power(delta),final,linear(BigFloat(0)),1.0,method)
+                @test precision(BigFloat)==53
+            end
+            @test account.energy_residual_j==0
+            @test account.previous_stored_energy_j==final
+            @test precision(account.previous_stored_energy_j)==bits
+            @test isconcretetype(typeof(account.previous_power))
+            wrong=E.ExtendedVSCBalanceAccounting(power(2delta),initial,linear(BigFloat(0)),0.0,0.0)
+            E._accumulate_extended_vsc_balance!(wrong,power(2delta),final,linear(BigFloat(0)),1.0,method)
+            @test wrong.energy_residual_j==delta
+            report=E._extended_vsc_reported_energy_ratio(wrong.energy_residual_j,eps(Float64))
+            @test report.exact_ratio==delta/BigFloat(eps(Float64))
+            @test report.exact_ratio>1e-6 && report.reported>1e-6
+            @test isfinite(report.reported)
+            @test BigFloat(prevfloat(report.reported))<=report.exact_ratio<=BigFloat(nextfloat(report.reported))
+            # A Float64 baseline must admit a compensated accepted substep
+            # without freezing either power/linear record to its initial type.
+            mixed=E.ExtendedVSCBalanceAccounting(power(0.0),0.0,linear(0.0),0.0,0.0)
+            factor=method===B.TrapezoidalCompanion ? 2 : 1
+            compensated_power=power(factor*final)
+            compensated_linear=linear(final)
+            setprecision(BigFloat,53) do
+                E._accumulate_extended_vsc_balance!(mixed,compensated_power,final,compensated_linear,1.0,method)
+            end
+            @test mixed.energy_residual_j==0
+            @test mixed.previous_power.external_power_w==factor*final
+            @test mixed.previous_power.external_power_w isa BigFloat
+            @test mixed.previous_linear.inductor_power_w==final
+            @test mixed.previous_linear.inductor_power_w isa BigFloat
+            E._accumulate_extended_vsc_balance!(mixed,power(0.0),0.0,linear(0.0),1.0,method)
+            @test mixed.energy_residual_j==(method===B.TrapezoidalCompanion ? 2final : final)
+            @test mixed.previous_stored_energy_j isa Float64
+            @test mixed.previous_power.external_power_w isa Float64
+            @test mixed.previous_linear.inductor_power_w isa Float64
+        end
+    end
+end
+
+@testset "VSC live conservation survives window cancellation rollback and restart" begin
+    E=AIMORA.EMTStudy
+    integrator=E.configure_extended_vsc(AIMORA.SwitchDetailedVSC.ExtendedVSCParameters())
+    runtime=integrator.runtime
+    delta=setprecision(BigFloat,256) do;BigFloat(2)^(-70);end
+    transaction=E.ExtendedVSCRuntimeTransaction(runtime)
+    E._begin_extended_vsc_transaction!(transaction)
+    setprecision(BigFloat,53) do
+        for increment in (1.0,delta,-1.0)
+            E._accumulate_extended_vsc_conservation!(runtime,increment,increment)
+        end
+    end
+    @test runtime.cumulative_energy_residual_j==delta
+    @test runtime.cumulative_linear_companion_energy_residual_j==delta
+    @test precision(runtime.cumulative_energy_residual_j)>=256
+    E._restore_extended_vsc_transaction!(transaction)
+    @test runtime.cumulative_energy_residual_j===0.0
+    @test runtime.cumulative_linear_companion_energy_residual_j===0.0
+    for increment in (1.0,delta,-1.0)
+        E._accumulate_extended_vsc_conservation!(runtime,increment,increment)
+    end
+    E._begin_extended_vsc_transaction!(transaction)
+    runtime.cumulative_energy_residual_j=0.0
+    runtime.cumulative_linear_companion_energy_residual_j=0.0
+    E._restore_extended_vsc_transaction!(transaction)
+    @test runtime.cumulative_energy_residual_j==delta
+    @test runtime.cumulative_linear_companion_energy_residual_j==delta
+    mktempdir() do directory
+        path=joinpath(directory,"retained-conservation.checkpoint")
+        E.write_extended_vsc_checkpoint(path,integrator)
+        restored=E.read_extended_vsc_checkpoint(path)
+        @test restored.runtime.cumulative_energy_residual_j==delta
+        @test restored.runtime.cumulative_linear_companion_energy_residual_j==delta
+        @test precision(restored.runtime.cumulative_energy_residual_j)==precision(runtime.cumulative_energy_residual_j)
+        @test precision(restored.runtime.cumulative_linear_companion_energy_residual_j)==precision(runtime.cumulative_linear_companion_energy_residual_j)
+    end
 end

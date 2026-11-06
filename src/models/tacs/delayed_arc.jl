@@ -126,7 +126,7 @@ function apply_controlled_switch_delayed_arc_transition!(switch, time_s::Real)
 end
 
 function _stamp_controlled_switch_arc_tail!(
-    rhs::AbstractVector{Float64},
+    rhs::AbstractVector{<:Real},
     switch,
     time_s::Float64,
     dt_s::Float64,

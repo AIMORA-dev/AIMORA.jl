@@ -754,7 +754,7 @@ function over16_switch_bvalue_export!(
     )
 end
 
-function stamp!(y::AbstractMatrix{Float64}, _rhs::AbstractVector{Float64},
+function stamp!(y::AbstractMatrix{<:Real}, _rhs::AbstractVector{<:Real},
                 s::Union{IdealSwitch,TimeSwitch,CurrentZeroSwitch}, t::Float64, _dt::Float64)
     stamp_conductance!(y, s.a, s.b, switch_conductance(s, t))
     return nothing

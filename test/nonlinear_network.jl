@@ -11,6 +11,35 @@ function synthetic_physical_parameter_provenance()
     )
 end
 
+@testset "cubic constitutive law retains compensated terminal differences" begin
+    device = CubicCurrentBranch(1, 0; linear_conductance_s=0.05,
+        cubic_coefficient_a_per_v3=0.002)
+    current, jacobian = zeros(2), zeros(2, 2)
+    for high in ([1e16, 1e16], [2.0, 1.0], [0.0, 0.0]),
+        low in ([0.5, -0.25], [1e-17, -2e-17], [-0.25, 0.5])
+        nonlinear_current_jacobian_compensated!(current, jacobian, device, high, low, 0.0)
+        expected_current, expected_jacobian = setprecision(BigFloat, 512) do
+            voltage = (BigFloat(high[1])-BigFloat(high[2])) +
+                (BigFloat(low[1])-BigFloat(low[2]))
+            (Float64(BigFloat(0.05)*voltage + BigFloat(0.002)*voltage^3),
+                Float64(BigFloat(0.05) + 3BigFloat(0.002)*voltage^2))
+        end
+        @test current == [expected_current, -expected_current]
+        @test jacobian == [expected_jacobian -expected_jacobian;
+            -expected_jacobian expected_jacobian]
+        @test accept_nonlinear_device_compensated_state!(device, high, low,
+            current, jacobian, 0.0) === nothing
+    end
+    nonlinear_current_jacobian!(current, jacobian, device, [2.0, 1.0], 0.0)
+    ordinary = (copy(current), copy(jacobian))
+    nonlinear_current_jacobian_compensated!(current, jacobian, device, [2.0, 1.0], zeros(2), 0.0)
+    @test (current, jacobian) == ordinary
+    @test_throws DimensionMismatch nonlinear_current_jacobian_compensated!(
+        current, jacobian, device, [2.0, 1.0], [0.5], 0.0)
+    @test_throws ArgumentError nonlinear_current_jacobian_compensated!(
+        current, jacobian, device, [2.0, 1.0], [NaN, 0.0], 0.0)
+end
+
 @testset "nonlinear terminal-current and ideal-constraint public contracts" begin
     exponential = ExponentialCurrentBranch(
         1,
@@ -262,6 +291,46 @@ if AIMORA.solver_available()
     )
         device.accepted_state_count += 1
         return nothing
+    end
+
+    function AIMORA.NonlinearNetwork.nonlinear_current_jacobian_compensated!(
+        terminal_current_a::AbstractVector{Float64},
+        terminal_jacobian_s::AbstractMatrix{Float64},
+        device::TimeLimitedLinearCurrentBranch,
+        terminal_voltage_v::AbstractVector{Float64},
+        terminal_voltage_correction_v::AbstractVector{Float64},
+        time_s::Float64,
+    )
+        length(terminal_voltage_v) == length(terminal_voltage_correction_v) ||
+            throw(DimensionMismatch("time-limited fixture voltage inventories disagree"))
+        all(iszero, terminal_voltage_correction_v) && return nonlinear_current_jacobian!(
+            terminal_current_a, terminal_jacobian_s, device, terminal_voltage_v, time_s)
+        # The fixture remains the same linear law with the same time-triggered
+        # nonfinite failure. A nonzero low part must not preempt that failure.
+        failure_time_s = device.failure_time_s isa Function ?
+            Float64(device.failure_time_s()) : Float64(device.failure_time_s)
+        conductance = time_s >= failure_time_s ? NaN : 0.1
+        branch_current = setprecision(BigFloat, 106) do
+            difference = (BigFloat(terminal_voltage_v[1])-BigFloat(terminal_voltage_v[2])) +
+                (BigFloat(terminal_voltage_correction_v[1])-BigFloat(terminal_voltage_correction_v[2]))
+            Float64(BigFloat(conductance)*difference)
+        end
+        terminal_current_a .= (branch_current, -branch_current)
+        terminal_jacobian_s .= [conductance -conductance; -conductance conductance]
+        return nothing
+    end
+
+    function AIMORA.NonlinearNetwork.accept_nonlinear_device_compensated_state!(
+        device::TimeLimitedLinearCurrentBranch,
+        terminal_voltage_v::AbstractVector{Float64},
+        terminal_voltage_correction_v::AbstractVector{Float64},
+        terminal_current_a::AbstractVector{Float64},
+        terminal_jacobian_s::AbstractMatrix{Float64},
+        time_s::Float64,
+    )
+        length(terminal_voltage_v) == length(terminal_voltage_correction_v) ||
+            throw(DimensionMismatch("time-limited fixture accepted voltage inventories disagree"))
+        return accept_nonlinear_device_state!(device, terminal_voltage_v, terminal_current_a, time_s)
     end
 
     mutable struct ToggleableFailureCurrentBranch <: AbstractNonlinearCurrentDevice

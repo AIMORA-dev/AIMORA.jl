@@ -1,6 +1,7 @@
 module TransformerApparatus
 
 using ..StudyCore: ContractQuantity,
+                   ContinuousEvaluationTime,
                    DynamicStateInventory,
                    FieldCoupledDetailed,
                    LegacyDetailed,
@@ -15,17 +16,20 @@ using ..TransformerParameters: MultiphaseTransformerParameterResult,
 using ..NonlinearNetwork: AbstractNonlinearCurrentDevice,
                           NonlinearDeviceEventSurface,
                           PhysicalConstitutiveCurrent
-import ..NonlinearNetwork: accept_nonlinear_device_state!,
+import ..NonlinearNetwork: accept_nonlinear_device_compensated_state!,
+                           accept_nonlinear_device_state!,
                            apply_nonlinear_device_event!,
                            finish_nonlinear_device_step!,
                            nonlinear_current_jacobian!,
+                           nonlinear_current_jacobian_compensated!,
                            nonlinear_device_event_candidate_time,
                            nonlinear_device_event_surfaces,
                            nonlinear_device_event_value,
                            nonlinear_device_formulation,
                            nonlinear_device_provenance,
                            nonlinear_terminal_nodes,
-                           prepare_nonlinear_device_step!
+                           prepare_nonlinear_device_step!,
+                           prepare_nonlinear_device_event_substep!
 using LinearAlgebra
 using SHA
 

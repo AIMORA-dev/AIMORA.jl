@@ -39,6 +39,106 @@ function _validate_semiconductor_provenance(
     return provenance
 end
 
+"""One physical history time in normalized, lossless numerical storage.
+
+The residual is storage, not a second physical coordinate. Its precision is
+derived from the represented dyadic value; model arithmetic keeps its caller's
+precision. Rounded switching-event identity is retained independently in event_time_s;
+normalization of the physical limbs never changes that occurrence identity.
+"""
+struct SemiconductorHistoryTime <: Real
+    high_s::Float64
+    low_s::BigFloat
+    event_time_s::Float64
+
+    function SemiconductorHistoryTime(high_s::Float64, low_s::BigFloat; event_time_s::Float64=high_s)
+        all(isfinite, (high_s, low_s, event_time_s)) || throw(ArgumentError(
+            "semiconductor physical history time must be finite",
+        ))
+        value = _semiconductor_time_exact(high_s) + _semiconductor_time_exact(low_s)
+        high = Float64(_semiconductor_time_storage(value))
+        isfinite(high) || throw(ArgumentError("semiconductor physical clock overflow"))
+        low = _semiconductor_time_storage(value - _semiconductor_time_exact(high))
+        new(high, low, event_time_s)
+    end
+end
+
+_semiconductor_time_exact(value::Real) = Rational{BigInt}(value)
+_semiconductor_time_exact(value::BigFloat) = setprecision(BigFloat, precision(value)) do
+    Rational{BigInt}(value)
+end
+_semiconductor_time_exact(value::SemiconductorHistoryTime) =
+    _semiconductor_time_exact(value.high_s) + _semiconductor_time_exact(value.low_s)
+_semiconductor_time_exact(value::ContinuousEvaluationTime) =
+    _semiconductor_time_exact(value.high_s) + _semiconductor_time_exact(value.low_s)
+
+function _semiconductor_time_storage(value::Rational{BigInt})
+    ispow2(denominator(value)) || throw(ArgumentError("physical history time must be dyadic"))
+    bits = max(106, iszero(value) ? 1 : ndigits(abs(numerator(value)); base=2))
+    return setprecision(BigFloat, bits) do
+        BigFloat(numerator(value)) / BigFloat(denominator(value))
+    end
+end
+
+function SemiconductorHistoryTime(value::Union{Real,ContinuousEvaluationTime};
+    event_time_s::Float64=value isa SemiconductorHistoryTime ? value.event_time_s :
+        value isa ContinuousEvaluationTime ? value.high_s : Float64(value))
+    exact = _semiconductor_time_exact(value)
+    high = Float64(_semiconductor_time_storage(exact))
+    return SemiconductorHistoryTime(high,
+        _semiconductor_time_storage(exact - _semiconductor_time_exact(high)); event_time_s)
+end
+
+Base.isfinite(::SemiconductorHistoryTime) = true
+Base.isinf(::SemiconductorHistoryTime) = false
+Base.isnan(::SemiconductorHistoryTime) = false
+Base.copy(value::SemiconductorHistoryTime) = SemiconductorHistoryTime(value.high_s, value.low_s; event_time_s=value.event_time_s)
+Base.:(==)(left::SemiconductorHistoryTime, right::SemiconductorHistoryTime) =
+    _semiconductor_time_exact(left) == _semiconductor_time_exact(right)
+Base.:(==)(left::SemiconductorHistoryTime, right::Real) =
+    isfinite(right) && _semiconductor_time_exact(left) == _semiconductor_time_exact(right)
+Base.:(==)(left::Real, right::SemiconductorHistoryTime) = right == left
+Base.:<(left::SemiconductorHistoryTime, right::Real) =
+    isinf(right) ? right > 0 : _semiconductor_time_exact(left) < _semiconductor_time_exact(right)
+Base.:<(left::Real, right::SemiconductorHistoryTime) =
+    isinf(left) ? left < 0 : _semiconductor_time_exact(left) < _semiconductor_time_exact(right)
+Base.:<(left::SemiconductorHistoryTime, right::SemiconductorHistoryTime) =
+    _semiconductor_time_exact(left) < _semiconductor_time_exact(right)
+Base.:<=(left::SemiconductorHistoryTime, right::Real) = left < right || left == right
+Base.:<=(left::Real, right::SemiconductorHistoryTime) = left < right || left == right
+Base.:<=(left::SemiconductorHistoryTime, right::SemiconductorHistoryTime) = left < right || left == right
+
+"""Subtract complete physical origins, then round the relative result at caller precision."""
+function _semiconductor_history_elapsed(endpoint, origin)
+    exact = _semiconductor_time_exact(endpoint) - _semiconductor_time_exact(origin)
+    return BigFloat(numerator(exact)) / BigFloat(denominator(exact))
+end
+Base.:-(endpoint::Real, origin::SemiconductorHistoryTime) =
+    _semiconductor_history_elapsed(endpoint, origin)
+Base.:-(endpoint::SemiconductorHistoryTime, origin::SemiconductorHistoryTime) =
+    _semiconductor_history_elapsed(endpoint, origin)
+
+_semiconductor_history_event_time(value::SemiconductorHistoryTime) = value.event_time_s
+_semiconductor_history_event_time(value::Float64) = value
+
+function _semiconductor_history_shift(origin::SemiconductorHistoryTime, shift::Real)
+    return SemiconductorHistoryTime(_semiconductor_time_storage(
+        _semiconductor_time_exact(origin) - _semiconductor_time_exact(shift));
+        event_time_s=origin.event_time_s-Float64(shift))
+end
+
+# Tail kernels retain their original arithmetic after subtracting physical clocks.
+_semiconductor_tail_elapsed(endpoint::Float64, origin::Float64) = endpoint - origin
+_semiconductor_tail_elapsed_binary64(endpoint, origin) =
+    Float64(_semiconductor_time_storage(_semiconductor_time_exact(endpoint) - _semiconductor_time_exact(origin)))
+_semiconductor_tail_elapsed(endpoint::Real, origin::Real) =
+    _semiconductor_tail_elapsed_binary64(endpoint, origin)
+_semiconductor_tail_elapsed(endpoint::ContinuousEvaluationTime, origin::Real) =
+    setprecision(BigFloat, 106) do
+        _semiconductor_history_elapsed(endpoint, origin)
+    end
+
+
 """First-order stored-charge state for a diode or an explicitly selected antiparallel path."""
 mutable struct RecoveredChargeFidelity <: AbstractPowerSemiconductorFidelityComponent
     lifetime_s::Float64
@@ -48,7 +148,7 @@ mutable struct RecoveredChargeFidelity <: AbstractPowerSemiconductorFidelityComp
     last_recovery_current_a::Float64
     peak_reverse_current_a::Float64
     cumulative_recovered_charge_c::Float64
-    recovery_start_time_s::Float64
+    recovery_start_time_s::Union{Float64,SemiconductorHistoryTime}
     last_recovery_duration_s::Float64
     recovery_zero_event_count::Int
     last_recovery_zero_time_s::Float64
@@ -85,6 +185,49 @@ function RecoveredChargeFidelity(
         0,
         -Inf,
         provenance,
+    )
+end
+
+"""Unprojected backward-Euler recovered charge, in coulombs."""
+function _power_semiconductor_recovery_charge(
+    recovery::RecoveredChargeFidelity,
+    channel_current_a::Float64,
+    step_s::Float64,
+)
+    return (recovery.stored_charge_c + step_s * channel_current_a) /
+        (1.0 + step_s / recovery.lifetime_s)
+end
+
+"""Recovery-root allowance from the step's incoming charge and solved channel current."""
+function _power_semiconductor_recovery_zero_tolerance(
+    previous_charge_c::Float64, channel_current_a::Float64, step_s::Float64,
+)
+    scale_c = max(abs(previous_charge_c),abs(channel_current_a)*step_s,eps(Float64))
+    return max(8192.0*eps(Float64)*max(1.0,scale_c),abs(channel_current_a)*1.0e-12)
+end
+
+"""Linearize the same unprojected charge used by acceptance and localization.
+
+The step derivative retains the finite localized root residual. Dropping
+`charge_c / lifetime_s` differentiates the numerator's zero set instead of
+the actual discrete charge surface away from an exactly represented zero.
+Projection onto nonnegative charge and event resets are separate operations.
+"""
+function _power_semiconductor_recovery_charge_linearization(
+    recovery::RecoveredChargeFidelity,
+    channel_current_a::Float64,
+    step_s::Float64,
+)
+    denominator = 1.0 + step_s / recovery.lifetime_s
+    charge_c = _power_semiconductor_recovery_charge(
+        recovery, channel_current_a, step_s,
+    )
+    return (;
+        charge_c,
+        stored_charge_derivative=inv(denominator),
+        current_derivative_s=step_s / denominator,
+        step_derivative_a=(channel_current_a - charge_c / recovery.lifetime_s) /
+            denominator,
     )
 end
 
@@ -314,7 +457,7 @@ mutable struct TurnOffTailFidelity <: AbstractPowerSemiconductorFidelityComponen
     active::Bool
     current_a::Float64
     initial_current_a::Float64
-    turn_off_time_s::Float64
+    turn_off_time_s::Union{Float64,SemiconductorHistoryTime}
     last_duration_s::Float64
     cutoff_event_count::Int
     last_cutoff_time_s::Float64
@@ -532,6 +675,7 @@ mutable struct CauerThermalFidelity <: AbstractPowerSemiconductorFidelityCompone
     resistance_k_per_w::Vector{Float64}
     ambient_temperature_k::Float64
     node_temperature_k::Vector{Float64}
+    accepted_temperature_rise_k::Vector{Float64}
     minimum_temperature_k::Float64
     maximum_temperature_k::Float64
     last_loss_power_w::Float64
@@ -602,6 +746,7 @@ function CauerThermalFidelity(
         resistance,
         ambient,
         temperatures,
+        copy(rises),
         minimum_temperature,
         maximum_temperature,
         0.0,
@@ -621,6 +766,26 @@ function CauerThermalFidelity(
     )
 end
 
+# Explicit temperature mutation initializes the one physical rise coordinate.
+# Reporting temperatures cannot recover low rise bits after accepted evolution.
+function _set_cauer_accepted_temperature!(thermal::CauerThermalFidelity, stage::Int, temperature::Real)
+    value = Float64(temperature)
+    isfinite(value) && thermal.minimum_temperature_k <= value <= thermal.maximum_temperature_k ||
+        throw(DomainError(value, "thermal mutation leaves the declared domain"))
+    thermal.accepted_temperature_rise_k[stage] = value - thermal.ambient_temperature_k
+    thermal.node_temperature_k[stage] = value
+    return thermal
+end
+
+function _refresh_cauer_accepted_outputs!(thermal::CauerThermalFidelity)
+    for stage in eachindex(thermal.accepted_temperature_rise_k)
+        thermal.node_temperature_k[stage] = thermal.ambient_temperature_k + thermal.accepted_temperature_rise_k[stage]
+    end
+    thermal.last_stored_energy_j = power_semiconductor_thermal_stored_energy(thermal)
+    thermal.last_ambient_heat_flow_w = thermal.accepted_temperature_rise_k[end] / thermal.resistance_k_per_w[end]
+    return thermal
+end
+
 function power_semiconductor_thermal_stored_energy(thermal::CauerThermalFidelity)
     stored_energy_j = 0.0
     for stage in eachindex(
@@ -628,7 +793,7 @@ function power_semiconductor_thermal_stored_energy(thermal::CauerThermalFidelity
         thermal.node_temperature_k,
     )
         stored_energy_j += thermal.capacitance_j_per_k[stage] *
-            (thermal.node_temperature_k[stage] - thermal.ambient_temperature_k)
+            thermal.accepted_temperature_rise_k[stage]
     end
     return stored_energy_j
 end
@@ -692,15 +857,15 @@ function _cauer_thermal_trial(
         ambient = thermal.ambient_temperature_k
         @inbounds begin
             right_hand_side[1] = storage[1] *
-                (thermal.node_temperature_k[1] - ambient) + loss_power_w
+                thermal.accepted_temperature_rise_k[1] + loss_power_w
             right_hand_side[2] = storage[2] *
-                (thermal.node_temperature_k[2] - ambient) -
+                thermal.accepted_temperature_rise_k[2] -
                 lower[1] * right_hand_side[1]
             right_hand_side[3] = storage[3] *
-                (thermal.node_temperature_k[3] - ambient) -
+                thermal.accepted_temperature_rise_k[3] -
                 lower[2] * right_hand_side[2]
             right_hand_side[4] = storage[4] *
-                (thermal.node_temperature_k[4] - ambient) -
+                thermal.accepted_temperature_rise_k[4] -
                 lower[3] * right_hand_side[3]
             rise[4] = right_hand_side[4] / diagonal[4]
             rise[3] = (right_hand_side[3] - upper[3] * rise[4]) / diagonal[3]
@@ -732,7 +897,7 @@ function _cauer_thermal_trial(
     end
     @inbounds for stage in 1:stage_count
         right_hand_side[stage] = storage[stage] *
-            (thermal.node_temperature_k[stage] - thermal.ambient_temperature_k)
+            thermal.accepted_temperature_rise_k[stage]
         if stage == 1
             right_hand_side[stage] += loss_power_w
         end
@@ -772,6 +937,7 @@ function _accept_cauer_thermal_step!(
         loss_power_w,
         step_s,
     )
+    copyto!(thermal.accepted_temperature_rise_k, thermal.trial_temperature_rise_k)
     copyto!(thermal.node_temperature_k, thermal.trial_temperature_k)
     thermal.last_loss_power_w = loss_power_w
     thermal.last_ambient_heat_flow_w = ambient_heat_flow
@@ -800,10 +966,12 @@ function _deposit_cauer_event_energy!(
     isfinite(energy_j) && energy_j >= 0.0 || throw(ArgumentError(
         "thermal event energy must be finite and nonnegative",
     ))
-    temperature = thermal.node_temperature_k[1] +
+    rise = thermal.accepted_temperature_rise_k[1] +
         energy_j / thermal.capacitance_j_per_k[1]
+    temperature = thermal.ambient_temperature_k + rise
     thermal.minimum_temperature_k <= temperature <= thermal.maximum_temperature_k ||
         throw(DomainError(temperature, "event energy leaves the thermal domain"))
+    thermal.accepted_temperature_rise_k[1] = rise
     thermal.node_temperature_k[1] = temperature
     thermal.cumulative_input_energy_j += energy_j
     thermal.last_stored_energy_j = power_semiconductor_thermal_stored_energy(thermal)
@@ -857,6 +1025,22 @@ struct DeclaredSemiconductorModelIdentity
     end
 end
 
+"""Fixed106 accepted electrical endpoint; compensation is one physical scalar.
+
+This frame records a causal acceptance, never a reconstruction from rounded
+outgoing voltage. Kernel arithmetic remains106 bits and public reports Float64.
+"""
+struct AcceptedSemiconductorElectricalHistory
+    voltage_v::BigFloat
+    terminal_current_a::BigFloat
+    channel_current_a::Float64
+    displacement_current_a::Float64
+    tail_current_a::Float64
+    snubber_current_a::Float64
+    topology_transition_count::Int
+    arithmetic_policy::Symbol
+end
+
 """Compositional extended fidelity attached to one accepted semiconductor owner."""
 mutable struct PowerSemiconductorExtendedFidelity
     recovered_charge::Union{Nothing,RecoveredChargeFidelity}
@@ -872,6 +1056,9 @@ mutable struct PowerSemiconductorExtendedFidelity
     candidate_prepared::Bool
     previous_terminal_voltage_v::Float64
     previous_terminal_current_a::Float64
+    accepted_electrical_history::Union{Nothing,AcceptedSemiconductorElectricalHistory}
+    boundary_electrical_anchor::Union{Nothing,AcceptedSemiconductorElectricalHistory}
+    boundary_electrical_state::Union{Nothing,AcceptedSemiconductorElectricalHistory}
     companion_energy_residual_j::Float64
     accepted_topology_transition_count::Int
     pending_event_current_a::Float64
@@ -916,6 +1103,9 @@ function PowerSemiconductorExtendedFidelity(;
         false,
         junction_charge === nothing ? 0.0 : junction_charge.previous_voltage_v,
         0.0,
+        nothing,
+        nothing,
+        nothing,
         0.0,
         0,
         0.0,

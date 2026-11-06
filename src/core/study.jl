@@ -13,6 +13,9 @@ export STUDY_STATUSES,
        ScalingBasisParameter,
        NumericalPolicyParameter,
        ParameterProvenance,
+       ContinuousEvaluationTime,
+       continuous_time_seconds,
+       continuous_time_elapsed,
        NumericDomainBound,
        ModelValidityDomain,
        DynamicStateInventory,
@@ -42,6 +45,65 @@ export STUDY_STATUSES,
 
 const STUDY_STATUSES = (:implemented, :prototype, :planned, :legacy_reference)
 const RESULT_STATUSES = (:ok, :warning, :failed, :not_implemented, :invalid_input)
+
+"""Decode an exact canonical Float64 high/low scalar at 106-bit storage precision."""
+function _decode_compensated_scalar_pair(high::Float64,low::Float64)
+    all(isfinite,(high,low)) || return (;status=:nonfinite,value=nothing)
+    value = setprecision(BigFloat,106) do
+        iszero(low) ? BigFloat(high) : BigFloat(high)+BigFloat(low)
+    end
+    isequal(Float64(value),high) || return (;status=:noncanonical,value=nothing)
+    exact = setprecision(BigFloat,256) do
+        value-BigFloat(high) == BigFloat(low)
+    end
+    return exact ? (;status=:ok,value) : (;status=:precision_loss,value=nothing)
+end
+
+"""Encode a physical scalar without discarding low parts or signed zero."""
+function _encode_compensated_scalar_pair(value::Real)
+    high = Float64(value)
+    isfinite(high) && isfinite(value) || return (;status=:nonfinite,high,low=0.0)
+    low = setprecision(BigFloat,106) do
+        Float64(value-BigFloat(high))
+    end
+    decoded = _decode_compensated_scalar_pair(high,low)
+    exact = decoded.status === :ok && isequal(decoded.value,value)
+    return (;status=exact ? :ok : :precision_loss,high,low)
+end
+
+"""Continuous evaluation endpoint in seconds, separate from rounded task/event bookkeeping.
+
+Construct from an accepted origin and an elapsed substep. The nonoverlapping
+high/low sum retains elapsed information below the absolute Float64 clock's
+lattice. Consumers must explicitly evaluate both parts; there is deliberately
+no implicit conversion to a rounded timestamp. This is evaluation metadata,
+not permission to change a scheduler deadline or accept a physical state.
+"""
+struct ContinuousEvaluationTime
+    high_s::Float64
+    low_s::Float64
+
+    function ContinuousEvaluationTime(origin_s::Float64, elapsed_s::Float64)
+        isfinite(origin_s) && isfinite(elapsed_s) || throw(ArgumentError(
+            "continuous evaluation origin and elapsed time must be finite",
+        ))
+        high = origin_s + elapsed_s
+        isfinite(high) || throw(ArgumentError("continuous evaluation time overflow"))
+        virtual_elapsed = high - origin_s
+        low = (origin_s - (high - virtual_elapsed)) + (elapsed_s - virtual_elapsed)
+        new(high, low)
+    end
+end
+
+"""Evaluate the continuous endpoint at the caller's explicit BigFloat precision."""
+continuous_time_seconds(time::ContinuousEvaluationTime) =
+    BigFloat(time.high_s) + BigFloat(time.low_s)
+
+"""Subtract an owner's stored time without first rounding the evaluation endpoint."""
+continuous_time_elapsed(time::ContinuousEvaluationTime, origin_s::Float64) =
+    (BigFloat(time.high_s) - BigFloat(origin_s)) + BigFloat(time.low_s)
+
+Base.isfinite(time::ContinuousEvaluationTime) = isfinite(time.high_s) && isfinite(time.low_s)
 
 @enum ModelFidelity begin
     LegacyDetailed

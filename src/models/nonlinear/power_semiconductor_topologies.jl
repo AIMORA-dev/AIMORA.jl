@@ -296,13 +296,21 @@ function power_semiconductor_event_localization!(bridge::PowerSemiconductorBridg
     return bridge
 end
 
-function _bridge_topology_apply_due_gate_transitions!(bridge::PowerSemiconductorBridgeTopology, time_s)
+function _bridge_topology_apply_due_gate_transitions!(
+    bridge::PowerSemiconductorBridgeTopology,
+    time_s;
+    defer_conduction::Bool=false,
+    include_localized::Bool=true,
+)
     count = 0
     for valve in bridge.valves
+        !include_localized && valve.event_localization_enabled && continue
         transition_time = power_semiconductor_gate_transition_time(valve)
         transition_time === nothing && continue
         transition_time <= time_s + 16 * eps(max(1.0, abs(time_s))) &&
-            (count += apply_power_semiconductor_gate_transition!(valve, time_s))
+            (count += apply_power_semiconductor_gate_transition!(
+                valve, time_s; defer_conduction,
+            ))
     end
     return count
 end
@@ -319,11 +327,17 @@ end
 apply_power_semiconductor_bridge_gate_transitions!(
     bridge::PowerSemiconductorBridgeTopology,
     time_s::Real,
-) = _bridge_topology_apply_due_gate_transitions!(bridge, Float64(time_s))
+    ; defer_conduction::Bool=false,
+) = _bridge_topology_apply_due_gate_transitions!(
+    bridge, Float64(time_s); defer_conduction,
+)
 
 function _stamp_power_semiconductor_bridge_topology!(admittance, rhs,
     bridge::PowerSemiconductorBridgeTopology, time_s::Float64, dt_s::Float64, method)
-    _bridge_topology_apply_due_gate_transitions!(bridge, time_s)
+    # A localized gate belongs to the nonlinear event clock, after the
+    # left-limit solve. Stamping must not consume that event at its endpoint.
+    _bridge_topology_apply_due_gate_transitions!(bridge, time_s;
+        include_localized=false)
     _validate_bridge_topology_requested_state!(bridge)
     for valve in bridge.valves
         power_semiconductor_has_extended_fidelity(valve) && continue
@@ -342,6 +356,10 @@ function stamp!(admittance, rhs, bridge::PowerSemiconductorBridgeTopology,
         admittance, rhs, bridge, time_s, dt_s, Val(TrapezoidalCompanion),
     )
 end
+
+Branches.continuous_time_invariant(bridge::PowerSemiconductorBridgeTopology) =
+    all(Branches.continuous_time_invariant,bridge.valves) &&
+    all(Branches.continuous_time_invariant,bridge.passives)
 
 
 function stamp!(admittance, rhs, bridge::PowerSemiconductorBridgeTopology,
@@ -404,6 +422,20 @@ function _update_power_semiconductor_bridge_terminal_state!(
         end
     end
     return bridge
+end
+
+function refresh_accepted_dependents!(
+    bridge::PowerSemiconductorBridgeTopology,
+    voltages::AbstractVector{Float64},
+    dt_s::Float64,
+)
+    _update_power_semiconductor_bridge_terminal_state!(bridge, voltages, dt_s)
+    for leg in bridge.bridge_legs
+        leg.last_dc_positive_voltage_v = _bridge_node_voltage(voltages, leg.upper_switch.a)
+        leg.last_ac_terminal_voltage_v = _bridge_node_voltage(voltages, leg.upper_switch.b)
+        leg.last_dc_negative_voltage_v = _bridge_node_voltage(voltages, leg.lower_switch.b)
+    end
+    return nothing
 end
 
 function update!(bridge::PowerSemiconductorBridgeTopology, voltages, dt_s::Float64)

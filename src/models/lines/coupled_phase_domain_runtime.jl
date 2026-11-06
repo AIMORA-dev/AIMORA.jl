@@ -3,6 +3,7 @@ using ..CoupledLineFitting: CoupledLineFitResult
 using TOML
 
 import ..Branches:
+    backward_euler_companion_supported,
     trace_output_channel_count,
     trace_output_channel_names!,
     trace_output_is_public,
@@ -25,6 +26,12 @@ mutable struct CoupledFrequencyDependentLine <: EMTElement
     runtime_state::CoupledLineRuntimeState
     voltage_workspace_v::Vector{Float64}
 end
+
+backward_euler_companion_supported(::CoupledFrequencyDependentLine) = true
+
+# Companion stamps depend on the retained causal state and elapsed duration.
+# The absolute evaluation clock is unused by both admitted methods.
+Branches.continuous_time_invariant(::CoupledFrequencyDependentLine) = true
 
 function _checked_coupled_line_runtime_nodes(
     preparation::CoupledLineRuntimePreparation,
@@ -120,6 +127,8 @@ function _coupled_line_runtime_timestep_matches(
     line::CoupledFrequencyDependentLine,
     timestep_s::Float64,
 )
+    isfinite(timestep_s) && timestep_s > 0.0 ||
+        throw(ArgumentError("coupled line timestep must be finite and positive"))
     expected = line.runtime_state.preparation.settings.timestep_s
     abs(timestep_s - expected) <=
         64.0 * eps(Float64) * max(abs(timestep_s), abs(expected), 1.0) ||
@@ -130,8 +139,8 @@ function _coupled_line_runtime_timestep_matches(
 end
 
 function stamp!(
-    admittance::AbstractMatrix{Float64},
-    right_hand_side::AbstractVector{Float64},
+    admittance::AbstractMatrix{<:Real},
+    right_hand_side::AbstractVector{<:Real},
     line::CoupledFrequencyDependentLine,
     _time_s::Float64,
     timestep_s::Float64,
@@ -174,6 +183,69 @@ function update!(
         line.voltage_workspace_v,
     )
     return nothing
+end
+
+function _stamp_coupled_line_runtime_step!(admittance, rhs, line, step)
+    state = line.runtime_state
+    history = step.history_to_terminal_current *
+        (step.history_state_output * state.rational_state +
+            step.history_incident_output * state.previous_incident_wave)
+    for column in eachindex(line.port_nodes), row in eachindex(line.port_nodes)
+        stamp_admittance_entry!(admittance, line.port_nodes[row], 0,
+            line.port_nodes[column], 0, step.companion_admittance_s[row, column])
+    end
+    for port in eachindex(line.port_nodes)
+        stamp_history_current!(rhs, line.port_nodes[port], 0, history[port])
+    end
+    return nothing
+end
+
+function _update_coupled_line_runtime_step!(line, voltage, step)
+    @inbounds for port in eachindex(line.port_nodes)
+        node = line.port_nodes[port]
+        line.voltage_workspace_v[port] = node == 0 ? 0.0 : voltage[node]
+    end
+    accept_coupled_line_runtime_step!(line.runtime_state, line.voltage_workspace_v, step)
+    return nothing
+end
+
+function stamp!(admittance, rhs, line::CoupledFrequencyDependentLine,
+    time_s::Float64, timestep_s::Float64, ::Val{Branches.TrapezoidalCompanion})
+    nominal = line.runtime_state.preparation.settings.timestep_s
+    abs(timestep_s - nominal) <= 64eps(Float64) *
+        max(abs(timestep_s), nominal) &&
+        return stamp!(admittance, rhs, line, time_s, nominal)
+    step = coupled_line_runtime_step(line.runtime_state.preparation, timestep_s)
+    return _stamp_coupled_line_runtime_step!(admittance, rhs, line, step)
+end
+
+function update!(line::CoupledFrequencyDependentLine, voltage::AbstractVector{Float64},
+    timestep_s::Float64, ::Val{Branches.TrapezoidalCompanion})
+    nominal = line.runtime_state.preparation.settings.timestep_s
+    abs(timestep_s - nominal) <= 64eps(Float64) *
+        max(abs(timestep_s), nominal) && return update!(line, voltage, nominal)
+    step = coupled_line_runtime_step(line.runtime_state.preparation, timestep_s)
+    return _update_coupled_line_runtime_step!(line, voltage, step)
+end
+
+function stamp!(admittance, rhs, line::CoupledFrequencyDependentLine,
+    _time_s::Float64, timestep_s::Float64, ::Val{Branches.BackwardEulerCompanion})
+    nominal = line.runtime_state.preparation.settings.timestep_s
+    duration = abs(timestep_s - nominal) <= 64eps(Float64) *
+        max(abs(timestep_s), nominal) ? nominal : timestep_s
+    step = coupled_line_runtime_step(line.runtime_state.preparation, duration;
+        backward_euler=true)
+    return _stamp_coupled_line_runtime_step!(admittance, rhs, line, step)
+end
+
+function update!(line::CoupledFrequencyDependentLine, voltage,
+    timestep_s::Float64, ::Val{Branches.BackwardEulerCompanion})
+    nominal = line.runtime_state.preparation.settings.timestep_s
+    duration = abs(timestep_s - nominal) <= 64eps(Float64) *
+        max(abs(timestep_s), nominal) ? nominal : timestep_s
+    step = coupled_line_runtime_step(line.runtime_state.preparation, duration;
+        backward_euler=true)
+    return _update_coupled_line_runtime_step!(line, voltage, step)
 end
 
 line_terminal_voltages(line::CoupledFrequencyDependentLine) = (

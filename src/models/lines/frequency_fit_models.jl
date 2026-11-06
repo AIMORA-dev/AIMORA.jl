@@ -338,7 +338,7 @@ function distributed_transposed_line_modal_timestep_update!(
 end
 
 function distributed_transposed_line_history_current_injection!(
-    rhs::AbstractVector{Float64},
+    rhs::AbstractVector{<:Real},
     state::DistributedTransposedLineModalBranchState,
     history::DistributedTransposedLineHistoryState;
     name::Symbol=Symbol(string(history.name), "_history_current_injection"),
@@ -500,7 +500,7 @@ function _distributed_line_phase_node_indices(
 end
 
 function distributed_transposed_line_phase_current_injection!(
-    rhs::AbstractVector{Float64},
+    rhs::AbstractVector{<:Real},
     update::DistributedTransposedLineModalTimestepUpdate,
     from_node_indices::AbstractVector{<:Integer},
     to_node_indices::AbstractVector{<:Integer};
@@ -665,7 +665,7 @@ function distributed_transposed_line_companion_admittance(
 end
 
 function distributed_transposed_line_companion_admittance_stamp!(
-    y::AbstractMatrix{Float64},
+    y::AbstractMatrix{<:Real},
     admittance::DistributedTransposedLineCompanionAdmittance,
 )
     phase_count = admittance.phase_count
@@ -711,7 +711,7 @@ function update!(admittance::DistributedTransposedLineCompanionAdmittance, v, dt
 end
 
 function terminal_surge_impedance_admittance_stamp!(
-    y::AbstractMatrix{Float64},
+    y::AbstractMatrix{<:Real},
     admittance::TerminalSurgeImpedanceAdmittance,
 )
     phase_count = admittance.phase_count

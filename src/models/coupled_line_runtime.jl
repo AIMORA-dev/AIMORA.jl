@@ -9,6 +9,8 @@ export CoupledLineRuntimeSettings,
        CoupledLineRuntimePreparation,
        CoupledLineRuntimeState,
        CoupledLineRuntimeSnapshot,
+       CoupledLineRuntimeStep,
+       coupled_line_runtime_step,
        prepare_coupled_line_runtime,
        coupled_line_runtime_state,
        initialize_coupled_line_runtime_deenergized!,
@@ -550,6 +552,8 @@ mutable struct CoupledLineRuntimeState
     accepted_step_count::Int
     initialization_kind::Symbol
     initialization_frequency_hz::Float64
+    accepted_substep_count::Int
+    accepted_substep_duration_s::Float64
 end
 
 function coupled_line_runtime_state(preparation::CoupledLineRuntimePreparation)
@@ -578,6 +582,8 @@ function coupled_line_runtime_state(preparation::CoupledLineRuntimePreparation)
         0.0,
         0,
         :deenergized,
+        0.0,
+        0,
         0.0,
     )
     return initialize_coupled_line_runtime_deenergized!(state)
@@ -632,6 +638,8 @@ function initialize_coupled_line_runtime_deenergized!(
     state.accepted_step_count = 0
     state.initialization_kind = :deenergized
     state.initialization_frequency_hz = 0.0
+    state.accepted_substep_count = 0
+    state.accepted_substep_duration_s = 0.0
     return state
 end
 
@@ -693,15 +701,129 @@ function initialize_coupled_line_runtime_sinusoidal!(
     state.accepted_step_count = 0
     state.initialization_kind = :sinusoidal_discrete_operating_point
     state.initialization_frequency_hz = frequency
+    state.accepted_substep_count = 0
+    state.accepted_substep_duration_s = 0.0
     _runtime_history_output!(state)
     return state
+end
+
+"""Step-local companion of the same accepted continuous rational realization."""
+struct CoupledLineRuntimeStep
+    preparation_signature_sha256::String
+    timestep_s::Float64
+    backward_euler::Bool
+    state_transition::Matrix{Float64}
+    endpoint_input::Matrix{Float64}
+    history_state_output::Matrix{Float64}
+    history_incident_output::Matrix{Float64}
+    incident_from_voltage::Matrix{Float64}
+    incident_from_history::Matrix{Float64}
+    history_to_terminal_current::Matrix{Float64}
+    companion_admittance_s::Matrix{Float64}
+end
+
+function coupled_line_runtime_step(
+    preparation::CoupledLineRuntimePreparation,
+    timestep_s::Real;
+    backward_euler::Bool=false,
+)
+    duration = _checked_positive_runtime_value(timestep_s, "coupled line substep duration")
+    nominal = preparation.settings.timestep_s
+    duration <= nominal || throw(ArgumentError(
+        "coupled line event substeps cannot exceed the prepared nominal timestep",
+    ))
+    if !backward_euler && duration == nominal
+        return CoupledLineRuntimeStep(
+            preparation.deterministic_signature_sha256, duration, false,
+            preparation.state_transition, preparation.endpoint_input,
+            preparation.history_state_output, preparation.history_incident_output,
+            preparation.incident_from_voltage, preparation.incident_from_history,
+            preparation.history_to_terminal_current, preparation.companion_admittance_s,
+        )
+    end
+    # T=(alpha I-A)^-1(alpha I+A), G=(alpha I-A)^-1 B.
+    # Cayley rescaling recovers the new companion without subtracting nearly
+    # equal matrices to reconstruct A, refitting the line, or resetting history.
+    beta = if backward_euler
+        inv(duration)
+    elseif preparation.settings.prewarp_frequency_hz === nothing
+        2.0 / duration
+    else
+        omega = 2pi * something(preparation.settings.prewarp_frequency_hz)
+        omega / tan(0.5 * omega * duration)
+    end
+    ratio = beta / preparation.bilinear_alpha_per_s
+    isfinite(ratio) && ratio > 0.0 || throw(ArgumentError(
+        "coupled line substep discretization is nonfinite",
+    ))
+    transition = preparation.state_transition
+    identity_state = Matrix{Float64}(I, size(transition, 1), size(transition, 1))
+    denominator = (ratio + 1.0) .* identity_state .+ (ratio - 1.0) .* transition
+    condition = cond(denominator)
+    isfinite(condition) && condition <= preparation.settings.maximum_condition_number ||
+        throw(ArgumentError("coupled line substep state solve is ill-conditioned"))
+    factor = lu(denominator)
+    numerator = backward_euler ? ratio .* (identity_state .+ transition) :
+        (ratio - 1.0) .* identity_state .+ (ratio + 1.0) .* transition
+    step_transition = factor \ numerator
+    step_input = factor \ (2.0 .* preparation.endpoint_input)
+    output = preparation.output_matrix
+    history_state = output * step_transition
+    history_incident = backward_euler ? zeros(size(preparation.history_incident_output)) :
+        output * step_input
+    direct = preparation.continuous_direct_term + output * step_input
+    identity_ports = Matrix{Float64}(I, size(direct, 1), size(direct, 1))
+    wave_matrix = identity_ports + direct
+    wave_condition = cond(wave_matrix)
+    isfinite(wave_condition) &&
+        wave_condition <= preparation.settings.maximum_condition_number ||
+        throw(ArgumentError("coupled line substep wave solve is ill-conditioned"))
+    wave_factor = lu(wave_matrix)
+    inverse_reference = Diagonal(preparation.reference_impedance_inverse_sqrt_per_ohm_sqrt)
+    from_voltage = wave_factor \ Matrix(inverse_reference)
+    from_history = -(wave_factor \ identity_ports)
+    history_to_current = inverse_reference *
+        ((identity_ports - direct) * from_history - identity_ports)
+    raw_companion = inverse_reference * (identity_ports - direct) * from_voltage
+    opnorm(raw_companion - transpose(raw_companion)) <=
+        preparation.settings.reciprocity_relative_tolerance *
+        max(opnorm(raw_companion), eps(Float64)) || throw(ArgumentError(
+            "coupled line substep companion is not reciprocal",
+        ))
+    companion = 0.5 .* (raw_companion .+ transpose(raw_companion))
+    minimum(eigvals(Symmetric(companion))) >=
+        -preparation.settings.passivity_tolerance * max(opnorm(companion), 1.0) ||
+        throw(ArgumentError("coupled line substep companion is active"))
+    return CoupledLineRuntimeStep(
+        preparation.deterministic_signature_sha256, duration, backward_euler,
+        step_transition, step_input, history_state, history_incident,
+        from_voltage, from_history, history_to_current, companion,
+    )
 end
 
 function accept_coupled_line_runtime_step!(
     state::CoupledLineRuntimeState,
     terminal_voltage_v::AbstractVector{<:Real},
 )
+    return _accept_coupled_line_runtime_step!(state, terminal_voltage_v, state.preparation)
+end
+
+function accept_coupled_line_runtime_step!(
+    state::CoupledLineRuntimeState,
+    terminal_voltage_v::AbstractVector{<:Real},
+    step::CoupledLineRuntimeStep,
+)
+    step.preparation_signature_sha256 == state.preparation.deterministic_signature_sha256 ||
+        throw(ArgumentError("coupled line substep preparation is stale"))
+    !step.backward_euler && step.timestep_s == state.preparation.settings.timestep_s &&
+        return accept_coupled_line_runtime_step!(state, terminal_voltage_v)
+    return _accept_coupled_line_runtime_step!(state, terminal_voltage_v, step)
+end
+
+function _accept_coupled_line_runtime_step!(state, terminal_voltage_v, step)
     preparation = state.preparation
+    duration = step isa CoupledLineRuntimeStep ? step.timestep_s : preparation.settings.timestep_s
+    backward_euler = step isa CoupledLineRuntimeStep && step.backward_euler
     port_count = length(preparation.port_order)
     length(terminal_voltage_v) == port_count ||
         throw(ArgumentError("coupled line runtime terminal voltage count must match ports"))
@@ -709,34 +831,42 @@ function accept_coupled_line_runtime_step!(
     all(isfinite, voltage) ||
         throw(ArgumentError("coupled line runtime terminal voltages must be finite"))
 
-    _runtime_history_output!(state)
+    if step isa CoupledLineRuntimePreparation
+        _runtime_history_output!(state)
+    else
+        mul!(state.wave_history_workspace, step.history_state_output, state.rational_state)
+        mul!(state.wave_history_workspace, step.history_incident_output,
+            state.previous_incident_wave, 1.0, 1.0)
+    end
+    history = step isa CoupledLineRuntimePreparation ? state.history_current_a :
+        step.history_to_terminal_current * state.wave_history_workspace
     mul!(
         state.incident_workspace,
-        preparation.incident_from_voltage,
+        step.incident_from_voltage,
         voltage,
     )
     mul!(
         state.incident_workspace,
-        preparation.incident_from_history,
+        step.incident_from_history,
         state.wave_history_workspace,
         1.0,
         1.0,
     )
     mul!(
         state.state_workspace,
-        preparation.state_transition,
+        step.state_transition,
         state.rational_state,
     )
     mul!(
         state.state_workspace,
-        preparation.endpoint_input,
+        step.endpoint_input,
         state.incident_workspace,
         1.0,
         1.0,
     )
-    mul!(
+    backward_euler || mul!(
         state.state_workspace,
-        preparation.endpoint_input,
+        step.endpoint_input,
         state.previous_incident_wave,
         1.0,
         1.0,
@@ -760,10 +890,12 @@ function accept_coupled_line_runtime_step!(
     end
     mul!(
         state.wave_history_workspace,
-        preparation.companion_admittance_s,
+        step.companion_admittance_s,
         voltage,
     )
-    state.wave_history_workspace .+= state.history_current_a
+    # The accepted history_current_a remains the next *nominal* companion.
+    # Reconstruct this step's history independently from its wave history.
+    state.wave_history_workspace .+= history
     kcl_residual = maximum(
         abs,
         state.current_workspace .- state.wave_history_workspace;
@@ -780,13 +912,13 @@ function accept_coupled_line_runtime_step!(
         throw(ArgumentError("coupled line runtime companion current failed its KCL reconstruction"))
 
     power = dot(voltage, state.current_workspace)
-    energy_increment = 0.5 * preparation.settings.timestep_s *
-        (state.previous_terminal_power_w + power)
+    energy_increment = backward_euler ? duration * power :
+        0.5 * duration * (state.previous_terminal_power_w + power)
     cumulative_energy = state.cumulative_supplied_energy_j + energy_increment
     energy_roundoff = 256.0 * eps(Float64) * max(
         abs(state.cumulative_supplied_energy_j),
         abs(energy_increment),
-        preparation.settings.timestep_s * abs(power),
+        duration * abs(power),
         1.0,
     )
     state.initialization_kind == :deenergized &&
@@ -817,9 +949,14 @@ function accept_coupled_line_runtime_step!(
     )
     state.rational_state .= state.state_workspace
     state.previous_incident_wave .= state.incident_workspace
-    state.accepted_step_count += 1
-    state.accepted_time_s =
-        state.accepted_step_count * preparation.settings.timestep_s
+    if duration == preparation.settings.timestep_s
+        state.accepted_step_count += 1
+    else
+        state.accepted_substep_count += 1
+        state.accepted_substep_duration_s += duration
+    end
+    state.accepted_time_s = state.accepted_step_count *
+        preparation.settings.timestep_s + state.accepted_substep_duration_s
     _runtime_history_output!(state)
     return state
 end
@@ -845,6 +982,8 @@ struct CoupledLineRuntimeSnapshot
     initialization_kind::Symbol
     initialization_frequency_hz::Float64
     deterministic_signature_sha256::String
+    accepted_substep_count::Int
+    accepted_substep_duration_s::Float64
 end
 
 function _coupled_line_runtime_snapshot_signature(
@@ -859,6 +998,8 @@ function _coupled_line_runtime_snapshot_signature(
     scalars,
     accepted_step_count,
     initialization_kind,
+    accepted_substep_count=0,
+    accepted_substep_duration_s=0.0,
 )
     return _runtime_sha256() do io
         println(io, COUPLED_LINE_RUNTIME_SCHEMA_VERSION)
@@ -877,6 +1018,11 @@ function _coupled_line_runtime_snapshot_signature(
         _write_runtime_values(io, scalars)
         _write_runtime_value(io, accepted_step_count)
         _write_runtime_value(io, initialization_kind)
+        if accepted_substep_count > 0
+            println(io, "event_substeps")
+            _write_runtime_value(io, accepted_substep_count)
+            _write_runtime_value(io, accepted_substep_duration_s)
+        end
     end
 end
 
@@ -903,9 +1049,11 @@ function coupled_line_runtime_snapshot(state::CoupledLineRuntimeState)
         scalars,
         state.accepted_step_count,
         state.initialization_kind,
+        state.accepted_substep_count,
+        state.accepted_substep_duration_s,
     )
     return CoupledLineRuntimeSnapshot(
-        COUPLED_LINE_RUNTIME_SCHEMA_VERSION,
+        state.accepted_substep_count == 0 ? COUPLED_LINE_RUNTIME_SCHEMA_VERSION : 2,
         state.preparation.deterministic_signature_sha256,
         copy(state.rational_state),
         copy(state.previous_incident_wave),
@@ -925,6 +1073,8 @@ function coupled_line_runtime_snapshot(state::CoupledLineRuntimeState)
         state.initialization_kind,
         state.initialization_frequency_hz,
         signature,
+        state.accepted_substep_count,
+        state.accepted_substep_duration_s,
     )
 end
 
@@ -932,7 +1082,7 @@ function _coupled_line_runtime_snapshot_dictionary(
     snapshot::CoupledLineRuntimeSnapshot,
 )
     return Dict{String,Any}(
-        "schema" => "aimora.coupled_line_runtime_snapshot.v1",
+        "schema" => "aimora.coupled_line_runtime_snapshot.v$(snapshot.schema_version)",
         "schema_version" => snapshot.schema_version,
         "preparation_signature_sha256" => snapshot.preparation_signature_sha256,
         "rational_state" => snapshot.rational_state,
@@ -951,6 +1101,8 @@ function _coupled_line_runtime_snapshot_dictionary(
         "maximum_state_magnitude" => snapshot.maximum_state_magnitude,
         "accepted_time_s" => snapshot.accepted_time_s,
         "accepted_step_count" => snapshot.accepted_step_count,
+        "accepted_substep_count" => snapshot.accepted_substep_count,
+        "accepted_substep_duration_s" => snapshot.accepted_substep_duration_s,
         "initialization_kind" => String(snapshot.initialization_kind),
         "initialization_frequency_hz" => snapshot.initialization_frequency_hz,
         "deterministic_signature_sha256" =>
@@ -959,8 +1111,12 @@ function _coupled_line_runtime_snapshot_dictionary(
 end
 
 function _coupled_line_runtime_snapshot_from_dictionary(data)
-    get(data, "schema", "") == "aimora.coupled_line_runtime_snapshot.v1" ||
+    get(data, "schema", "") in ("aimora.coupled_line_runtime_snapshot.v1",
+        "aimora.coupled_line_runtime_snapshot.v2") ||
         throw(ArgumentError("coupled line runtime snapshot schema is unsupported"))
+    get(data, "schema", "") ==
+        "aimora.coupled_line_runtime_snapshot.v$(get(data, "schema_version", 0))" ||
+        throw(ArgumentError("coupled line runtime snapshot schema identity disagrees"))
     try
         return CoupledLineRuntimeSnapshot(
             Int(data["schema_version"]),
@@ -983,6 +1139,8 @@ function _coupled_line_runtime_snapshot_from_dictionary(data)
             Symbol(data["initialization_kind"]),
             Float64(data["initialization_frequency_hz"]),
             String(data["deterministic_signature_sha256"]),
+            Int(get(data, "accepted_substep_count", 0)),
+            Float64(get(data, "accepted_substep_duration_s", 0.0)),
         )
     catch error
         error isa ArgumentError && rethrow()
@@ -1020,7 +1178,7 @@ function restore_coupled_line_runtime_snapshot!(
     state::CoupledLineRuntimeState,
     snapshot::CoupledLineRuntimeSnapshot,
 )
-    snapshot.schema_version == COUPLED_LINE_RUNTIME_SCHEMA_VERSION ||
+    snapshot.schema_version in (COUPLED_LINE_RUNTIME_SCHEMA_VERSION, 2) ||
         throw(ArgumentError("coupled line runtime snapshot schema is unsupported"))
     snapshot.preparation_signature_sha256 ==
         state.preparation.deterministic_signature_sha256 ||
@@ -1063,8 +1221,16 @@ function restore_coupled_line_runtime_snapshot!(
         throw(ArgumentError("coupled line runtime snapshot contains nonfinite diagnostics"))
     snapshot.accepted_step_count >= 0 ||
         throw(ArgumentError("coupled line runtime snapshot step count is negative"))
+    substeps = snapshot.accepted_substep_count
+    duration = snapshot.accepted_substep_duration_s
+    substeps >= 0 && isfinite(duration) && duration >= 0.0 ||
+        throw(ArgumentError("coupled line runtime snapshot substep history is invalid"))
+    (substeps == 0 ? duration == 0.0 && snapshot.schema_version == 1 :
+        0.0 < duration <= substeps * state.preparation.settings.timestep_s &&
+            snapshot.schema_version == 2) ||
+        throw(ArgumentError("coupled line runtime snapshot substep clock disagrees"))
     expected_time = snapshot.accepted_step_count *
-        state.preparation.settings.timestep_s
+        state.preparation.settings.timestep_s + duration
     abs(snapshot.accepted_time_s - expected_time) <=
         64.0 * eps(Float64) * max(abs(expected_time), 1.0) ||
         throw(ArgumentError("coupled line runtime snapshot time and step count disagree"))
@@ -1080,6 +1246,8 @@ function restore_coupled_line_runtime_snapshot!(
         scalars,
         snapshot.accepted_step_count,
         snapshot.initialization_kind,
+        substeps,
+        duration,
     )
     snapshot.deterministic_signature_sha256 == expected_signature ||
         throw(ArgumentError("coupled line runtime snapshot integrity signature does not match"))
@@ -1102,6 +1270,8 @@ function restore_coupled_line_runtime_snapshot!(
     state.accepted_step_count = snapshot.accepted_step_count
     state.initialization_kind = snapshot.initialization_kind
     state.initialization_frequency_hz = snapshot.initialization_frequency_hz
+    state.accepted_substep_count = substeps
+    state.accepted_substep_duration_s = duration
     fill!(state.state_workspace, 0.0)
     fill!(state.wave_history_workspace, 0.0)
     fill!(state.current_workspace, 0.0)
@@ -1133,6 +1303,8 @@ function coupled_line_runtime_diagnostics(state::CoupledLineRuntimeState)
         port_count=length(state.terminal_voltage_v),
         accepted_time_s=state.accepted_time_s,
         accepted_step_count=state.accepted_step_count,
+        accepted_substep_count=state.accepted_substep_count,
+        accepted_substep_duration_s=state.accepted_substep_duration_s,
         initialization_kind=state.initialization_kind,
         initialization_frequency_hz=state.initialization_frequency_hz,
         terminal_power_w=state.terminal_power_w,
@@ -1153,7 +1325,8 @@ function coupled_line_runtime_diagnostics(state::CoupledLineRuntimeState)
             state.initialization_kind != :deenergized ||
             state.minimum_cumulative_supplied_energy_j >=
                 -preparation.settings.energy_absolute_tolerance_j,
-        coupled_phase_domain_runtime_executed=state.accepted_step_count > 0,
+        coupled_phase_domain_runtime_executed=
+            state.accepted_step_count + state.accepted_substep_count > 0,
         ulm_compatible_architecture=true,
         ulm_file_compatibility_claimed=false,
         atp_or_pscad_equivalence_claimed=false,

@@ -248,11 +248,10 @@ function _bridge_gate_off_boundary!(
 )
     driver = something(device.gate_driver)
     request_power_semiconductor_gate!(device, false, command_time_s)
-    transition_time = power_semiconductor_gate_transition_time(device)
-    if transition_time !== nothing && driver.pending_state === false
-        return max(command_time_s, transition_time)
-    end
-    return max(command_time_s, driver.last_turn_off_time_s)
+    return power_semiconductor_gate_off_boundary_timing(
+        driver,
+        command_time_s,
+    ).transition_time_s
 end
 
 function _request_bridge_all_off!(
@@ -395,8 +394,8 @@ function _bridge_assert_interlock(bridge::PowerSemiconductorBridgeLeg)
 end
 
 function stamp!(
-    admittance::AbstractMatrix{Float64},
-    rhs::AbstractVector{Float64},
+    admittance::AbstractMatrix{<:Real},
+    rhs::AbstractVector{<:Real},
     bridge::PowerSemiconductorBridgeLeg,
     time_s::Float64,
     dt_s::Float64,

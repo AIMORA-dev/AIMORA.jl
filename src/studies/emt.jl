@@ -5,6 +5,12 @@ using Serialization
 using Unicode
 using ..PortableSnapshots
 using ..Sources: AnalyticSourceSignal
+import ..TransformerApparatus
+import ..BridgeTopologies
+import ..ConverterSystems
+import ..SwitchDetailedVSC
+import ..StudyCore
+import ..Lines
 
 include(joinpath(@__DIR__, "emt", "source_signal_program.jl"))
 include(joinpath(@__DIR__, "emt", "types_and_horizons.jl"))

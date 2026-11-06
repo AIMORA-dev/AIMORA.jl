@@ -125,6 +125,63 @@ end
 _full_bridge_gate_pattern(positive::Bool) =
     positive ? Bool[true, false, false, true] : Bool[false, true, true, false]
 
+function _switching_detailed_converter_controlled_valve(
+    parameters,
+    position,
+    minimum_pulse_s,
+    start_time_s,
+    dead_time_s,
+    initially_commanded,
+    initially_closed,
+)
+    device = Nonlinear.IGBTSwitch(
+        position.from_node,
+        position.to_node;
+        gate_driver=Nonlinear.PowerSemiconductorGateDriver(
+            minimum_pulse_width_s=minimum_pulse_s,
+            initially_on=initially_closed,
+        ),
+        on_conductance=parameters.controlled_on_conductance_s,
+        off_conductance=parameters.controlled_off_conductance_s,
+        forward_voltage_drop_v=parameters.controlled_forward_voltage_v,
+        snubber=Nonlinear.SeriesRCSnubber(
+            parameters.snubber_resistance_ohm,
+            parameters.snubber_capacitance_f,
+        ),
+        extended_fidelity=_detailed_chopper_controlled_fidelity(parameters),
+        initially_closed,
+    )
+    if initially_commanded != initially_closed
+        Nonlinear.request_power_semiconductor_gate!(
+            device,
+            initially_commanded,
+            start_time_s;
+            earliest_transition_time_s=start_time_s + dead_time_s,
+        )
+    end
+    return device
+end
+
+function _switching_detailed_converter_freewheel_diode(
+    parameters,
+    position,
+    initially_closed,
+)
+    return Nonlinear.DiodeValveSwitch(
+        position.to_node,
+        position.from_node;
+        on_conductance=parameters.freewheel_on_conductance_s,
+        off_conductance=parameters.freewheel_off_conductance_s,
+        forward_voltage_drop_v=parameters.freewheel_forward_voltage_v,
+        snubber=Nonlinear.SeriesRCSnubber(
+            parameters.snubber_resistance_ohm,
+            parameters.snubber_capacitance_f,
+        ),
+        extended_fidelity=_detailed_chopper_freewheel_fidelity(parameters),
+        initially_closed,
+    )
+end
+
 function _full_bridge_controlled_valve(
     study,
     position,
@@ -134,6 +191,15 @@ function _full_bridge_controlled_valve(
     parameters = study.detailed_semiconductor
     timing = study.specification.timing
     detailed = _full_bridge_is_detailed(study)
+    detailed && return _switching_detailed_converter_controlled_valve(
+        parameters,
+        position,
+        timing.minimum_pulse_s,
+        study.start_time_s,
+        timing.dead_time_s,
+        initially_commanded,
+        initially_closed,
+    )
     device = Nonlinear.IGBTSwitch(
         position.from_node,
         position.to_node;
@@ -141,15 +207,11 @@ function _full_bridge_controlled_valve(
             minimum_pulse_width_s=timing.minimum_pulse_s,
             initially_on=initially_closed,
         ),
-        on_conductance=detailed ? parameters.controlled_on_conductance_s : 1.0e6,
-        off_conductance=detailed ? parameters.controlled_off_conductance_s : 1.0e-9,
-        forward_voltage_drop_v=detailed ? parameters.controlled_forward_voltage_v : 0.0,
-        snubber=detailed ? Nonlinear.SeriesRCSnubber(
-            parameters.snubber_resistance_ohm,
-            parameters.snubber_capacitance_f,
-        ) : nothing,
-        extended_fidelity=detailed ?
-            _detailed_chopper_controlled_fidelity(parameters) : nothing,
+        on_conductance=1.0e6,
+        off_conductance=1.0e-9,
+        forward_voltage_drop_v=0.0,
+        snubber=nothing,
+        extended_fidelity=nothing,
         initially_closed,
     )
     if initially_commanded != initially_closed
@@ -166,18 +228,19 @@ end
 function _full_bridge_freewheel_diode(study, position, initially_closed)
     parameters = study.detailed_semiconductor
     detailed = _full_bridge_is_detailed(study)
+    detailed && return _switching_detailed_converter_freewheel_diode(
+        parameters,
+        position,
+        initially_closed,
+    )
     return Nonlinear.DiodeValveSwitch(
         position.to_node,
         position.from_node;
-        on_conductance=detailed ? parameters.freewheel_on_conductance_s : 1.0e6,
-        off_conductance=detailed ? parameters.freewheel_off_conductance_s : 1.0e-9,
-        forward_voltage_drop_v=detailed ? parameters.freewheel_forward_voltage_v : 0.0,
-        snubber=detailed ? Nonlinear.SeriesRCSnubber(
-            parameters.snubber_resistance_ohm,
-            parameters.snubber_capacitance_f,
-        ) : nothing,
-        extended_fidelity=detailed ?
-            _detailed_chopper_freewheel_fidelity(parameters) : nothing,
+        on_conductance=1.0e6,
+        off_conductance=1.0e-9,
+        forward_voltage_drop_v=0.0,
+        snubber=nothing,
+        extended_fidelity=nothing,
         initially_closed,
     )
 end

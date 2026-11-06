@@ -11,7 +11,9 @@ include("emt_task_platform.jl")
 include("emt_partitioning.jl")
 include("dassl_class_contracts.jl")
 include("performance_realtime_contracts.jl")
-include("extended_vsc_control_filter_platform.jl")
+if AIMORA.solver_available()
+    include("extended_vsc_control_filter_platform.jl")
+end
 include("transformer_apparatus.jl")
 include("modern_machine_families.jl")
 include("measurement_chains.jl")
@@ -827,4 +829,15 @@ end
 if AIMORA.solver_available()
     include("extended_power_semiconductor_fidelity.jl")
     include("performance.jl")
+end
+
+if AIMORA.solver_available()
+    include("compensated_capacitor_history.jl")
+    include("bridge_conduction_admission.jl")
+    include("transformer_affine_history.jl")
+    include("transformer_compensated_histories.jl")
+    include("transformer_companion_balance.jl")
+    include("compensated_junction_constitutive.jl")
+    include("semiconductor_loss_quadrature.jl")
+    include("continuous_evaluation_time.jl")
 end

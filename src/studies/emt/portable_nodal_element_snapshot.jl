@@ -735,9 +735,62 @@ function _restore_portable_semiconductor_gate_driver!(
     return driver
 end
 
+function _commit_portable_semiconductor_state!(destination,source)
+    typeof(destination)===typeof(source) || _portable_emt_fail(:state_type_mismatch,"staged semiconductor codec changed type")
+    for name in fieldnames(typeof(destination))
+        previous=getfield(destination,name);value=getfield(source,name)
+        if previous isa AbstractArray && value isa AbstractArray
+            copyto!(previous,value)
+        elseif value isa Symbol
+            # Interned Symbols are value-semantic leaves despite Julia's
+            # mutable-type classification; they are not recursively owned state.
+            setfield!(destination,name,value)
+        elseif typeof(previous)===typeof(value) && ismutabletype(typeof(previous)) && !(previous isa BigFloat)
+            _commit_portable_semiconductor_state!(previous,value)
+        else
+            setfield!(destination,name,value)
+        end
+    end
+    return destination
+end
+
+function _portable_semiconductor_endpoint_fields(fidelity, prefix;frame=fidelity.accepted_electrical_history)
+    owner = "emt.power_semiconductor_extended"
+    fields = PortableSnapshotStateField[
+        _portable_emt_state_field("$prefix.endpoint_schema", owner, :checkpoint, "1", "accepted_electrical_v2"),
+        _portable_emt_state_field("$prefix.endpoint_present", owner, :discrete, "1", frame !== nothing),
+    ]
+    frame === nothing && return fields
+    push!(fields,_portable_emt_state_field("$prefix.endpoint.arithmetic_policy",owner,:checkpoint,"1",String(frame.arithmetic_policy)))
+    for (name, unit) in ((:voltage_v,"V"),(:terminal_current_a,"A"))
+        push!(fields, _portable_emt_state_field("$prefix.endpoint.$name", owner, :history, unit,
+            _portable_fixed106_history_value(getfield(frame,name))))
+    end
+    for name in (:channel_current_a,:displacement_current_a,:tail_current_a,:snubber_current_a)
+        push!(fields,_portable_emt_state_field("$prefix.endpoint.$name",owner,:history,"A",getfield(frame,name)))
+    end
+    push!(fields,_portable_emt_state_field("$prefix.endpoint.topology_transition_count",owner,:discrete,"1",frame.topology_transition_count))
+    return fields
+end
+
+function _restore_portable_semiconductor_endpoint(fields, prefix)
+    _portable_emt_scalar(fields,"$prefix.endpoint_schema",:checkpoint,"1",String) == "accepted_electrical_v2" ||
+        _portable_emt_fail(:unsupported_section_version,"unsupported electrical endpoint at $prefix")
+    _portable_emt_scalar(fields,"$prefix.endpoint_present",:discrete,"1",Bool) || return nothing
+    voltage = _portable_fixed106_history_decode(_portable_emt_scalar(fields,"$prefix.endpoint.voltage_v",:history,"V",String),prefix)
+    current = _portable_fixed106_history_decode(_portable_emt_scalar(fields,"$prefix.endpoint.terminal_current_a",:history,"A",String),prefix)
+    components = [_portable_emt_scalar(fields,"$prefix.endpoint.$name",:history,"A",Float64)
+        for name in (:channel_current_a,:displacement_current_a,:tail_current_a,:snubber_current_a)]
+    all(isfinite,components) || _portable_emt_fail(:invalid_state_value,"nonfinite endpoint constituent at $prefix")
+    transitions = _portable_emt_nonnegative_integer(fields,"$prefix.endpoint.topology_transition_count",:discrete)
+    policy=Symbol(_portable_emt_scalar(fields,"$prefix.endpoint.arithmetic_policy",:checkpoint,"1",String))
+    policy in (:binary64,:compensated_binary) || _portable_emt_fail(:invalid_state_value,"unknown electrical arithmetic policy")
+    return Nonlinear.AcceptedSemiconductorElectricalHistory(voltage,current,components...,transitions,policy)
+end
+
 function _portable_semiconductor_snubber_fields(snubber, prefix::AbstractString)
     owner = "emt.power_semiconductor_snubber"
-    return PortableSnapshotStateField[
+    fields = PortableSnapshotStateField[
         _portable_emt_state_field("$prefix.resistance", owner, :checkpoint, "ohm", snubber.resistance_ohm),
         _portable_emt_state_field("$prefix.capacitance", owner, :checkpoint, "F", snubber.capacitance_f),
         _portable_emt_state_field("$prefix.previous_current", owner, :history, "A", snubber.previous_current_a),
@@ -747,9 +800,44 @@ function _portable_semiconductor_snubber_fields(snubber, prefix::AbstractString)
         _portable_emt_state_field("$prefix.last_resistor_loss", owner, :output, "W", snubber.last_resistor_loss_w),
         _portable_emt_state_field("$prefix.dissipated_energy", owner, :history, "J", snubber.dissipated_energy_j),
     ]
+    frame = snubber.accepted_companion_history
+    push!(fields,_portable_emt_state_field("$prefix.boundary_voltage_present",owner,:discrete,"1",snubber.boundary_voltage_v!==nothing))
+    if snubber.boundary_voltage_v!==nothing
+        push!(fields,_portable_emt_state_field("$prefix.boundary_voltage",owner,:algebraic,"V",_portable_fixed106_history_value(snubber.boundary_voltage_v)))
+    end
+    push!(fields,_portable_emt_state_field("$prefix.companion_schema",owner,:checkpoint,"1","accepted_rc_companion_v2"))
+    push!(fields,_portable_emt_state_field("$prefix.companion_present",owner,:discrete,"1",frame !== nothing))
+    if frame !== nothing
+        for (name,unit) in ((:incoming_capacitor_voltage_v,"V"),(:incoming_current_a,"A"),(:step_s,"s"),(:current_a,"A"),(:outgoing_capacitor_voltage_v,"V"))
+            push!(fields,_portable_emt_state_field("$prefix.companion.$name",owner,:history,unit,getfield(frame,name)))
+        end
+        push!(fields,_portable_emt_state_field("$prefix.companion.physical_voltage_v",owner,:history,"V",_portable_fixed106_history_value(frame.physical_voltage_v)))
+        push!(fields,_portable_emt_state_field("$prefix.companion.method",owner,:discrete,"1",String(frame.method)))
+        push!(fields,_portable_emt_state_field("$prefix.companion.arithmetic_policy",owner,:checkpoint,"1",String(frame.arithmetic_policy)))
+    end
+    return fields
 end
 
 function _restore_portable_semiconductor_snubber!(snubber, fields, prefix)
+    _portable_emt_scalar(fields,"$prefix.companion_schema",:checkpoint,"1",String) == "accepted_rc_companion_v2" ||
+        _portable_emt_fail(:unsupported_section_version,"unsupported RC accepted companion at $prefix")
+    staged = deepcopy(snubber)
+    staged.boundary_voltage_v = _portable_emt_scalar(fields,"$prefix.boundary_voltage_present",:discrete,"1",Bool) ?
+        _portable_fixed106_history_decode(_portable_emt_scalar(fields,"$prefix.boundary_voltage",:algebraic,"V",String),prefix) : nothing
+    if _portable_emt_scalar(fields,"$prefix.companion_present",:discrete,"1",Bool)
+        scalar(name,unit)=_portable_emt_scalar(fields,"$prefix.companion.$name",:history,unit,Float64)
+        method=Symbol(_portable_emt_scalar(fields,"$prefix.companion.method",:discrete,"1",String))
+        method in (:trapezoidal,:backward_euler) || _portable_emt_fail(:invalid_state_value,"unknown RC accepted method")
+        voltage=_portable_fixed106_history_decode(_portable_emt_scalar(fields,"$prefix.companion.physical_voltage_v",:history,"V",String),prefix)
+        policy=Symbol(_portable_emt_scalar(fields,"$prefix.companion.arithmetic_policy",:checkpoint,"1",String))
+        policy in (:binary64,:compensated_binary) || _portable_emt_fail(:invalid_state_value,"unknown accepted RC arithmetic policy")
+        staged.accepted_companion_history=Nonlinear.AcceptedRCCompanionHistory(
+            scalar(:incoming_capacitor_voltage_v,"V"),scalar(:incoming_current_a,"A"),voltage,
+            scalar(:step_s,"s"),method,scalar(:current_a,"A"),scalar(:outgoing_capacitor_voltage_v,"V"),policy)
+        staged.accepted_companion_history.step_s > 0 || _portable_emt_fail(:invalid_state_value,"invalid RC accepted step")
+    else
+        staged.accepted_companion_history=nothing
+    end
     for (field_name, identity, family, unit) in (
         (:previous_current_a, :previous_current, :history, "A"),
         (:capacitor_voltage_v, :capacitor_voltage, :continuous, "V"),
@@ -758,10 +846,20 @@ function _restore_portable_semiconductor_snubber!(snubber, fields, prefix)
         (:last_resistor_loss_w, :last_resistor_loss, :output, "W"),
         (:dissipated_energy_j, :dissipated_energy, :history, "J"),
     )
-        setfield!(snubber, field_name, _portable_emt_scalar(
+        setfield!(staged, field_name, _portable_emt_scalar(
             fields, "$prefix.$(String(identity))", family, unit, Float64,
         ))
     end
+    frame=staged.accepted_companion_history
+    if frame !== nothing
+        current=Nonlinear._accepted_rc_companion_current(staged,frame)
+        current==frame.current_a && Nonlinear._accepted_rc_companion_capacitor(staged,frame,current)==frame.outgoing_capacitor_voltage_v ||
+            _portable_emt_fail(:invalid_state_value,"RC incoming companion fails original rounded law")
+        voltage=staged.boundary_voltage_v===nothing ? frame.physical_voltage_v : staged.boundary_voltage_v
+        Nonlinear._rc_boundary_markov_current(staged,frame,voltage,staged.capacitor_voltage_v)==staged.last_current_a ||
+            _portable_emt_fail(:invalid_state_value,"RC boundary Markov frame/current mismatch")
+    end
+    for name in fieldnames(typeof(snubber));setfield!(snubber,name,getfield(staged,name));end
     return snubber
 end
 
@@ -785,6 +883,7 @@ function _portable_semiconductor_recovery_fields(recovery, prefix::AbstractStrin
 end
 
 function _restore_portable_semiconductor_recovery!(recovery, fields, prefix)
+    staged = deepcopy(recovery)
     for (field_name, identity, family, unit) in (
         (:stored_charge_c, :stored_charge, :continuous, "C"),
         (:previous_stored_charge_c, :previous_stored_charge, :history, "C"),
@@ -793,14 +892,18 @@ function _restore_portable_semiconductor_recovery!(recovery, fields, prefix)
         (:cumulative_recovered_charge_c, :cumulative_recovered_charge, :output, "C"),
         (:last_recovery_duration_s, :last_duration, :output, "s"),
     )
-        setfield!(recovery, field_name, _portable_emt_scalar(
+        setfield!(staged, field_name, _portable_emt_scalar(
             fields, "$prefix.$(String(identity))", family, unit, Float64,
         ))
     end
-    recovery.recovery_active = _portable_emt_scalar(fields, "$prefix.active", :discrete, "1", Bool)
-    recovery.recovery_start_time_s = _portable_emt_time_scalar(fields, "$prefix.start_time", :scheduler)
-    recovery.recovery_zero_event_count = _portable_emt_nonnegative_integer(fields, "$prefix.zero_event_count", :discrete)
-    recovery.last_recovery_zero_time_s = _portable_emt_time_scalar(fields, "$prefix.last_zero_time", :scheduler)
+    staged.recovery_active = _portable_emt_scalar(fields, "$prefix.active", :discrete, "1", Bool)
+    staged.recovery_start_time_s = _portable_recovery_origin_decode(
+        _portable_emt_inventory_field(fields, "$prefix.start_time", :scheduler, "s").value, "$prefix.start_time")
+    staged.recovery_zero_event_count = _portable_emt_nonnegative_integer(fields, "$prefix.zero_event_count", :discrete)
+    staged.last_recovery_zero_time_s = _portable_emt_time_scalar(fields, "$prefix.last_zero_time", :scheduler)
+    for name in fieldnames(typeof(recovery))
+        setfield!(recovery, name, getfield(staged, name))
+    end
     return recovery
 end
 
@@ -855,13 +958,20 @@ function _portable_semiconductor_tail_fields(tail, prefix::AbstractString)
 end
 
 function _restore_portable_semiconductor_tail!(tail, fields, prefix)
-    tail.active = _portable_emt_scalar(fields, "$prefix.active", :discrete, "1", Bool)
-    tail.current_a = _portable_emt_scalar(fields, "$prefix.current", :continuous, "A", Float64)
-    tail.initial_current_a = _portable_emt_scalar(fields, "$prefix.initial_current", :history, "A", Float64)
-    tail.turn_off_time_s = _portable_emt_time_scalar(fields, "$prefix.turn_off_time", :scheduler)
-    tail.last_duration_s = _portable_emt_scalar(fields, "$prefix.last_duration", :output, "s", Float64)
-    tail.cutoff_event_count = _portable_emt_nonnegative_integer(fields, "$prefix.cutoff_event_count", :discrete)
-    tail.last_cutoff_time_s = _portable_emt_time_scalar(fields, "$prefix.last_cutoff_time", :scheduler)
+    # Decode every member before publishing any scalar to the live component.
+    restored = (;
+        active=_portable_emt_scalar(fields, "$prefix.active", :discrete, "1", Bool),
+        current_a=_portable_emt_scalar(fields, "$prefix.current", :continuous, "A", Float64),
+        initial_current_a=_portable_emt_scalar(fields, "$prefix.initial_current", :history, "A", Float64),
+        turn_off_time_s=_portable_recovery_origin_decode(
+            _portable_emt_inventory_field(fields, "$prefix.turn_off_time", :scheduler, "s").value, "$prefix.turn_off_time"),
+        last_duration_s=_portable_emt_scalar(fields, "$prefix.last_duration", :output, "s", Float64),
+        cutoff_event_count=_portable_emt_nonnegative_integer(fields, "$prefix.cutoff_event_count", :discrete),
+        last_cutoff_time_s=_portable_emt_time_scalar(fields, "$prefix.last_cutoff_time", :scheduler),
+    )
+    for name in keys(restored)
+        setfield!(tail, name, getproperty(restored, name))
+    end
     return tail
 end
 
@@ -903,7 +1013,9 @@ function _portable_semiconductor_thermal_fields(thermal, prefix::AbstractString)
         _portable_emt_array_field("$prefix.capacitance", owner, :checkpoint, "J_K", ["stage"], thermal.capacitance_j_per_k),
         _portable_emt_array_field("$prefix.resistance", owner, :checkpoint, "K_W", ["stage"], thermal.resistance_k_per_w),
         _portable_emt_state_field("$prefix.ambient_temperature", owner, :checkpoint, "K", thermal.ambient_temperature_k),
-        _portable_emt_array_field("$prefix.node_temperature", owner, :continuous, "K", ["stage"], thermal.node_temperature_k),
+        _portable_emt_state_field("$prefix.accepted_rise_schema", owner, :checkpoint, "1", "cauer_accepted_rise_v1"),
+        _portable_emt_array_field("$prefix.accepted_temperature_rise", owner, :continuous, "K", ["stage"], thermal.accepted_temperature_rise_k),
+        _portable_emt_array_field("$prefix.node_temperature", owner, :output, "K", ["stage"], thermal.node_temperature_k),
         _portable_emt_state_field("$prefix.minimum_temperature", owner, :checkpoint, "K", thermal.minimum_temperature_k),
         _portable_emt_state_field("$prefix.maximum_temperature", owner, :checkpoint, "K", thermal.maximum_temperature_k),
         _portable_emt_state_field("$prefix.last_loss_power", owner, :algebraic, "W", thermal.last_loss_power_w),
@@ -925,7 +1037,38 @@ function _portable_semiconductor_thermal_fields(thermal, prefix::AbstractString)
 end
 
 function _restore_portable_semiconductor_thermal!(thermal, fields, prefix)
+    # Old rounded temperatures cannot recover an accepted physical rise.
+    # Refuse missing/unknown schema before touching the destination or aliases.
+    _portable_emt_scalar(fields, "$prefix.accepted_rise_schema", :checkpoint, "1", String) == "cauer_accepted_rise_v1" ||
+        _portable_emt_fail(:unsupported_section_version, "unsupported accepted thermal rise at $prefix")
+    staged = deepcopy(thermal)
+    _restore_portable_semiconductor_thermal_fields!(staged, fields, prefix)
+    for stage in eachindex(staged.accepted_temperature_rise_k)
+        rise = staged.accepted_temperature_rise_k[stage]
+        temperature = staged.ambient_temperature_k + rise
+        isfinite(rise) && staged.minimum_temperature_k <= temperature <= staged.maximum_temperature_k ||
+            _portable_emt_fail(:invalid_state_value, "accepted thermal rise leaves domain at $prefix")
+        temperature == staged.node_temperature_k[stage] ||
+            _portable_emt_fail(:invalid_state_value, "thermal reporting/rise ownership mismatch at $prefix")
+    end
+    staged.last_stored_energy_j == Nonlinear.power_semiconductor_thermal_stored_energy(staged) &&
+        staged.last_ambient_heat_flow_w == staged.accepted_temperature_rise_k[end] / staged.resistance_k_per_w[end] ||
+        _portable_emt_fail(:invalid_state_value, "accepted thermal derived output mismatch at $prefix")
+    for name in fieldnames(typeof(thermal))
+        destination = getfield(thermal, name)
+        value = getfield(staged, name)
+        if destination isa AbstractArray
+            copyto!(destination, value)
+        elseif ismutabletype(typeof(thermal))
+            setfield!(thermal, name, value)
+        end
+    end
+    return thermal
+end
+
+function _restore_portable_semiconductor_thermal_fields!(thermal, fields, prefix)
     for (field_name, identity, unit, axis) in (
+        (:accepted_temperature_rise_k, :accepted_temperature_rise, "K", "stage"),
         (:node_temperature_k, :node_temperature, "K", "stage"),
         (:trial_lower_conductance_w_per_k, :trial_lower_conductance, "W_K", "coupling"),
         (:trial_diagonal_conductance_w_per_k, :trial_diagonal_conductance, "W_K", "stage"),
@@ -939,7 +1082,8 @@ function _restore_portable_semiconductor_thermal!(thermal, fields, prefix)
             getfield(thermal, field_name),
             fields,
             "$prefix.$(String(identity))",
-            field_name === :node_temperature_k ? :continuous : :reconstruction,
+            field_name === :accepted_temperature_rise_k ? :continuous :
+                field_name === :node_temperature_k ? :output : :reconstruction,
             unit,
             [axis],
         )
@@ -1012,10 +1156,22 @@ function _portable_semiconductor_extended_fields(fidelity, prefix::AbstractStrin
         _portable_emt_state_field("$prefix.pending_event_blocking_voltage", owner, :scheduler, "V", fidelity.pending_event_blocking_voltage_v),
         _portable_emt_state_field("$prefix.candidate_recovery_charge", owner, :reconstruction, "C", fidelity.candidate_recovery_charge_c),
     ])
+    append!(fields,_portable_semiconductor_endpoint_fields(fidelity,prefix))
+    append!(fields,_portable_semiconductor_endpoint_fields(fidelity,"$prefix.boundary_anchor";frame=fidelity.boundary_electrical_anchor))
+    append!(fields,_portable_semiconductor_endpoint_fields(fidelity,"$prefix.boundary_state";frame=fidelity.boundary_electrical_state))
     return fields
 end
 
-function _restore_portable_semiconductor_extended!(fidelity, fields, prefix)
+function _restore_portable_semiconductor_extended!(fidelity,fields,prefix)
+    staged=deepcopy(fidelity)
+    _restore_portable_semiconductor_extended_fields!(staged,fields,prefix)
+    return _commit_portable_semiconductor_state!(fidelity,staged)
+end
+
+function _restore_portable_semiconductor_extended_fields!(fidelity, fields, prefix)
+    endpoint = _restore_portable_semiconductor_endpoint(fields,prefix)
+    boundary_anchor = _restore_portable_semiconductor_endpoint(fields,"$prefix.boundary_anchor")
+    boundary_state = _restore_portable_semiconductor_endpoint(fields,"$prefix.boundary_state")
     for (component, value) in (
         ("recovered_charge", fidelity.recovered_charge),
         ("junction_charge", fidelity.junction_charge),
@@ -1060,6 +1216,14 @@ function _restore_portable_semiconductor_extended!(fidelity, fields, prefix)
     fidelity.accepted_topology_transition_count = _portable_emt_nonnegative_integer(
         fields, "$prefix.accepted_topology_transition_count", :discrete,
     )
+    current_endpoint=boundary_state===nothing ? endpoint : boundary_state
+    if current_endpoint !== nothing
+        Float64(current_endpoint.voltage_v)==fidelity.previous_terminal_voltage_v && Float64(current_endpoint.terminal_current_a)==fidelity.previous_terminal_current_a ||
+            _portable_emt_fail(:invalid_state_value,"accepted electrical endpoint/report mismatch")
+    end
+    fidelity.accepted_electrical_history=endpoint
+    fidelity.boundary_electrical_anchor=boundary_anchor
+    fidelity.boundary_electrical_state=boundary_state
     return fidelity
 end
 

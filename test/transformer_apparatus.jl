@@ -434,6 +434,27 @@ function single_coil_reactor_connection()
     )
 end
 
+@testset "exact transformer terminal-current cutsets" begin
+    connection = single_coil_reactor_connection()
+    before = copy(connection.incidence)
+    @test TransformerPublic.transformer_terminal_current_cutset(connection, [1.0, 1.0])
+    @test TransformerPublic.transformer_terminal_current_cutset(connection, [-3.0, -3.0])
+    @test !TransformerPublic.transformer_terminal_current_cutset(connection, [1.0, -1.0])
+    @test !TransformerPublic.transformer_terminal_current_cutset(connection, [1.0, nextfloat(1.0)])
+    @test_throws DimensionMismatch TransformerPublic.transformer_terminal_current_cutset(connection, [1.0])
+    @test_throws ArgumentError TransformerPublic.transformer_terminal_current_cutset(connection, [0.0, 0.0])
+    @test_throws ArgumentError TransformerPublic.transformer_terminal_current_cutset(connection, [Inf, 1.0])
+    @test_throws ArgumentError TransformerPublic.transformer_terminal_current_cutset(connection, [NaN, 1.0])
+    @test connection.incidence == before
+    # This is a current constraint, not a zero-voltage constraint: arbitrary
+    # stored winding current still gives equal and opposite terminal currents.
+    current = zeros(2)
+    for winding_current in (-17.0, 0.0, 29.0)
+        TransformerPublic.transformer_terminal_currents!(current, connection, [winding_current])
+        @test sum(current) == 0.0
+    end
+end
+
 function split_winding_reactor_connection()
     return TransformerPublic.TransformerConnectionTopology(
         node_order=[
@@ -656,6 +677,82 @@ end
         TransformerPublic.prepare_transformer_apparatus(air_core_specification),
         [1, 2],
     )
+    event_runtime = TransformerPublic.transformer_apparatus_runtime(
+        TransformerPublic.prepare_transformer_apparatus(air_core_specification),
+        [1, 2],
+    )
+    @test_throws Exception prepare_nonlinear_device_step!(
+        event_runtime, 5.0e-6, 5.0e-6, :trapezoidal)
+    prepare_nonlinear_device_event_substep!(
+        event_runtime, 5.0e-6, 5.0e-6, :trapezoidal)
+    @test event_runtime.candidate_step_s == 5.0e-6
+    @test event_runtime.companion_method === :trapezoidal
+    @test event_runtime.accepted_state.accepted_time_s == 0.0
+    compensated_runtime = TransformerPublic.transformer_apparatus_runtime(
+        TransformerPublic.prepare_transformer_apparatus(air_core_specification),
+        [1, 2],
+    )
+    compensated_voltage_v = [100.0, 100.0]
+    compensated_voltage_correction_v = [0.25eps(100.0), -0.25eps(100.0)]
+    @test compensated_voltage_v .+ compensated_voltage_correction_v ==
+        compensated_voltage_v
+    compensated_current_a = zeros(2)
+    compensated_jacobian_s = zeros(2, 2)
+    prepare_nonlinear_device_step!(
+        compensated_runtime,
+        10.0e-6,
+        10.0e-6,
+        :trapezoidal,
+    )
+    nonlinear_current_jacobian_compensated!(
+        compensated_current_a,
+        compensated_jacobian_s,
+        compensated_runtime,
+        compensated_voltage_v,
+        compensated_voltage_correction_v,
+        10.0e-6,
+    )
+    ordinary_runtime = TransformerPublic.transformer_apparatus_runtime(
+        TransformerPublic.prepare_transformer_apparatus(air_core_specification),
+        [1, 2],
+    )
+    ordinary_current_a = zeros(2)
+    ordinary_jacobian_s = zeros(2, 2)
+    prepare_nonlinear_device_step!(
+        ordinary_runtime,
+        10.0e-6,
+        10.0e-6,
+        :trapezoidal,
+    )
+    nonlinear_current_jacobian!(
+        ordinary_current_a,
+        ordinary_jacobian_s,
+        ordinary_runtime,
+        compensated_voltage_v,
+        10.0e-6,
+    )
+    expected_compensated_current_a = map(eachindex(ordinary_current_a)) do row
+        Float64(setprecision(BigFloat, 106) do
+            value = BigFloat(ordinary_current_a[row])
+            for column in eachindex(compensated_voltage_correction_v)
+                value += BigFloat(ordinary_jacobian_s[row, column]) *
+                    BigFloat(compensated_voltage_correction_v[column])
+            end
+            value
+        end)
+    end
+    @test compensated_current_a == expected_compensated_current_a
+    @test compensated_jacobian_s == ordinary_jacobian_s
+    accept_nonlinear_device_compensated_state!(
+        compensated_runtime,
+        compensated_voltage_v,
+        compensated_voltage_correction_v,
+        compensated_current_a,
+        compensated_jacobian_s,
+        10.0e-6,
+    )
+    finish_nonlinear_device_step!(compensated_runtime)
+    @test compensated_runtime.accepted_evaluation_count == 1
     TransformerPublic.queue_transformer_apparatus_event!(
         air_core_runtime,
         TransformerPublic.TransformerApparatusEventCommand(

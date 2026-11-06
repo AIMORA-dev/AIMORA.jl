@@ -580,18 +580,101 @@ function _stabilize_three_phase_inverter_topology!(runtime, time_s, step_s)
     throw(ArgumentError("three-phase inverter switching topology failed to stabilize"))
 end
 
-function _synchronize_three_phase_inverter_conduction!(runtime, time_s)
+function _complete_two_level_bridge_conduction_chart!(
+    controlled_valves,
+    freewheel_diodes,
+    chart,
+    time_s,
+    ; extinguished_positions=(),
+)
+    length(controlled_valves) == length(freewheel_diodes) == 6 ||
+        throw(DimensionMismatch("two-level three-phase bridge requires six controlled and six freewheel devices"))
+    length(chart) == 12 || throw(DimensionMismatch(
+        "two-level bridge conduction chart requires twelve devices",
+    ))
+    all(value -> value isa Bool, chart) || throw(ArgumentError(
+        "two-level bridge conduction chart must contain Boolean decisions",
+    ))
+    for phase in 1:3
+        upper = 2phase - 1
+        count(identity, (chart[upper], chart[upper + 1],
+            chart[upper + 6], chart[upper + 7])) <= 1 ||
+            throw(ArgumentError("two-level bridge conduction chart has multiple paths in phase $phase"))
+    end
+    for position in extinguished_positions
+        1 <= position <= 12 || throw(BoundsError(1:12, position))
+        chart[position] || throw(ArgumentError(
+            "two-level bridge holding correction requires an active recorded path",
+        ))
+    end
+    changed = false
+    for index in 1:6
+        changed |= _set_full_bridge_device_state!(
+            controlled_valves[index],
+            chart[index] && !(index in extinguished_positions), time_s,
+        )
+        changed |= _set_full_bridge_device_state!(
+            freewheel_diodes[index],
+            chart[index + 6] && !(index + 6 in extinguished_positions), time_s,
+        )
+    end
+    return changed
+end
+
+"""Owned scalar chart/guard inputs for an optional bridge observer."""
+function _bridge_conduction_device_observation(device)
+    driver = device.gate_driver
+    return (;
+        closed=device.closed, reverse_diode_conducting=device.reverse_diode_conducting,
+        event_localization_enabled=device.event_localization_enabled,
+        voltage_v=device.last_voltage, forward_current_a=device.last_forward_current_a,
+        threshold_v=device.threshold_v, forward_voltage_drop_v=device.forward_voltage_drop_v,
+        holding_current_a=device.holding_current, on_conductance=device.on_conductance,
+        mosfet=device isa Nonlinear.MOSFETSwitch,
+        gate=driver === nothing ? nothing : (; applied_on=driver.applied_on,
+            commanded_on=driver.commanded_on, pending_state=driver.pending_state,
+            pending_transition_time_s=driver.pending_transition_time_s,
+            last_command_time_s=driver.last_command_time_s,
+            last_turn_on_time_s=driver.last_turn_on_time_s,
+            last_turn_off_time_s=driver.last_turn_off_time_s,
+            command_count=driver.command_count, transition_count=driver.transition_count),
+        chart=Nonlinear.power_semiconductor_topology_chart_state(device),
+        tail_history=Nonlinear.power_semiconductor_topology_tail_history(device),
+    )
+end
+
+function _synchronize_two_level_bridge_conduction!(
+    controlled_valves,
+    freewheel_diodes,
+    phase_current_a,
+    time_s,
+    ; mapped_devices=nothing,
+      excluded_positions=(),
+      conduction_observer=nothing,
+)
+    length(controlled_valves) == length(freewheel_diodes) == 6 ||
+        throw(DimensionMismatch("two-level three-phase bridge requires six controlled and six freewheel devices"))
+    length(phase_current_a) == 3 || throw(DimensionMismatch(
+        "two-level three-phase bridge requires three phase currents",
+    ))
     controlled_target = falses(6)
     diode_target = falses(6)
     tolerance = maximum(
-        valve.holding_current for valve in _three_phase_inverter_devices(runtime)
+        valve.holding_current for valve in (controlled_valves..., freewheel_diodes...)
     )
+    conduction_observer === nothing || conduction_observer((;
+        kind=:selection_input, time_s, phase_current_a=Tuple(phase_current_a), tolerance,
+        devices=map(_bridge_conduction_device_observation, (controlled_valves..., freewheel_diodes...)),
+        mapped_devices=mapped_devices === nothing ? nothing :
+            Tuple(_bridge_conduction_device_observation(d) for d in mapped_devices),
+        excluded_positions=Tuple(excluded_positions),
+    ))
     for phase in 1:3
         upper = 2 * phase - 1
         lower = 2 * phase
-        current = runtime.load_branches[phase].i_last
-        upper_applied = runtime.controlled_valves[upper].gate_driver.applied_on
-        lower_applied = runtime.controlled_valves[lower].gate_driver.applied_on
+        current = phase_current_a[phase]
+        upper_applied = controlled_valves[upper].gate_driver.applied_on
+        lower_applied = controlled_valves[lower].gate_driver.applied_on
         if upper_applied && current >= -tolerance
             controlled_target[upper] = true
         elseif lower_applied && current <= tolerance
@@ -606,20 +689,99 @@ function _synchronize_three_phase_inverter_conduction!(runtime, time_s)
             controlled_target[lower] = true
         end
     end
+    conduction_observer === nothing || conduction_observer((;
+        kind=:selection_sign_targets, time_s,
+        targets=Tuple((controlled_target..., diode_target...)),
+    ))
+    # Phase-current sign proposes a path; it cannot release a natural
+    # voltage-owned turn-on before the accepted incoming owner is eligible.
+    # In particular, displacement current can carry a dead-time leg while
+    # its diode remains reverse biased. An admissible future probe is not
+    # permission to pre-close that diode across the preceding interval.
+    for (devices, targets) in ((controlled_valves, controlled_target),
+                              (freewheel_diodes, diode_target))
+        for index in eachindex(targets)
+            targets[index] && !devices[index].closed || continue
+            margin = Nonlinear.power_semiconductor_forward_turn_on_residual(devices[index])
+            conduction_observer === nothing || conduction_observer((;
+                kind=:selection_incoming_guard, time_s,
+                position=(devices === controlled_valves ? index : index + 6), margin,
+            ))
+            # A MOSFET's bidirectional channel is gate-owned and deliberately
+            # has no forward-voltage event. Preserve that admitted behavior.
+            if margin === nothing
+                devices[index] isa Nonlinear.MOSFETSwitch || (targets[index] = false)
+            elseif margin < 0.0
+                targets[index] = false
+            end
+        end
+    end
+    if mapped_devices !== nothing
+        length(mapped_devices) == 12 || throw(DimensionMismatch(
+            "two-level bridge mapped conduction requires twelve devices",
+        ))
+        for index in 1:6
+            if controlled_target[index] && mapped_devices[index].closed
+                margin = Nonlinear.power_semiconductor_forward_extinction_residual(
+                    mapped_devices[index],
+                )
+                conduction_observer === nothing || conduction_observer((;
+                    kind=:selection_probe_guard, time_s, position=index, margin,
+                ))
+                margin !== nothing && margin < 0.0 &&
+                    (controlled_target[index] = false)
+            end
+            if diode_target[index] && mapped_devices[index + 6].closed
+                margin = Nonlinear.power_semiconductor_forward_extinction_residual(
+                    mapped_devices[index + 6],
+                )
+                conduction_observer === nothing || conduction_observer((;
+                    kind=:selection_probe_guard, time_s, position=index + 6, margin,
+                ))
+                margin !== nothing && margin < 0.0 &&
+                    (diode_target[index] = false)
+            end
+        end
+    end
+    # A holding-current-invalid trial may exclude its exact conduction path
+    # from the next active-set candidate. The neutral leg remains a physical
+    # candidate; it is never accepted without the subsequent network solve
+    # and forward/holding guard checks.
+    for position in excluded_positions
+        1 <= position <= 12 || throw(BoundsError(1:12, position))
+        if position <= 6
+            controlled_target[position] = false
+        else
+            diode_target[position - 6] = false
+        end
+    end
+    conduction_observer === nothing || conduction_observer((;
+        kind=:selection_final_targets, time_s,
+        targets=Tuple((controlled_target..., diode_target...)),
+    ))
     changed = false
     for index in 1:6
         changed |= _set_full_bridge_device_state!(
-            runtime.controlled_valves[index],
+            controlled_valves[index],
             controlled_target[index],
             time_s,
         )
         changed |= _set_full_bridge_device_state!(
-            runtime.freewheel_diodes[index],
+            freewheel_diodes[index],
             diode_target[index],
             time_s,
         )
     end
     return changed
+end
+
+function _synchronize_three_phase_inverter_conduction!(runtime, time_s)
+    return _synchronize_two_level_bridge_conduction!(
+        runtime.controlled_valves,
+        runtime.freewheel_diodes,
+        [branch.i_last for branch in runtime.load_branches],
+        time_s,
+    )
 end
 
 function _request_three_phase_inverter_gates!(runtime, time_s)

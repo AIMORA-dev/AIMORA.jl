@@ -109,6 +109,40 @@ function _extended_vsc_grid_source_connected(source::ExtendedVSCGridSource, time
     return !(scenario.island_start_s <= time_s < scenario.reconnect_time_s)
 end
 
+function _extended_vsc_grid_source_voltage(
+    source::ExtendedVSCGridSource,
+    time::StudyCore.ContinuousEvaluationTime,
+)
+    p = source.parameters
+    scenario = p.scenario
+    time_s = StudyCore.continuous_time_seconds(time)
+    # Preserve the original coefficient conventions while evaluating phase
+    # and its constitutive contribution before rounding the continuous time.
+    angle = BigFloat(2.0 * pi * p.frequency_hz) * time_s
+    phase_offset = BigFloat((source.phase - 1) * 2.0 * pi / 3.0)
+    crest = BigFloat(sqrt(2.0 / 3.0) * p.grid_line_line_rms_v)
+    voltage = crest * cos(angle - phase_offset)
+    voltage += crest * BigFloat(scenario.negative_sequence_voltage_ratio) * cos(angle + phase_offset)
+    voltage += crest * BigFloat(scenario.zero_sequence_voltage_ratio) * cos(angle)
+    for (order, ratio) in zip(scenario.harmonic_orders, scenario.harmonic_voltage_ratios)
+        sequence_sign = mod(order, 6) == 5 ? -1.0 : 1.0
+        voltage += crest * BigFloat(ratio) * cos(order * angle - sequence_sign * phase_offset)
+    end
+    faulted = scenario.fault_kind === :three_phase || source.phase in scenario.faulted_phases
+    scenario.fault_start_s <= time_s < scenario.fault_end_s && faulted &&
+        (voltage *= BigFloat(scenario.fault_voltage_factor))
+    return voltage
+end
+
+function _extended_vsc_grid_source_connected(
+    source::ExtendedVSCGridSource,
+    time::StudyCore.ContinuousEvaluationTime,
+)
+    scenario = source.parameters.scenario
+    time_s = StudyCore.continuous_time_seconds(time)
+    return !(scenario.island_start_s <= time_s < scenario.reconnect_time_s)
+end
+
 function Branches.stamp!(
     admittance,
     right_hand_side,
@@ -143,6 +177,19 @@ Branches.stamp!(admittance, right_hand_side, source::ExtendedVSCGridSource,
     Branches.stamp!(admittance, right_hand_side, source, time_s, step_s)
 
 Branches.backward_euler_companion_supported(::ExtendedVSCGridSource) = true
+
+function Branches.stamp!(admittance,right_hand_side,source::ExtendedVSCGridSource,
+    time::StudyCore.ContinuousEvaluationTime,step_s::Float64,method)
+    setprecision(BigFloat,106) do
+        _extended_vsc_grid_source_connected(source,time) || return nothing
+        conductance = inv(source.resistance_ohm)
+        voltage = _extended_vsc_grid_source_voltage(source,time)
+        Branches.stamp_conductance!(admittance,source.phase_node,source.neutral_node,conductance)
+        Branches.stamp_history_current!(right_hand_side,source.phase_node,source.neutral_node,
+            -BigFloat(conductance)*voltage)
+    end
+    nothing
+end
 Branches.update!(::ExtendedVSCGridSource, _voltage, _step_s::Float64) = nothing
 Branches.update!(::ExtendedVSCGridSource, _voltage, _step_s::Float64,
     ::Val{Branches.TrapezoidalCompanion}) = nothing
@@ -260,8 +307,8 @@ mutable struct ExtendedVSCRuntime{S,T,L,C,G,D,N}
     measurement_count::Int
     maximum_nonlinear_kcl_residual_a::Float64
     last_nonlinear_kcl_residual_a::Float64
-    cumulative_energy_residual_j::Float64
-    cumulative_linear_companion_energy_residual_j::Float64
+    cumulative_energy_residual_j::Union{Float64,BigFloat}
+    cumulative_linear_companion_energy_residual_j::Union{Float64,BigFloat}
 end
 
 struct ExtendedVSCRuntimeCheckpoint{N,C,M,H,P}
@@ -277,8 +324,8 @@ struct ExtendedVSCRuntimeCheckpoint{N,C,M,H,P}
     measurement_count::Int
     maximum_nonlinear_kcl_residual_a::Float64
     last_nonlinear_kcl_residual_a::Float64
-    cumulative_energy_residual_j::Float64
-    cumulative_linear_companion_energy_residual_j::Float64
+    cumulative_energy_residual_j::Union{Float64,BigFloat}
+    cumulative_linear_companion_energy_residual_j::Union{Float64,BigFloat}
 end
 
 function _extended_vsc_runtime_checkpoint(runtime::ExtendedVSCRuntime)
@@ -952,12 +999,151 @@ function _apply_extended_vsc_boundaries!(integrator, time_s)
     return runtime
 end
 
+_extended_vsc_is_source_boundary(name::Symbol) = name in (
+    :fault_begins, :fault_clears, :dc_sag_begins, :dc_sag_clears,
+    :island_begins, :grid_reconnects,
+)
+
+function _extended_vsc_source_boundary_at(runtime, endpoint_time_s)
+    # Peek without releasing tasks/commands early. Time-dependent source
+    # stamps already observe the right side at this exact declared endpoint.
+    for index in runtime.next_boundary_index:length(runtime.boundary_plan)
+        name, boundary_time_s, _ = runtime.boundary_plan[index]
+        boundary_time_s > endpoint_time_s && break
+        boundary_time_s == endpoint_time_s &&
+            _extended_vsc_is_source_boundary(name) && return true
+    end
+    return false
+end
+
+function _extended_vsc_source_boundary_changed(occurrences, previous_count::Int)
+    return any(occurrences[previous_count+1:end]) do occurrence
+        _extended_vsc_is_source_boundary(occurrence.name)
+    end
+end
+
 function _next_extended_vsc_boundary(runtime, current_time_s, endpoint_time_s)
     runtime.next_boundary_index <= length(runtime.boundary_plan) || return Inf
     boundary_time = runtime.boundary_plan[runtime.next_boundary_index][2]
     boundary_time < current_time_s - runtime.parameters.scheduler_tick_s * 1.0e-9 &&
         throw(ArgumentError("extended VSC boundary precedes the active interval"))
     return boundary_time <= endpoint_time_s ? boundary_time : Inf
+end
+
+# Accounting retains admitted scalar types; the physical kernels keep their
+# existing precision. Higher stored precision is scoped to these operations.
+_extended_vsc_accounting_precision(value) = 0
+_extended_vsc_accounting_precision(value::BigFloat) = precision(value)
+_extended_vsc_accounting_precision(value::NamedTuple) =
+    maximum(_extended_vsc_accounting_precision, values(value); init=0)
+function _with_extended_vsc_accounting_precision(f, values...)
+    bits = max(precision(BigFloat), maximum(_extended_vsc_accounting_precision, values; init=0))
+    return bits > precision(BigFloat) ? setprecision(f, BigFloat, bits) : f()
+end
+_extended_vsc_accounting_add(left::Float64, right::Float64) = left + right
+_extended_vsc_accounting_add(left, right) =
+    _with_extended_vsc_accounting_precision(() -> left + right, left, right)
+
+@generated function _extended_vsc_accounting_record(record::T) where {T<:NamedTuple}
+    fields = map(fieldtypes(T)) do S
+        S <: Union{Float64,BigFloat} ? Union{Float64,BigFloat} : S
+    end
+    record_type = NamedTuple{fieldnames(T),Tuple{fields...}}
+    return :($record_type(record))
+end
+
+mutable struct ExtendedVSCBalanceAccounting{P,L}
+    previous_power::P
+    previous_stored_energy_j::Union{Float64,BigFloat}
+    previous_linear::L
+    energy_residual_j::Union{Float64,BigFloat}
+    linear_companion_defect_j::Union{Float64,BigFloat}
+    function ExtendedVSCBalanceAccounting(power, stored::Union{Float64,BigFloat},
+        linear, residual::Union{Float64,BigFloat}, defect::Union{Float64,BigFloat})
+        previous_power = _extended_vsc_accounting_record(power)
+        previous_linear = _extended_vsc_accounting_record(linear)
+        return new{typeof(previous_power),typeof(previous_linear)}(
+            previous_power, stored, previous_linear, residual, defect)
+    end
+end
+
+function ExtendedVSCBalanceAccounting(runtime, time_s)
+    measurement = _extended_vsc_measurement(runtime, time_s)
+    return ExtendedVSCBalanceAccounting(
+        _extended_vsc_power(runtime, measurement, time_s),
+        _extended_vsc_stored_energy(runtime),
+        _extended_vsc_linear_companion_accounting(runtime),
+        0.0, 0.0,
+    )
+end
+
+function _extended_vsc_balance_increment(previous_power, final_power,
+    previous_stored_j, final_stored_j, previous_linear, final_linear,
+    step_s, companion_method)
+    return _with_extended_vsc_accounting_precision(previous_power, final_power,
+        previous_stored_j, final_stored_j, previous_linear, final_linear,
+        previous_power.bridge.companion_energy_residual_j,
+        final_power.bridge.companion_energy_residual_j, step_s) do
+        _extended_vsc_balance_increment_at_precision(previous_power, final_power,
+            previous_stored_j, final_stored_j, previous_linear, final_linear,
+            step_s, companion_method)
+    end
+end
+
+function _extended_vsc_balance_increment_at_precision(previous_power, final_power,
+    previous_stored_j, final_stored_j, previous_linear, final_linear,
+    step_s, companion_method)
+    weight = companion_method === Branches.TrapezoidalCompanion ? 0.5 :
+        companion_method === Branches.BackwardEulerCompanion ? 1.0 :
+        throw(ArgumentError("extended VSC received an unknown companion method"))
+    blend(previous, final) = weight == 0.5 ? 0.5 * (previous + final) : final
+    previous_dynamic_power = previous_linear.capacitor_power_w +
+        previous_linear.inductor_power_w - previous_linear.inductor_dissipated_power_w
+    final_dynamic_power = final_linear.capacitor_power_w +
+        final_linear.inductor_power_w - final_linear.inductor_dissipated_power_w
+    linear_stored_change = final_linear.capacitor_stored_energy_j -
+        previous_linear.capacitor_stored_energy_j + final_linear.inductor_stored_energy_j -
+        previous_linear.inductor_stored_energy_j
+    linear_defect_j = step_s * blend(previous_dynamic_power, final_dynamic_power) -
+        linear_stored_change
+    bridge_defect_j = final_power.bridge.companion_energy_residual_j -
+        previous_power.bridge.companion_energy_residual_j
+    external_work_j = step_s * blend(previous_power.external_power_w, final_power.external_power_w)
+    dissipated_work_j = step_s * blend(previous_power.dissipated_power_w, final_power.dissipated_power_w)
+    residual_j = external_work_j - dissipated_work_j - (final_stored_j - previous_stored_j) -
+        bridge_defect_j - linear_defect_j
+    return (;residual_j, linear_defect_j, external_work_j, dissipated_work_j)
+end
+
+function _accumulate_extended_vsc_balance!(accounting::ExtendedVSCBalanceAccounting,
+    power, stored_j, linear, step_s, companion_method)
+    increment = _extended_vsc_balance_increment(accounting.previous_power, power,
+        accounting.previous_stored_energy_j, stored_j, accounting.previous_linear,
+        linear, step_s, companion_method)
+    accounting.energy_residual_j = _extended_vsc_accounting_add(accounting.energy_residual_j, increment.residual_j)
+    accounting.linear_companion_defect_j = _extended_vsc_accounting_add(accounting.linear_companion_defect_j, increment.linear_defect_j)
+    accounting.previous_power = power
+    accounting.previous_stored_energy_j = stored_j
+    accounting.previous_linear = linear
+    return nothing
+end
+
+function _observe_extended_vsc_substep!(accounting::ExtendedVSCBalanceAccounting,
+    runtime, _system, time_s, step_s, companion_method, _substep_index)
+    measurement = _extended_vsc_measurement(runtime, time_s)
+    power = _extended_vsc_power(runtime, measurement, time_s)
+    stored_j = _extended_vsc_stored_energy(runtime)
+    linear = _extended_vsc_linear_companion_accounting(runtime)
+    return _accumulate_extended_vsc_balance!(accounting, power, stored_j, linear,
+        step_s, companion_method)
+end
+
+function _accumulate_extended_vsc_conservation!(runtime, residual, defect)
+    runtime.cumulative_linear_companion_energy_residual_j = _extended_vsc_accounting_add(
+        runtime.cumulative_linear_companion_energy_residual_j, defect)
+    runtime.cumulative_energy_residual_j = _extended_vsc_accounting_add(
+        runtime.cumulative_energy_residual_j, residual)
+    return runtime
 end
 
 function _extended_vsc_network_window!(integrator, start_time_s, endpoint_time_s)
@@ -977,16 +1163,7 @@ function _extended_vsc_network_window!(integrator, start_time_s, endpoint_time_s
         segment_step > tolerance || throw(ArgumentError(
             "extended VSC scheduler produced a nonadvancing interval",
         ))
-        initial_measurement = _extended_vsc_measurement(runtime, current_time)
-        initial_accounting = _extended_vsc_power(
-            runtime,
-            initial_measurement,
-            current_time,
-        )
-        initial_stored_energy_j = _extended_vsc_stored_energy(runtime)
-        initial_companion_energy_residual_j =
-            initial_accounting.bridge.companion_energy_residual_j
-        initial_linear_companion = _extended_vsc_linear_companion_accounting(runtime)
+        accounting = ExtendedVSCBalanceAccounting(runtime, current_time)
         _apply_extended_vsc_boundaries!(integrator, segment_endpoint)
         run_due_sampled_tasks!(integrator.scheduler, runtime, segment_endpoint)
         Nonlinear.apply_power_semiconductor_bridge_gate_transitions!(
@@ -1003,6 +1180,9 @@ function _extended_vsc_network_window!(integrator, start_time_s, endpoint_time_s
             discontinuity_treatment=topology_invalidating ?
                 :two_backward_euler_half_steps : :none,
             discontinuity_reason=topology_invalidating ? :topology_change : :none,
+            accepted_substep_observer=(system, time_s, step_s, method, index) ->
+                _observe_extended_vsc_substep!(accounting, runtime, system,
+                    time_s, step_s, method, index),
         )
         result.accepted || throw(something(result.failure))
         runtime.maximum_nonlinear_kcl_residual_a = max(
@@ -1011,38 +1191,8 @@ function _extended_vsc_network_window!(integrator, start_time_s, endpoint_time_s
         )
         runtime.last_nonlinear_kcl_residual_a =
             result.diagnostics.maximum_kcl_residual_a
-        final_measurement = _extended_vsc_measurement(runtime, segment_endpoint)
-        final_accounting = _extended_vsc_power(
-            runtime,
-            final_measurement,
-            segment_endpoint,
-        )
-        final_stored_energy_j = _extended_vsc_stored_energy(runtime)
-        final_linear_companion = _extended_vsc_linear_companion_accounting(runtime)
-        linear_companion_energy_residual_j = 0.5 * segment_step * (
-            initial_linear_companion.capacitor_power_w +
-            final_linear_companion.capacitor_power_w +
-            initial_linear_companion.inductor_power_w +
-            final_linear_companion.inductor_power_w -
-            initial_linear_companion.inductor_dissipated_power_w -
-            final_linear_companion.inductor_dissipated_power_w
-        ) - (
-            final_linear_companion.capacitor_stored_energy_j -
-            initial_linear_companion.capacitor_stored_energy_j +
-            final_linear_companion.inductor_stored_energy_j -
-            initial_linear_companion.inductor_stored_energy_j
-        )
-        runtime.cumulative_linear_companion_energy_residual_j +=
-            linear_companion_energy_residual_j
-        runtime.cumulative_energy_residual_j += 0.5 * segment_step * (
-            initial_accounting.external_power_w -
-            initial_accounting.dissipated_power_w +
-            final_accounting.external_power_w -
-            final_accounting.dissipated_power_w
-        ) - (final_stored_energy_j - initial_stored_energy_j) -
-            (final_accounting.bridge.companion_energy_residual_j -
-             initial_companion_energy_residual_j) -
-            linear_companion_energy_residual_j
+        _accumulate_extended_vsc_conservation!(runtime,
+            accounting.energy_residual_j, accounting.linear_companion_defect_j)
         current_time = segment_endpoint
     end
     return runtime
@@ -1366,6 +1516,16 @@ function _extended_vsc_signature(recorder, runtime)
     return bytes2hex(sha256(take!(io)))
 end
 
+function _extended_vsc_reported_energy_ratio(residual, scale)
+    exact_ratio = _with_extended_vsc_accounting_precision(residual, scale) do
+        abs(residual) / scale
+    end
+    reported = Float64(exact_ratio)
+    isfinite(exact_ratio) && isfinite(reported) || throw(DomainError(exact_ratio,
+        "extended VSC energy ratio is outside finite report storage"))
+    return (; numerator=residual, scale, exact_ratio, reported)
+end
+
 function _extended_vsc_metrics(integrator)
     recorder = integrator.recorder
     runtime = integrator.runtime
@@ -1394,7 +1554,7 @@ function _extended_vsc_metrics(integrator)
         maximum(recorder.nodal_kcl_residual_a),
         maximum(recorder.nonlinear_kcl_residual_a),
         abs(bridge.terminal_kcl_residual_a),
-        abs(energy_residual) / energy_scale,
+        _extended_vsc_reported_energy_ratio(energy_residual, energy_scale).reported,
         minimum(recorder.dc_link_voltage_v),
         maximum(abs, recorder.converter_current_a),
         neutral_kcl,
