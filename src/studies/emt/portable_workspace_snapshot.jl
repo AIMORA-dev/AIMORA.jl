@@ -16,18 +16,28 @@ end
 function _portable_dyadic_history_value(value::BigFloat)
     isfinite(value) || _portable_emt_fail(:invalid_state_value,"nonfinite represented physical history")
     exact=Rational{BigInt}(value)
-    return "represented_binary_v1:"*string(precision(value))*":"*string(numerator(exact))*":"*string(denominator(exact))
+    return "represented_binary_v2:"*string(precision(value))*":"*string(numerator(exact))*":"*string(denominator(exact))*":"*(iszero(value)&&signbit(value) ? "1" : "0")
 end
 function _portable_dyadic_history_decode(value,identity)
     value isa String || _portable_emt_fail(:state_type_mismatch,"represented binary history missing at $identity")
     parts=split(value,':')
-    length(parts)==4 && parts[1]=="represented_binary_v1" || _portable_emt_fail(:state_type_mismatch,"unknown binary history at $identity")
+    legacy=length(parts)==4 && parts[1]=="represented_binary_v1"
+    signed=length(parts)==5 && parts[1]=="represented_binary_v2"
+    legacy || signed || _portable_emt_fail(:state_type_mismatch,"unknown binary history at $identity")
     try
         bits=parse(Int,parts[2]);bits>0 || error("invalid precision")
         n=parse(BigInt,parts[3]);d=parse(BigInt,parts[4]);d>0&&ispow2(d)||error("not dyadic")
         exact=n//d
+        negative_zero=false
+        if signed
+            parts[5] in ("0","1") || error("invalid zero sign")
+            negative_zero=parts[5]=="1"
+            negative_zero && !iszero(n) && error("zero sign on a nonzero history")
+        end
         string(bits)==parts[2]&&string(numerator(exact))==parts[3]&&string(denominator(exact))==parts[4]||error("noncanonical")
-        result=setprecision(BigFloat,bits) do;BigFloat(numerator(exact))/BigFloat(denominator(exact));end
+        result=setprecision(BigFloat,bits) do
+            negative_zero ? -BigFloat(0) : BigFloat(numerator(exact))/BigFloat(denominator(exact))
+        end
         isfinite(result)&&Rational{BigInt}(result)==exact||error("precision loss")
         return result
     catch error

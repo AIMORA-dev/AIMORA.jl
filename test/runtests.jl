@@ -20,6 +20,7 @@ include("measurement_chains.jl")
 include("protection_platform.jl")
 include("surge_insulation.jl")
 include("portable_emt_snapshots.jl")
+include("portable_companion_histories.jl")
 include("converter_systems.jl")
 
 @testset "public package isolation" begin
