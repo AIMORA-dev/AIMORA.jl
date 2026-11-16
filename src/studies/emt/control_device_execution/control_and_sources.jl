@@ -73,7 +73,8 @@ function _control_system_device_steady_state_value(
     elseif row.device_type in (51, 52)
         return p3 <= -1.0 ? (p1 == 0.0 ? weighted_input : p1 * weighted_input) : 0.0
     elseif row.device_type == 53
-        return 0.0
+        initialize_from_input = state.parsup_values[row.parsup_index + 3] != 0.0
+        return initialize_from_input ? weighted_input : 0.0
     elseif row.device_type == 55
         return p2 == 1.0 ? _control_system_digitizer_value(state, row, weighted_input) : 0.0
     elseif row.device_type == 56
@@ -117,13 +118,73 @@ function _control_system_device_steady_state_value(
     return 0.0
 end
 
+function _control_system_steady_state_input_slots(
+    state::OVER16CSUPState,
+    row::OVER16CSUPDeviceRow,
+)
+    p1 = state.parsup_values[row.parsup_index]
+    p2 = row.device_type == 66 ? 0.0 : state.parsup_values[row.parsup_index + 1]
+    if row.device_type == 60
+        selector = trunc(Int, p2)
+        return 1 <= selector <= 3 ? [row.input_terms[4 - selector].xtcs_index] : Int[]
+    elseif row.device_type == 61
+        selector = trunc(Int, p1)
+        if 1 <= selector <= 5
+            index = length(row.input_terms) - selector + 1
+            return 1 <= index <= length(row.input_terms) ?
+                [row.input_terms[index].xtcs_index] : Int[]
+        end
+        return selector == 6 ? [row.control_index] : Int[]
+    end
+    uses_weighted_input = if row.device_type in (51, 52)
+        state.parsup_values[row.parsup_index + 2] <= -1.0
+    elseif row.device_type == 53
+        state.parsup_values[row.parsup_index + 3] != 0.0
+    elseif row.device_type in (55, 56)
+        p2 == 1.0
+    elseif row.device_type == 62
+        p2 > 1.5
+    elseif row.device_type == 64
+        p1 != 0.0
+    else
+        row.device_type == 66
+    end
+    uses_weighted_input || return Int[]
+    terms = filter(term -> term.xtcs_index != 0, row.input_terms)
+    if length(terms) == 2
+        first_term, second_term = terms
+        if first_term.xtcs_index == second_term.xtcs_index &&
+           abs(first_term.scale) == 1.0 && first_term.scale == -second_term.scale
+            return Int[]
+        end
+    end
+    return [term.xtcs_index for term in terms]
+end
+
 function _initialize_control_system_device_histories!(
     runtime::ControlSystemSupplementalDeviceRuntime,
 )
     runtime.initialized && return runtime
-    for (index, row) in enumerate(runtime.rows)
-        output = _control_system_device_steady_state_value(runtime.state, row)
-        runtime.state.xtcs_values[runtime.device_output_slots[index]] = output
+    output_owners = Dict(slot => index for (index, slot) in enumerate(runtime.device_output_slots))
+    visit_state = zeros(UInt8, length(runtime.rows))
+    function initialize_output!(index::Int)
+        visit_state[index] == 2 && return
+        visit_state[index] == 1 && throw(ArgumentError(
+            "control-system steady-state outputs contain an unresolved dependency cycle",
+        ))
+        visit_state[index] = 1
+        row = runtime.rows[index]
+        for slot in _control_system_steady_state_input_slots(runtime.state, row)
+            dependency = get(output_owners, slot, 0)
+            dependency == 0 || initialize_output!(dependency)
+        end
+        runtime.state.xtcs_values[runtime.device_output_slots[index]] =
+            _control_system_device_steady_state_value(runtime.state, row)
+        visit_state[index] = 2
+        return
+    end
+    for index in eachindex(runtime.rows)
+        initialize_output!(index)
     end
     for (index, row) in enumerate(runtime.rows)
         weighted_input = _control_system_device_weighted_input(runtime.state, row)
@@ -161,6 +222,44 @@ function _initialize_control_system_device_histories!(
     return runtime
 end
 
+function _record_control_system_transport_input!(
+    runtime::ControlSystemSupplementalDeviceRuntime,
+    index::Int,
+    input_value::Float64,
+)
+    row = runtime.rows[index]
+    pointer = runtime.transport_delay_pointers[index]
+    runtime.state.parsup_values[pointer] = input_value
+    history_start = trunc(Int, runtime.state.parsup_values[row.parsup_index])
+    history_count = trunc(Int, runtime.state.parsup_values[row.parsup_index + 2])
+    pointer += 1
+    runtime.transport_delay_pointers[index] =
+        pointer == history_start + history_count ? history_start : pointer
+    runtime.rows[index] = over16_csup_device_row(
+        row.supplemental_index,
+        row.device_type,
+        row.parsup_index;
+        input_terms = row.input_terms,
+        control_index = row.control_index,
+        reference_index = runtime.transport_delay_pointers[index],
+    )
+    return runtime
+end
+
+function _record_control_system_transport_time_zero!(runtime::ControlSystemNetworkRuntime)
+    supplemental = runtime.supplemental_devices
+    supplemental === nothing && return runtime
+    for (index, name) in enumerate(supplemental.ordinary_signal_names)
+        supplemental.state.xtcs_values[index] = get(runtime.state.values, name, 0.0)
+    end
+    for (index, row) in enumerate(supplemental.rows)
+        row.device_type == 53 || continue
+        input_value = _control_system_device_weighted_input(supplemental.state, row)
+        _record_control_system_transport_input!(supplemental, index, input_value)
+    end
+    return runtime
+end
+
 function _advance_control_system_supplemental_devices!(
     runtime::ControlSystemSupplementalDeviceRuntime,
     state::ControlSystemExecutionState,
@@ -183,20 +282,8 @@ function _advance_control_system_supplemental_devices!(
     )
     for (index, row) in enumerate(runtime.rows)
         row.device_type == 53 || continue
-        pointer = runtime.transport_delay_pointers[index]
-        runtime.state.parsup_values[pointer] = update.weighted_input_values[index]
-        history_start = trunc(Int, runtime.state.parsup_values[row.parsup_index])
-        history_count = trunc(Int, runtime.state.parsup_values[row.parsup_index + 2])
-        pointer += 1
-        runtime.transport_delay_pointers[index] =
-            pointer == history_start + history_count ? history_start : pointer
-        runtime.rows[index] = over16_csup_device_row(
-            row.supplemental_index,
-            row.device_type,
-            row.parsup_index;
-            input_terms = row.input_terms,
-            control_index = row.control_index,
-            reference_index = runtime.transport_delay_pointers[index],
+        _record_control_system_transport_input!(
+            runtime, index, update.weighted_input_values[index],
         )
     end
     for index in eachindex(runtime.device_output_names)
@@ -629,7 +716,8 @@ end
 
 function _initialize_control_system_network_steady_state!(
     runtime::ControlSystemNetworkRuntime,
-    network_voltage::AbstractVector{<:Real},
+    network_voltage::AbstractVector{<:Real};
+    parsed::DeckParser.DeckParseResult,
 )
     for index in eachindex(runtime.network_voltage_source_names)
         runtime.state.values[runtime.network_voltage_source_names[index]] =
@@ -639,6 +727,14 @@ function _initialize_control_system_network_steady_state!(
     initialize_control_function_steady_state!(runtime.state)
     supplemental = runtime.supplemental_devices
     if supplemental !== nothing
+        # Rebuild declared parameters after the actual initial network values
+        # are known, then retain the existing mutable runtime owners.
+        initialized = _control_system_supplemental_device_runtime(
+            parsed,
+            runtime.state,
+            runtime.state.deltat_s,
+        )
+        restore_timestep_state!(supplemental, initialized)
         for (index, name) in enumerate(supplemental.ordinary_signal_names)
             supplemental.state.xtcs_values[index] =
                 get(runtime.state.values, name, 0.0)
@@ -661,13 +757,15 @@ end
 
 function _initialize_control_system_network_steady_state!(
     context::EMTStepContext,
-    network_voltage::AbstractVector{<:Real},
+    network_voltage::AbstractVector{<:Real};
+    parsed::DeckParser.DeckParseResult,
 )
     runtime = context.control_system_runtime
     runtime === nothing && return nothing
     return _initialize_control_system_network_steady_state!(
         runtime,
-        network_voltage,
+        network_voltage;
+        parsed,
     )
 end
 

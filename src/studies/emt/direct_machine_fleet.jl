@@ -266,7 +266,8 @@ function run_deck_direct_machine_fleet_horizon(
     control_runtime === nothing ||
         _initialize_control_system_network_steady_state!(
             control_runtime,
-            context.system.v,
+            context.system.v;
+            parsed,
         )
     control_output_names = sort!(
         unique(Symbol[

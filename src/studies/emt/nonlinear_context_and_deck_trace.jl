@@ -1979,7 +1979,8 @@ function _prepare_dynamic_deck_runtime(
     steady_state_initial_sample === nothing ||
         _initialize_control_system_network_steady_state!(
             context,
-            context.system.v,
+            context.system.v;
+            parsed,
         )
     initialize_dc_simulator_sources!(plan, over16_state.source.e_values)
     _initialize_source_function_state!(context, over16_state, plan)

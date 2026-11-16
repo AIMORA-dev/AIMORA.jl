@@ -47,6 +47,7 @@ function _control_system_frequency_device_value(
     state::OVER16CSUPState,
     row::OVER16CSUPDeviceRow,
     angular_frequency::Float64,
+    dt_s::Float64,
 )
     input = _control_system_frequency_weighted_input(phasors, row)
     p1 = state.parsup_values[row.parsup_index]
@@ -57,7 +58,8 @@ function _control_system_frequency_device_value(
         return p3 <= -1.0 ? (p1 == 0.0 ? input : p1 * input) : 0.0 + 0.0im
     elseif row.device_type == 53
         state.parsup_values[row.parsup_index + 3] == 0.0 && return 0.0 + 0.0im
-        phase_shift = angular_frequency * p3 * state.parsup_values[row.parsup_index + 1]
+        row.control_index == 0 && p2 == 0.0 && return input
+        phase_shift = angular_frequency * dt_s * p3
         return input * cis(-phase_shift)
     elseif row.device_type == 59
         return p3 == 1.0 ? im * angular_frequency * input : 0.0 + 0.0im
@@ -178,6 +180,7 @@ function _control_system_frequency_initializations(
                         supplemental.state,
                         row,
                         angular_frequency,
+                        state.deltat_s,
                     )
             end
         end
@@ -284,19 +287,6 @@ function _apply_control_system_frequency_initializations!(
                     supplemental.state.parsup_values[history_index] +=
                         real(input * cis(-angular_frequency * runtime.state.deltat_s * lag))
                 end
-                pointer = supplemental.transport_delay_pointers[index]
-                supplemental.state.parsup_values[pointer] = real(input)
-                pointer += 1
-                pointer == history_start + history_count && (pointer = history_start)
-                supplemental.transport_delay_pointers[index] = pointer
-                supplemental.rows[index] = over16_csup_device_row(
-                    row.supplemental_index,
-                    row.device_type,
-                    row.parsup_index;
-                    input_terms = row.input_terms,
-                    control_index = row.control_index,
-                    reference_index = pointer,
-                )
             elseif row.device_type == 59
                 supplemental.state.parsup_values[row.parsup_index + 1] += real(input)
             end
@@ -307,5 +297,6 @@ function _apply_control_system_frequency_initializations!(
                 supplemental.state.xtcs_values[output_slot]
         end
     end
+    _record_control_system_transport_time_zero!(runtime)
     return runtime
 end

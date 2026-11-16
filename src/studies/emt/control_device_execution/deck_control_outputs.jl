@@ -328,6 +328,7 @@ function _deck_control_system_network_runtime(
         false,
         nothing,
     )
+    _record_control_system_transport_time_zero!(runtime)
     return runtime
 end
 
@@ -686,7 +687,8 @@ function _deck_control_system_trace_outputs(
     initial_network_voltage === nothing ||
         _initialize_control_system_network_steady_state!(
             runtime,
-            initial_network_voltage,
+            initial_network_voltage;
+            parsed,
         )
     values = Matrix{Float64}(undef, switch_count + output_count, length(trace.time_s))
     for sample_index in eachindex(trace.time_s)
