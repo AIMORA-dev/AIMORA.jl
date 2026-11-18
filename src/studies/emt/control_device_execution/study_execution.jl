@@ -470,7 +470,8 @@ function _run_deck_emt(
     initial_control_voltage === nothing ||
         _initialize_control_system_network_steady_state!(
             context,
-            initial_control_voltage,
+            initial_control_voltage;
+            parsed,
         )
     trace = run_deck_emt(context; initial_voltage_sample = initial_sample)
     trace = _append_deck_control_system_outputs(

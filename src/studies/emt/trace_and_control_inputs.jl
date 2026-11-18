@@ -2304,7 +2304,7 @@ function _append_control_system_device_parameters!(
         history_start = base + 4
         delay_output_initial = reference_is_value ? 0.0 : p1
         history_values = zeros(Float64, history_count)
-        reference_is_value && (history_values[1] = p1)
+        reference_is_value && fill!(history_values, p1)
         append!(
             values,
             (
