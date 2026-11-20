@@ -677,7 +677,8 @@ end
 function _deck_control_system_trace_outputs(
     parsed::DeckParser.DeckParseResult,
     trace::DeckEMTTrace,
-    initial_network_voltage::Union{Nothing,AbstractVector{<:Real}}=nothing,
+    initial_network_voltage::Union{Nothing,AbstractVector{<:Real}}=nothing;
+    steady_state_sample = nothing,
 )
     runtime = _deck_control_system_network_runtime(parsed, trace.dt_s, parsed.elements)
     runtime === nothing && return nothing
@@ -689,6 +690,7 @@ function _deck_control_system_trace_outputs(
             runtime,
             initial_network_voltage;
             parsed,
+            steady_state_sample,
         )
     values = Matrix{Float64}(undef, switch_count + output_count, length(trace.time_s))
     for sample_index in eachindex(trace.time_s)
@@ -781,7 +783,8 @@ end
 function _append_deck_control_system_outputs(
     trace::DeckEMTTrace,
     parsed::DeckParser.DeckParseResult,
-    initial_network_voltage::Union{Nothing,AbstractVector{<:Real}}=nothing,
+    initial_network_voltage::Union{Nothing,AbstractVector{<:Real}}=nothing;
+    steady_state_sample = nothing,
 )
     switch_spec = _deck_control_system_switch_current_spec(parsed)
     embedded_names = Symbol[]
@@ -794,7 +797,8 @@ function _append_deck_control_system_outputs(
     outputs = _deck_control_system_trace_outputs(
         parsed,
         trace,
-        initial_network_voltage,
+        initial_network_voltage;
+        steady_state_sample,
     )
     outputs === nothing && return trace
     appended_extrema = _sampled_trace_extrema(outputs.values, trace.time_s)

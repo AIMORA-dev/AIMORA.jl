@@ -713,16 +713,47 @@ function _advance_control_system_network_runtime!(
     end
 end
 
+function _control_system_network_phasors(
+    runtime::ControlSystemNetworkRuntime,
+    sample,
+)
+    phasors = Dict{Symbol,Tuple{Float64,ComplexF64}}()
+    hasproperty(sample, :node_voltage_phasors) &&
+        hasproperty(sample, :node_steady_state_frequencies_hz) || return phasors
+    for (index, name) in enumerate(runtime.network_voltage_source_names)
+        node = runtime.network_voltage_source_node_indices[index]
+        node <= length(sample.node_steady_state_frequencies_hz) || continue
+        frequency = sample.node_steady_state_frequencies_hz[node]
+        isfinite(frequency) && frequency > 0.0 || continue
+        projected = any(runtime.switch_elements) do switch
+            switch.last_conductance == switch.on_conductance &&
+                (switch.a == node || switch.b == node)
+        end
+        projected && continue
+        phasor = sample.node_voltage_phasors[node]
+        runtime.state.values[name] == real(phasor) || continue
+        phasors[name] = (frequency, phasor)
+    end
+    return phasors
+end
+
 function _initialize_control_system_network_steady_state!(
     runtime::ControlSystemNetworkRuntime,
     network_voltage::AbstractVector{<:Real};
     parsed::DeckParser.DeckParseResult,
+    steady_state_sample = nothing,
 )
     for index in eachindex(runtime.network_voltage_source_names)
         runtime.state.values[runtime.network_voltage_source_names[index]] =
             Float64(network_voltage[runtime.network_voltage_source_node_indices[index]])
     end
     _project_closed_controlled_switch_voltages!(runtime, network_voltage)
+    network_phasors = _control_system_network_phasors(runtime, steady_state_sample)
+    # The frequency initializer restores these voltages at t = 0.
+    # Exclude them from the DC solve and history fill to avoid adding them twice.
+    for name in keys(network_phasors)
+        runtime.state.values[name] = 0.0
+    end
     initialize_control_function_steady_state!(runtime.state)
     supplemental = runtime.supplemental_devices
     if supplemental !== nothing
@@ -746,7 +777,11 @@ function _initialize_control_system_network_steady_state!(
                 ]
         end
     end
-    _apply_control_system_frequency_initializations!(runtime)
+    initializations = isempty(network_phasors) ? runtime.frequency_initializations :
+        _control_system_frequency_initializations(
+            runtime.state, supplemental, runtime.sinusoidal_sources, network_phasors,
+        )
+    _apply_control_system_frequency_initializations!(runtime, initializations)
     _set_controlled_switch_inputs!(runtime)
     for switch in runtime.switch_elements
         sync_controlled_switch!(switch, 0.0)
@@ -758,6 +793,7 @@ function _initialize_control_system_network_steady_state!(
     context::EMTStepContext,
     network_voltage::AbstractVector{<:Real};
     parsed::DeckParser.DeckParseResult,
+    steady_state_sample = nothing,
 )
     runtime = context.control_system_runtime
     runtime === nothing && return nothing
@@ -765,6 +801,7 @@ function _initialize_control_system_network_steady_state!(
         runtime,
         network_voltage;
         parsed,
+        steady_state_sample,
     )
 end
 

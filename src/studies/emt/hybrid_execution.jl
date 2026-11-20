@@ -1304,7 +1304,8 @@ function _emt_hybrid_trace(integrator::EMTHybridStepIntegrator)
     return _append_deck_control_system_outputs(
         trace,
         workspace.parsed,
-        initial_control_voltage,
+        initial_control_voltage;
+        steady_state_sample = workspace.runtime.steady_state_initial_sample,
     )
 end
 

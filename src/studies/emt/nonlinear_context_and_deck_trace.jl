@@ -1981,6 +1981,7 @@ function _prepare_dynamic_deck_runtime(
             context,
             context.system.v;
             parsed,
+            steady_state_sample = steady_state_initial_sample,
         )
     initialize_dc_simulator_sources!(plan, over16_state.source.e_values)
     _initialize_source_function_state!(context, over16_state, plan)

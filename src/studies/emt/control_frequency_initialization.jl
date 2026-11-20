@@ -91,10 +91,11 @@ function _control_system_frequency_initializations(
     state::ControlSystemExecutionState,
     supplemental::Union{Nothing,ControlSystemSupplementalDeviceRuntime},
     sources::Vector{SinusoidalControlSignal},
+    network_phasors::Dict{Symbol,Tuple{Float64,ComplexF64}} =
+        Dict{Symbol,Tuple{Float64,ComplexF64}}(),
 )
-    frequencies = sort!(unique(
-        source.frequency_hz for source in sources if source.start_time_s < 0.0
-    ))
+    frequencies = Set(source.frequency_hz for source in sources if source.start_time_s < 0.0)
+    union!(frequencies, (frequency for (frequency, _) in values(network_phasors)))
     ordinary_signal_names =
         supplemental === nothing ?
         sort!(collect(keys(state.values)); by = String) :
@@ -103,7 +104,7 @@ function _control_system_frequency_initializations(
         name => index for (index, name) in enumerate(ordinary_signal_names)
     )
     initializations = ControlSystemFrequencyInitialization[]
-    for frequency_hz in frequencies
+    for frequency_hz in sort!(collect(frequencies))
         phasor_count =
             supplemental === nothing ?
             length(ordinary_signal_names) :
@@ -118,6 +119,12 @@ function _control_system_frequency_initializations(
             ))
             phasors[slot] += sinusoidal_control_signal_phasor(source)
             push!(source_names, source.name)
+        end
+        for name in sort!(collect(keys(network_phasors)); by = String)
+            frequency, phasor = network_phasors[name]
+            frequency == frequency_hz || continue
+            phasors[ordinary_slots[name]] += phasor
+            push!(source_names, name)
         end
         angular_frequency = 2.0 * pi * frequency_hz
         function_count = length(state.functions)
@@ -215,9 +222,10 @@ end
 
 function _apply_control_system_frequency_initializations!(
     runtime::ControlSystemNetworkRuntime,
+    initializations::Vector{ControlSystemFrequencyInitialization} = runtime.frequency_initializations,
 )
     supplemental = runtime.supplemental_devices
-    for initialization in runtime.frequency_initializations
+    for initialization in initializations
         angular_frequency = 2.0 * pi * initialization.frequency_hz
         ordinary_names =
             supplemental === nothing ?

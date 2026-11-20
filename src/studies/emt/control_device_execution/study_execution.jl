@@ -472,12 +472,14 @@ function _run_deck_emt(
             context,
             initial_control_voltage;
             parsed,
+            steady_state_sample = initial_sample,
         )
     trace = run_deck_emt(context; initial_voltage_sample = initial_sample)
     trace = _append_deck_control_system_outputs(
         trace,
         parsed,
-        initial_sample === nothing ? nothing : initial_control_voltage,
+        initial_sample === nothing ? nothing : initial_control_voltage;
+        steady_state_sample = initial_sample,
     )
     return _deck_emt_execution_result(
         trace,
@@ -1260,7 +1262,8 @@ function evaluate_emt_study!(workspace::EMTStudyWorkspace)
     trace = _append_deck_control_system_outputs(
         requested_trace,
         workspace.parsed,
-        initial_control_voltage,
+        initial_control_voltage;
+        steady_state_sample = workspace.runtime.steady_state_initial_sample,
     )
     workspace.evaluation_count += 1
     return trace
