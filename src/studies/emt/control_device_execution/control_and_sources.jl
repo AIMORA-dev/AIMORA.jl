@@ -282,9 +282,8 @@ function _advance_control_system_supplemental_devices!(
     )
     for (index, row) in enumerate(runtime.rows)
         row.device_type == 53 || continue
-        _record_control_system_transport_input!(
-            runtime, index, update.weighted_input_values[index],
-        )
+        input_value = _control_system_device_weighted_input(runtime.state, row)
+        _record_control_system_transport_input!(runtime, index, input_value)
     end
     for index in eachindex(runtime.device_output_names)
         state.values[runtime.device_output_names[index]] =

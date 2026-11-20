@@ -500,7 +500,6 @@ function _append_restart_control_outputs(
     trace::DeckEMTTrace,
     full_trace::DeckEMTTrace,
     parsed::DeckParser.DeckParseResult,
-    checkpoint_sample_count::Int,
 )
     names = Symbol[]
     switch_spec = _deck_control_system_switch_current_spec(parsed)
@@ -516,17 +515,6 @@ function _append_restart_control_outputs(
         push!(indices, index)
     end
     values = copy(full_trace.output_pu[indices, :])
-    if checkpoint_sample_count > 0
-        original_outputs = _deck_control_system_trace_outputs(parsed, trace)
-        original_outputs === nothing && throw(ArgumentError(
-            "restart checkpoint control outputs could not be reconstructed",
-        ))
-        original_outputs.output_names == names || throw(ArgumentError(
-            "restart checkpoint control output order changed",
-        ))
-        values[:, 1:checkpoint_sample_count] .=
-            original_outputs.values[:, 1:checkpoint_sample_count]
-    end
     extrema = _sampled_trace_extrema(values, trace.time_s)
     return DeckEMTTrace(
         trace.source,
@@ -582,7 +570,6 @@ function restart_emt_study!(
         context.system.v .- context.voltage_pu[:, checkpoint_column];
         init = 0.0,
     )
-    checkpoint_sample_count = length(context.recorded_step_indices)
 
     mutation_records = EMTRestartMutationRecord[]
     ordered_mutations = Any[
@@ -616,7 +603,6 @@ function restart_emt_study!(
         requested_trace,
         boundary_run.trace,
         workspace.parsed,
-        checkpoint_sample_count,
     )
     workspace.evaluation_count += 1
     return EMTRestartRun(
