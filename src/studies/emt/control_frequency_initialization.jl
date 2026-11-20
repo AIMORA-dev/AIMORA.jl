@@ -180,8 +180,8 @@ function _control_system_frequency_initializations(
             end
         end
         if supplemental !== nothing
-            for (index, row) in enumerate(supplemental.rows)
-                phasors[supplemental.device_output_slots[index]] =
+            _initialize_control_system_device_outputs!(supplemental; frequency_domain = true) do slot, row
+                phasors[slot] =
                     _control_system_frequency_device_value(
                         phasors,
                         supplemental.state,

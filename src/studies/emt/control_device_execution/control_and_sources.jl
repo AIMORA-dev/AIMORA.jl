@@ -120,7 +120,8 @@ end
 
 function _control_system_steady_state_input_slots(
     state::OVER16CSUPState,
-    row::OVER16CSUPDeviceRow,
+    row::OVER16CSUPDeviceRow;
+    frequency_domain::Bool = false,
 )
     p1 = state.parsup_values[row.parsup_index]
     p2 = row.device_type == 66 ? 0.0 : state.parsup_values[row.parsup_index + 1]
@@ -141,13 +142,15 @@ function _control_system_steady_state_input_slots(
     elseif row.device_type == 53
         state.parsup_values[row.parsup_index + 3] != 0.0
     elseif row.device_type in (55, 56)
-        p2 == 1.0
+        !frequency_domain && p2 == 1.0
+    elseif row.device_type == 59
+        frequency_domain && state.parsup_values[row.parsup_index + 2] == 1.0
     elseif row.device_type == 62
-        p2 > 1.5
+        frequency_domain ? p2 >= 1.5 : p2 > 1.5
     elseif row.device_type == 64
-        p1 != 0.0
+        !frequency_domain && p1 != 0.0
     else
-        row.device_type == 66
+        !frequency_domain && row.device_type == 66
     end
     uses_weighted_input || return Int[]
     terms = filter(term -> term.xtcs_index != 0, row.input_terms)
@@ -161,10 +164,11 @@ function _control_system_steady_state_input_slots(
     return [term.xtcs_index for term in terms]
 end
 
-function _initialize_control_system_device_histories!(
-    runtime::ControlSystemSupplementalDeviceRuntime,
+function _initialize_control_system_device_outputs!(
+    evaluate_output!,
+    runtime::ControlSystemSupplementalDeviceRuntime;
+    frequency_domain::Bool = false,
 )
-    runtime.initialized && return runtime
     output_owners = Dict(slot => index for (index, slot) in enumerate(runtime.device_output_slots))
     visit_state = zeros(UInt8, length(runtime.rows))
     function initialize_output!(index::Int)
@@ -174,17 +178,27 @@ function _initialize_control_system_device_histories!(
         ))
         visit_state[index] = 1
         row = runtime.rows[index]
-        for slot in _control_system_steady_state_input_slots(runtime.state, row)
+        for slot in _control_system_steady_state_input_slots(runtime.state, row; frequency_domain)
             dependency = get(output_owners, slot, 0)
             dependency == 0 || initialize_output!(dependency)
         end
-        runtime.state.xtcs_values[runtime.device_output_slots[index]] =
-            _control_system_device_steady_state_value(runtime.state, row)
+        evaluate_output!(runtime.device_output_slots[index], row)
         visit_state[index] = 2
         return
     end
     for index in eachindex(runtime.rows)
         initialize_output!(index)
+    end
+    return nothing
+end
+
+function _initialize_control_system_device_histories!(
+    runtime::ControlSystemSupplementalDeviceRuntime,
+)
+    runtime.initialized && return runtime
+    _initialize_control_system_device_outputs!(runtime) do slot, row
+        runtime.state.xtcs_values[slot] =
+            _control_system_device_steady_state_value(runtime.state, row)
     end
     for (index, row) in enumerate(runtime.rows)
         weighted_input = _control_system_device_weighted_input(runtime.state, row)
