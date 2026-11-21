@@ -197,8 +197,17 @@ function _initialize_control_system_device_histories!(
 )
     runtime.initialized && return runtime
     _initialize_control_system_device_outputs!(runtime) do slot, row
-        runtime.state.xtcs_values[slot] =
-            _control_system_device_steady_state_value(runtime.state, row)
+        state = runtime.state
+        if row.device_type == 66 && !runtime.initialize_rms_from_input[row.supplemental_index]
+            # VALUE is a signed input sample. The transient ring stores squares.
+            first_slot = row.parsup_index + 1
+            history = @view state.parsup_values[first_slot:(row.parsup_index + row.control_index)]
+            sample = first(history) + _control_system_device_weighted_input(state, row)
+            fill!(history, sample * sample)
+            state.xtcs_values[slot] = sqrt(sum(history) * state.parsup_values[row.parsup_index])
+        else
+            state.xtcs_values[slot] = _control_system_device_steady_state_value(state, row)
+        end
     end
     for (index, row) in enumerate(runtime.rows)
         weighted_input = _control_system_device_weighted_input(runtime.state, row)
@@ -795,7 +804,7 @@ function _initialize_control_system_network_steady_state!(
         _control_system_frequency_initializations(
             runtime.state, supplemental, runtime.sinusoidal_sources, network_phasors,
         )
-    _apply_control_system_frequency_initializations!(runtime, initializations)
+    _apply_control_system_frequency_initializations!(runtime, initializations, parsed)
     _set_controlled_switch_inputs!(runtime)
     for switch in runtime.switch_elements
         sync_controlled_switch!(switch, 0.0)

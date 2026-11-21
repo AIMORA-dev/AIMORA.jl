@@ -224,18 +224,23 @@ function _initialize_control_system_ac_rms_histories!(
     supplemental::ControlSystemSupplementalDeviceRuntime,
     initializations::Vector{ControlSystemFrequencyInitialization},
     dt_s::Float64,
+    parsed::DeckParser.DeckParseResult,
 )
     outputs = Pair{Int,Float64}[]
     isempty(initializations) && return outputs
     state = supplemental.state
+    declared_rows = DeckParser.deck_control_system_device_rows(parsed)
     for (index, row) in enumerate(supplemental.rows)
-        supplemental.initialize_rms_from_input[index] || continue
+        row.device_type == 66 || continue
         input_phasors = [
             _control_system_frequency_weighted_input(initialization.signal_phasors, row)
             for initialization in initializations
         ]
         all(iszero, input_phasors) && continue
         dc_input = _control_system_device_weighted_input(state, row)
+        if !supplemental.initialize_rms_from_input[index]
+            dc_input += declared_rows[index].parameter_values[2]
+        end
         sample_count = row.control_index
         history = @view state.parsup_values[(row.parsup_index + 1):(row.parsup_index + sample_count)]
         for (index_in_history, lag) in enumerate(sample_count:-1:1)
@@ -254,13 +259,14 @@ end
 
 function _apply_control_system_frequency_initializations!(
     runtime::ControlSystemNetworkRuntime,
-    initializations::Vector{ControlSystemFrequencyInitialization} = runtime.frequency_initializations,
+    initializations::Vector{ControlSystemFrequencyInitialization},
+    parsed::DeckParser.DeckParseResult,
 )
     supplemental = runtime.supplemental_devices
     # The DC input still has its sign here. Sum the physical samples before squaring.
     rms_outputs = supplemental === nothing ? Pair{Int,Float64}[] :
         _initialize_control_system_ac_rms_histories!(
-            supplemental, initializations, runtime.state.deltat_s,
+            supplemental, initializations, runtime.state.deltat_s, parsed,
         )
     for initialization in initializations
         angular_frequency = 2.0 * pi * initialization.frequency_hz
