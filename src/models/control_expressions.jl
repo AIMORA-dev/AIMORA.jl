@@ -78,6 +78,9 @@ const _BPA_CONTROL_EXPRESSION_INTRINSICS = Dict(
     :reciprocal => :bpa_reciprocal,
     :exponential => :bpa_exponential,
     :cotangent => :bpa_cotangent,
+    :degrees_to_radians => :bpa_degrees_to_radians,
+    :radians_to_degrees => :bpa_radians_to_degrees,
+    :sequence_six => :bpa_sequence_six,
 )
 
 function _control_expression_tokens(source_text::AbstractString)
@@ -237,14 +240,41 @@ function _parse_control_expression_comparison!(compiler::_ControlExpressionCompi
     end
 end
 
+function _emit_bpa_control_expression_terms!(
+    compiler::_ControlExpressionCompiler,
+    first_term_end::Int,
+    operation_offsets::Vector{Int},
+    start_value::Float64,
+    combine_operation::Symbol,
+)
+    # CSUP accumulates the terms from right to left and combines the first term last.
+    suffix = compiler.instructions[(first_term_end + 1):end]
+    resize!(compiler.instructions, first_term_end)
+    _control_expression_emit!(compiler, :literal; value = start_value)
+    for index in reverse(eachindex(operation_offsets))
+        term_start = index == 1 ? 1 : operation_offsets[index - 1] + 1
+        append!(compiler.instructions, @view suffix[term_start:operation_offsets[index]])
+    end
+    _control_expression_emit!(compiler, combine_operation)
+    return
+end
+
 function _parse_control_expression_additive!(compiler::_ControlExpressionCompiler)
     _parse_control_expression_multiplicative!(compiler)
+    _control_expression_current(compiler).kind in (:add, :subtract) || return
+
+    first_term_end = length(compiler.instructions)
+    operation_offsets = compiler.bpa_factor_arithmetic ? Int[] : nothing
     while _control_expression_current(compiler).kind in (:add, :subtract)
         operation = _control_expression_current(compiler).kind
         compiler.index += 1
         _parse_control_expression_multiplicative!(compiler)
         _control_expression_emit!(compiler, operation)
+        operation_offsets === nothing ||
+            push!(operation_offsets, length(compiler.instructions) - first_term_end)
     end
+    operation_offsets === nothing && return
+    _emit_bpa_control_expression_terms!(compiler, first_term_end, operation_offsets, 0.0, :add)
 end
 
 function _parse_control_expression_multiplicative!(compiler::_ControlExpressionCompiler)
@@ -265,18 +295,9 @@ function _parse_control_expression_multiplicative!(compiler::_ControlExpressionC
             push!(operation_offsets, length(compiler.instructions) - first_factor_end)
     end
     operation_offsets === nothing && return
-
-    # CSUP accumulates factors from right to left before multiplying by the first factor.
-    # The division guard applies to that accumulator and the current divisor.
-    suffix = compiler.instructions[(first_factor_end + 1):end]
-    resize!(compiler.instructions, first_factor_end)
-    _control_expression_emit!(compiler, :literal; value = 1.0)
-    for index in reverse(eachindex(operation_offsets))
-        factor_start = index == 1 ? 1 : operation_offsets[index - 1] + 1
-        append!(compiler.instructions, @view suffix[factor_start:operation_offsets[index]])
-    end
-    _control_expression_emit!(compiler, :multiply)
-    return
+    _emit_bpa_control_expression_terms!(
+        compiler, first_factor_end, operation_offsets, 1.0, :multiply,
+    )
 end
 
 function _parse_control_expression_unary!(compiler::_ControlExpressionCompiler)
@@ -355,7 +376,7 @@ end
 """
     compile_control_expression(output_name, source_text; bpa_factor_arithmetic=false)
 
-Compile a control expression. Fixed-card BPA deck intake selects legacy factor order
+Compile a control expression. Fixed-card BPA deck intake selects legacy evaluation order
 and guarded division and intrinsics. The retained Linux glibc profile uses system
 `log10` and `exp`. Other builds use Julia's functions and may round cutoff or pole
 arguments differently.
@@ -470,11 +491,21 @@ function _control_expression_unary(operation::Symbol, value::Float64)
         return _bpa_control_expression_divide(1.0, value)
     elseif operation == :degrees_to_radians
         return value * pi / 180.0
+    elseif operation == :bpa_degrees_to_radians
+        # Keep the intermediate rounding and overflow of CSUP's TWOPI product.
+        return value * (2.0 * pi) / 360.0
     elseif operation == :radians_to_degrees
         return value * 180.0 / pi
+    elseif operation == :bpa_radians_to_degrees
+        return value / (2.0 * pi) * 360.0
     elseif operation == :sequence_six
         integer_value = trunc(Int, value)
         return Float64(mod(integer_value - 1, 6) + 1)
+    elseif operation == :bpa_sequence_six
+        integer_value = trunc(Int32, value)
+        # CSUP's signed quotient cancels in the negative branch, leaving the input plus six.
+        sequence = integer_value < 0 ? integer_value + 6 : rem(integer_value, 6)
+        return iszero(sequence) ? 6.0 : Float64(sequence)
     elseif operation == :sign
         return value < 0.0 ? -1.0 : 1.0
     end
