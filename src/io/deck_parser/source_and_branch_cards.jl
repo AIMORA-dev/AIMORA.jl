@@ -1474,6 +1474,63 @@ function record_fixed_blocker!(result::DeckParseResult, family::Symbol, blocker:
     return record_card!(result, blocker)
 end
 
+function parse_fixed_branch_unit_request!(
+    result::DeckParseResult,
+    active_section,
+    line::AbstractString,
+    line_no::Int,
+)
+    fields = match(r"^\s*\$UNITS\s*,(.*)$"i, line)
+    values_text = fields === nothing ? String[] :
+        split(only(fields.captures), ','; keepempty = true)
+    if active_section ∉ (:blank_branch, :blank_switch, :blank_source,
+                           :blank_initial_condition_or_output, :blank_output, :blank_plot,
+                           :blank_universal_machine) ||
+       length(values_text) < 2
+        add_issue!(result.validation, invalid_value(
+            "line $line_no", "expected two comma-delimited \$UNITS fields in a fixed-field case",
+        ))
+        return nothing
+    end
+    # CIMAGE reads precisely two FREFLD values. Empty fields produce zero.
+    values = map(values_text[1:2]) do field
+        text = normalized_fortran_float_text(field)
+        isempty(text) ? 0.0 : tryparse(Float64, text)
+    end
+    if any(value -> value === nothing || !isfinite(value) || value < 0.0, values)
+        add_issue!(result.validation, invalid_value(
+            "line $line_no", "\$UNITS frequencies must be finite and nonnegative",
+        ))
+        return nothing
+    end
+    frequencies = (something(values[1]), something(values[2]))
+    push!(result.study_option_request_rows, DeckStudyOptionRequestRow(
+        line_no, :branch_units, collect(frequencies), Int[], String[], String(line),
+    ))
+    record_card!(result, :fixed_card_branch_units_request)
+    return frequencies
+end
+
+function fixed_branch_unit_override(result::DeckParseResult, frequencies)
+    frequencies === nothing && return nothing
+    options = deck_fixed_time_horizon_options(result)
+    return frequencies == (options.x_frequency_hz, options.c_frequency_hz) ? nothing :
+        frequencies
+end
+
+function steady_state_generated_branch_input_count(result::DeckParseResult)
+    return length(result.universal_machine_definition_rows) +
+           length(result.synchronous_machine_model_parameter_rows) +
+           length(result.zinc_oxide_nonlinear_rows) +
+           length(result.nonlinear_resistance_rows) +
+           length(result.triggered_timed_resistance_rows) +
+           length(result.switching_nonlinear_resistor_rows) +
+           length(result.piecewise_nonlinear_inductor_rows) +
+           length(result.hysteretic_inductor_rows) +
+           length(result.arrester_nonlinear_rows) +
+           get(result.card_counts, :fixed_card_saturated_transformer_intake, 0)
+end
+
 function push_bpa_fixed_branch_scalar_row!(
     result::DeckParseResult,
     from_node::AbstractString,
@@ -1489,15 +1546,16 @@ function push_bpa_fixed_branch_scalar_row!(
     inline_name::Union{Nothing,AbstractString}=nothing,
     output_image::Union{Nothing,AbstractString}=nothing,
     output_code::Union{Nothing,Int}=nothing,
+    unit_frequencies::Union{Nothing,Tuple{Float64,Float64}}=nothing,
 )::Bool
     name = bpa_fixed_owner_name(result, "branch"; explicit_name=inline_name)
     element_count_before = length(result.elements)
-    timestep_inductance = fixed_card_branch_timestep_inductance(result, inductance)
-    timestep_capacitance = fixed_card_branch_timestep_capacitance(
-        result,
-        capacitance;
-        legacy_microfarad_units = branch_layout_kind != :free_field,
-    )
+    options = deck_fixed_time_horizon_options(result)
+    x_frequency, c_frequency = unit_frequencies === nothing ?
+        (options.x_frequency_hz, options.c_frequency_hz) : unit_frequencies
+    timestep_inductance = fixed_card_branch_timestep_inductance(inductance, x_frequency)
+    timestep_capacitance = branch_layout_kind == :free_field ? capacitance :
+        fixed_card_branch_timestep_capacitance(capacitance, c_frequency)
     if !all(
         isfinite,
         (
@@ -3002,6 +3060,7 @@ function parse_bpa_fixed_branch_card!(
     line::AbstractString,
     line_no::Int;
     branch_vintage_mode::Int = 0,
+    unit_frequencies::Union{Nothing,Tuple{Float64,Float64}} = nothing,
 )::Bool
     image = fixed_image(line)
     initial_issues = length(result.validation.issues)
@@ -3067,7 +3126,8 @@ function parse_bpa_fixed_branch_card!(
             line_no,
             from_node,
             to_node,
-            initial_issues,
+            initial_issues;
+            unit_frequencies,
         )
     elseif grounded_scalar_branch_reference_row(image, from_node, to_node, aux_1, aux_2)
         return parse_fixed_grounded_scalar_branch_reference_row!(
@@ -3563,6 +3623,7 @@ function parse_bpa_fixed_branch_card!(
         branch_layout_count = layout_count,
         inline_name = inline_name,
         output_image = image,
+        unit_frequencies,
     )
 end
 

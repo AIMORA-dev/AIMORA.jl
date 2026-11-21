@@ -854,9 +854,13 @@ function fixed_card_branch_timestep_inductance(
     result::DeckParseResult,
     raw_inductance::Float64,
 )
+    return fixed_card_branch_timestep_inductance(
+        raw_inductance, deck_fixed_time_horizon_options(result).x_frequency_hz,
+    )
+end
+
+function fixed_card_branch_timestep_inductance(raw_inductance::Float64, x_frequency_hz::Float64)
     raw_inductance == 0.0 && return 0.0
-    options = deck_fixed_time_horizon_options(result)
-    x_frequency_hz = Float64(options.x_frequency_hz)
     return x_frequency_hz > 0.0 ?
         raw_inductance / (2.0 * pi * x_frequency_hz) :
         raw_inductance / 1000.0
@@ -868,10 +872,14 @@ function fixed_card_branch_timestep_capacitance(
     ;
     legacy_microfarad_units::Bool = true,
 )
-    raw_capacitance == 0.0 && return 0.0
     legacy_microfarad_units || return raw_capacitance
-    options = deck_fixed_time_horizon_options(result)
-    c_frequency_hz = Float64(options.c_frequency_hz)
+    return fixed_card_branch_timestep_capacitance(
+        raw_capacitance, deck_fixed_time_horizon_options(result).c_frequency_hz,
+    )
+end
+
+function fixed_card_branch_timestep_capacitance(raw_capacitance::Float64, c_frequency_hz::Float64)
+    raw_capacitance == 0.0 && return 0.0
     capacitance = raw_capacitance / 1.0e6
     return c_frequency_hz > 0.0 ?
         capacitance / (2.0 * pi * c_frequency_hz) :

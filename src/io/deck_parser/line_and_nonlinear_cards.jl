@@ -839,7 +839,8 @@ function parse_bpa_fixed_single_terminal_capacitance_row!(
     line_no::Int,
     from_node::AbstractString,
     to_node::AbstractString,
-    initial_issues::Int,
+    initial_issues::Int;
+    unit_frequencies::Union{Nothing,Tuple{Float64,Float64}} = nothing,
 )::Bool
     capacitance = fixed_float_field!(result, image, line_no, 39, 44, "branch_capacitance")
     capacitance === nothing && return true
@@ -857,6 +858,7 @@ function parse_bpa_fixed_single_terminal_capacitance_row!(
         initial_issues;
         branch_layout_count = :bpa_fixed_branch_single_terminal_capacitance,
         output_image = image,
+        unit_frequencies,
     )
 end
 

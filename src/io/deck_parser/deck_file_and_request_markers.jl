@@ -121,12 +121,20 @@ function parse_deck_lines(
     pending_semlyen_line = nothing
     pending_rational_frequency_line = nothing
     semlyen_transform_imaginary_parts = true
+    branch_unit_frequencies = nothing
+    preceding_steady_state_branch_inputs = 0
     fixed_branch_vintage_mode = 0
     fixed_card_kc_lee_transform_active = false
     fixed_source_load_flow_requested = false
     abort_data_case_line = nothing
     for (line_no, line) in deck_logical_records!(result, lines)
         tokens = deck_tokens(line)
+        if !isempty(tokens) && uppercase(tokens[1]) == "\$UNITS"
+            branch_unit_frequencies = parse_fixed_branch_unit_request!(
+                result, active_section, line, line_no,
+            )
+            continue
+        end
         if !isempty(result.control_system_switch_rows)
             delayed_arc_row = last(result.control_system_switch_rows)
             if delayed_arc_row.switching_delay_or_model !== missing &&
@@ -673,20 +681,20 @@ function parse_deck_lines(
             continue
         end
         output_end_sentinels_before = get(result.card_counts, :bpa_fixed_output_end_sentinel, 0)
-        short_section_marker = fixed_card_short_section_marker(active_section, tokens)
-        if short_section_marker !== nothing
-            record_control_card!(result, short_section_marker.kind, tokens, line_no)
-            active_section =
-                short_section_marker.kind == :fixed_card_source_section_end &&
-                fixed_source_load_flow_requested ?
-                :fixed_source_load_flow : short_section_marker.next_section
-            fixed_saturated_transformer_intake_active = false
-            fixed_branch_vintage_mode = 0
-            fixed_card_kc_lee_transform_active = false
-            continue
+        section_marker = fixed_card_short_section_marker(active_section, tokens)
+        if section_marker === nothing
+            section_marker = fixed_card_section_marker(tokens)
         end
-        section_marker = fixed_card_section_marker(tokens)
         if section_marker !== nothing
+            # OVER8 forms steady-state equivalents after source intake, before output cards.
+            if section_marker.kind == :fixed_card_source_section_end &&
+               fixed_branch_unit_override(result, branch_unit_frequencies) !== nothing &&
+               steady_state_generated_branch_input_count(result) > preceding_steady_state_branch_inputs
+                add_issue!(result.validation, unknown_field(
+                    "line $line_no",
+                    "\$UNITS is unsupported at steady-state machine or nonlinear branch insertion",
+                ))
+            end
             if section_marker.kind == :fixed_card_case_terminator
                 record_case_boundary!(result, :run_termination, tokens, line_no)
             end
@@ -741,6 +749,26 @@ function parse_deck_lines(
             fixed_saturated_transformer_intake_active = false
             fixed_branch_vintage_mode = 0
             fixed_card_kc_lee_transform_active = false
+            continue
+        end
+        branch_unit_override = fixed_branch_unit_override(result, branch_unit_frequencies)
+        if active_section == :blank_branch && branch_unit_override !== nothing &&
+           fixed_card_branch_vintage_mode(tokens) === nothing &&
+           !study_option_request_card(tokens)
+            previous_rows = length(result.over2_branch_rows)
+            accepted = parse_bpa_fixed_branch_card!(
+                result, line, line_no;
+                branch_vintage_mode = fixed_branch_vintage_mode,
+                unit_frequencies = branch_unit_override,
+            )
+            if !accepted || length(result.over2_branch_rows) != previous_rows + 1 ||
+               last(result.over2_branch_rows).source_kind != :scalar ||
+               last(result.over2_branch_rows).layout_kind == :free_field
+                add_issue!(result.validation, unknown_field(
+                    "line $line_no",
+                    "\$UNITS is supported for direct scalar fixed-field branches",
+                ))
+            end
             continue
         end
         if active_section === nothing &&
@@ -826,6 +854,15 @@ function parse_deck_lines(
             continue
         end
         if pending_universal_machine_data !== nothing
+            # OVER5A generates the machine branches after the U.M. input terminator.
+            if universal_machine_data_terminator(tokens) &&
+               pending_universal_machine_data.phase in (:await_terminator, :await_detailed_machine_terminator) &&
+               fixed_branch_unit_override(result, branch_unit_frequencies) !== nothing
+                add_issue!(result.validation, unknown_field(
+                    "line $line_no",
+                    "\$UNITS is unsupported at universal-machine branch insertion",
+                ))
+            end
             finished = parse_universal_machine_data_card!(
                 result,
                 pending_universal_machine_data,
@@ -1058,6 +1095,8 @@ function parse_deck_lines(
             pending_dc_simulator_source = nothing
             pending_semlyen_line = nothing
             pending_rational_frequency_line = nothing
+            branch_unit_frequencies = nothing
+            preceding_steady_state_branch_inputs = steady_state_generated_branch_input_count(result)
             fixed_branch_vintage_mode = 0
             fixed_card_kc_lee_transform_active = false
         end
@@ -1282,7 +1321,8 @@ function strip_deck_line(raw_line)::String
         return ""
     end
     first_char = first(stripped)
-    if first_char == '$' && !startswith(uppercase(stripped), "\$VINTAGE")
+    if first_char == '$' && !startswith(uppercase(stripped), "\$VINTAGE") &&
+       !occursin(r"^\$UNITS(?:[\s,]|$)"i, stripped)
         return ""
     end
     if uppercase(first_char) == 'C' &&
