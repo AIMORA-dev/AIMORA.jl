@@ -105,13 +105,6 @@ function _control_system_device_steady_state_value(
             p1 = 0.0
         end
         return weighted_input + p1 * p2
-    elseif row.device_type == 66
-        sample_count = row.control_index
-        sum_squares = sum(
-            state.parsup_values[(row.parsup_index + 1):(row.parsup_index + sample_count)];
-            init = 0.0,
-        )
-        return sqrt(sum_squares * p1 + weighted_input * weighted_input)
     elseif row.device_type == 67
         return 1.0
     end
@@ -198,13 +191,17 @@ function _initialize_control_system_device_histories!(
     runtime.initialized && return runtime
     _initialize_control_system_device_outputs!(runtime) do slot, row
         state = runtime.state
-        if row.device_type == 66 && !runtime.initialize_rms_from_input[row.supplemental_index]
-            # VALUE is a signed input sample. The transient ring stores squares.
+        if row.device_type == 66
             first_slot = row.parsup_index + 1
             history = @view state.parsup_values[first_slot:(row.parsup_index + row.control_index)]
-            sample = first(history) + _control_system_device_weighted_input(state, row)
+            # VALUE is a signed input sample. The transient ring stores squares.
+            sample = _control_system_device_weighted_input(state, row)
+            if !runtime.initialize_rms_from_input[row.supplemental_index]
+                sample += first(history)
+            end
             fill!(history, sample * sample)
-            state.xtcs_values[slot] = sqrt(sum(history) * state.parsup_values[row.parsup_index])
+            state.xtcs_values[slot] = runtime.initialize_rms_from_input[row.supplemental_index] ?
+                abs(sample) : sqrt(sum(history) * state.parsup_values[row.parsup_index])
         else
             state.xtcs_values[slot] = _control_system_device_steady_state_value(state, row)
         end
@@ -216,10 +213,6 @@ function _initialize_control_system_device_histories!(
             history_count = trunc(Int, runtime.state.parsup_values[row.parsup_index + 2])
             runtime.state.parsup_values[history_start:(history_start + history_count - 1)] .=
                 weighted_input
-        elseif runtime.initialize_rms_from_input[index]
-            sample_count = row.control_index
-            runtime.state.parsup_values[(row.parsup_index + 1):(row.parsup_index + sample_count)] .=
-                weighted_input * weighted_input
         end
         if row.device_type == 50
             runtime.state.device_integer_values[index] = weighted_input < 0.0 ? -1 : 1
@@ -240,6 +233,15 @@ function _initialize_control_system_device_histories!(
             runtime.state.parsup_values[row.parsup_index] =
                 runtime.state.xtcs_values[runtime.device_output_slots[index]]
         end
+    end
+    # DC dependents and their histories use the provisional RMS input
+    # magnitude. Publish the window RMS only after initialization consumes it.
+    for (index, row) in enumerate(runtime.rows)
+        runtime.initialize_rms_from_input[index] || continue
+        state = runtime.state
+        history = @view state.parsup_values[(row.parsup_index + 1):(row.parsup_index + row.control_index)]
+        state.xtcs_values[runtime.device_output_slots[index]] =
+            sqrt(sum(history) * state.parsup_values[row.parsup_index])
     end
     runtime.initialized = true
     return runtime
