@@ -220,11 +220,48 @@ function _control_system_frequency_initializations(
     return initializations
 end
 
+function _initialize_control_system_ac_rms_histories!(
+    supplemental::ControlSystemSupplementalDeviceRuntime,
+    initializations::Vector{ControlSystemFrequencyInitialization},
+    dt_s::Float64,
+)
+    outputs = Pair{Int,Float64}[]
+    isempty(initializations) && return outputs
+    state = supplemental.state
+    for (index, row) in enumerate(supplemental.rows)
+        supplemental.initialize_rms_from_input[index] || continue
+        input_phasors = [
+            _control_system_frequency_weighted_input(initialization.signal_phasors, row)
+            for initialization in initializations
+        ]
+        all(iszero, input_phasors) && continue
+        dc_input = _control_system_device_weighted_input(state, row)
+        sample_count = row.control_index
+        history = @view state.parsup_values[(row.parsup_index + 1):(row.parsup_index + sample_count)]
+        for (index_in_history, lag) in enumerate(sample_count:-1:1)
+            sample = dc_input
+            for (initialization, phasor) in zip(initializations, input_phasors)
+                angle = -2.0 * pi * initialization.frequency_hz * dt_s * lag
+                sample += real(phasor * cis(angle))
+            end
+            history[index_in_history] = sample * sample
+        end
+        scale = state.parsup_values[row.parsup_index]
+        push!(outputs, index => sqrt(sum(history) * scale))
+    end
+    return outputs
+end
+
 function _apply_control_system_frequency_initializations!(
     runtime::ControlSystemNetworkRuntime,
     initializations::Vector{ControlSystemFrequencyInitialization} = runtime.frequency_initializations,
 )
     supplemental = runtime.supplemental_devices
+    # The DC input still has its sign here. Sum the physical samples before squaring.
+    rms_outputs = supplemental === nothing ? Pair{Int,Float64}[] :
+        _initialize_control_system_ac_rms_histories!(
+            supplemental, initializations, runtime.state.deltat_s,
+        )
     for initialization in initializations
         angular_frequency = 2.0 * pi * initialization.frequency_hz
         ordinary_names =
@@ -304,6 +341,10 @@ function _apply_control_system_frequency_initializations!(
             runtime.state.values[supplemental.device_output_names[index]] =
                 supplemental.state.xtcs_values[output_slot]
         end
+    end
+    for (index, output) in rms_outputs
+        supplemental.state.xtcs_values[supplemental.device_output_slots[index]] = output
+        runtime.state.values[supplemental.device_output_names[index]] = output
     end
     _record_control_system_transport_time_zero!(runtime)
     return runtime

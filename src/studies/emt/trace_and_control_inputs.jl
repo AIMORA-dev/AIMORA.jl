@@ -2365,11 +2365,13 @@ function _append_control_system_device_parameters!(
     elseif row.device_type == 66
         scale = p1 * dt_s
         scale > 0.0 || throw(ArgumentError("type-66 RMS period scale must be positive"))
-        sample_count = max(1, round(Int, inv(scale)))
+        # Fixed-card RMS allocation rounds half windows upward. The legacy
+        # pointer is normalized to slot one before the first runtime advance.
+        sample_count = max(1, trunc(Int, inv(scale) + 0.5))
         initial_value = reference_is_value ? p2 : 0.0
         append!(values, (scale,))
         append!(values, fill(initial_value, sample_count))
-        initial_integer = 0
+        initial_integer = 1
         rms_sample_count = sample_count
         initialize_rms = !reference_is_value
     elseif row.device_type == 67
