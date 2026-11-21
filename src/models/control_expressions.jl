@@ -74,6 +74,12 @@ const _CONTROL_EXPRESSION_FUNCTIONS = Dict(
     "NOT" => :logical_not,
 )
 
+const _BPA_CONTROL_EXPRESSION_INTRINSICS = Dict(
+    :reciprocal => :bpa_reciprocal,
+    :exponential => :bpa_exponential,
+    :cotangent => :bpa_cotangent,
+)
+
 function _control_expression_tokens(source_text::AbstractString)
     chars = collect(uppercase(strip(String(source_text))))
     tokens = _ControlExpressionToken[]
@@ -306,8 +312,8 @@ function _parse_control_expression_primary!(compiler::_ControlExpressionCompiler
             _parse_control_expression_or!(compiler)
             _control_expression_accept!(compiler, :close) ||
                 throw(ArgumentError("control-expression function $(token.text) lacks a closing parenthesis"))
-            if compiler.bpa_factor_arithmetic && operation == :reciprocal
-                operation = :bpa_reciprocal
+            if compiler.bpa_factor_arithmetic
+                operation = get(_BPA_CONTROL_EXPRESSION_INTRINSICS, operation, operation)
             end
             _control_expression_emit!(compiler, operation)
         else
@@ -350,8 +356,9 @@ end
     compile_control_expression(output_name, source_text; bpa_factor_arithmetic=false)
 
 Compile a control expression. Fixed-card BPA deck intake selects legacy factor order
-and guarded division and reciprocal. The retained Linux glibc profile uses system
-`log10`; other builds use Julia's `log10` and can classify a rounded cutoff differently.
+and guarded division and intrinsics. The retained Linux glibc profile uses system
+`log10` and `exp`. Other builds use Julia's functions and may round cutoff or pole
+arguments differently.
 """
 function compile_control_expression(
     output_name::Symbol,
@@ -389,11 +396,13 @@ function _control_expression_divide(left::Float64, right::Float64)
     return left / right
 end
 
-# The retained gfortran reference calls the glibc DLOG10 implementation.
+# The retained gfortran reference uses glibc for DLOG10 and DEXP.
 @static if Sys.islinux() && Base.BinaryPlatforms.libc(Base.BinaryPlatforms.HostPlatform()) == "glibc"
     _bpa_control_log10(value::Float64) = ccall((:log10, "libm.so.6"), Cdouble, (Cdouble,), value)
+    _bpa_control_exp(value::Float64) = ccall((:exp, "libm.so.6"), Cdouble, (Cdouble,), value)
 else
     _bpa_control_log10(value::Float64) = log10(value)
+    _bpa_control_exp(value::Float64) = exp(value)
 end
 
 function _bpa_control_expression_divide(left::Float64, right::Float64)
@@ -424,6 +433,11 @@ function _control_expression_unary(operation::Symbol, value::Float64)
         return tan(value)
     elseif operation == :cotangent
         return inv(tan(value))
+    elseif operation == :bpa_cotangent
+        sine = sin(value)
+        abs(sine) * CONTROL_SYSTEM_INFINITY > 1.0 ||
+            throw(DomainError(value, "BPA TACS cotangent argument is too close to a sine zero"))
+        return cos(value) / sine
     elseif operation == :hyperbolic_sine
         return sinh(value)
     elseif operation == :hyperbolic_cosine
@@ -438,6 +452,8 @@ function _control_expression_unary(operation::Symbol, value::Float64)
         return atan(value)
     elseif operation == :exponential
         return exp(value)
+    elseif operation == :bpa_exponential
+        return value >= -87.0 ? _bpa_control_exp(value) : 0.0
     elseif operation == :natural_logarithm
         return value == 0.0 ? -1.0e300 : log(value)
     elseif operation == :common_logarithm
