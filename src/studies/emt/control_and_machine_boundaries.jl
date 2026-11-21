@@ -1578,7 +1578,7 @@ end
 
 function deck_over16_boundary_plan(parsed::DeckParser.DeckParseResult)
     DeckParser.assert_deck_valid!(parsed)
-    source_inputs = DeckParser.deck_over5a_source_update_inputs(parsed)
+    source_inputs = DeckParser.deck_over5a_source_update_inputs(parsed; for_execution = true)
     control_device_rows = DeckParser.deck_control_system_device_rows(parsed)
     full_control_device_execution =
         !isempty(control_device_rows) &&

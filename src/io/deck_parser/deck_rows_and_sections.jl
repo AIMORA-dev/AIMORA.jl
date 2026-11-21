@@ -2123,31 +2123,44 @@ deck_over5a_source_tstart_values(result::DeckParseResult) =
 deck_over5a_source_tstop_values(result::DeckParseResult) =
     Float64[row.tstop for row in deck_over5a_source_rows(result)]
 
-function _deck_over5a_source_execution_iform_values(rows::Vector{DeckOVER5ASourceRow})
-    # The retained Type 18 path composes repeated analytic voltage cards.
-    any(row -> row.iform == 18, rows) || return [row.iform for row in rows]
+function _deck_over5a_source_execution_iform_values(
+    rows::Vector{DeckOVER5ASourceRow};
+    compose_standalone_type14::Bool = true,
+)
+    type18 = any(row -> row.iform == 18, rows)
+    type18 || compose_standalone_type14 || return [row.iform for row in rows]
+    type14_voltage_nodes = Set(
+        row.node_value for row in rows
+        if row.node_value > 0 && row.iform == 14 && row.layout_kind == :fixed_field
+    )
     voltage_nodes = Set{Int}()
     return map(rows) do row
         node = row.node_value
         node > 0 || return row.iform
+        # OVER5 finds an earlier positive NODE in card order, independently
+        # of its source type or whether its time window is currently active.
         repeats_voltage_node = node in voltage_nodes
         push!(voltage_nodes, node)
-        # OVER5 marks succeeding voltage sources on the same bus as
-        # additive. Keep the source card type in the public intake rows.
-        if repeats_voltage_node && row.iform in BPA_FIXED_ANALYTIC_SOURCE_TYPES
-            return -row.iform
+        additive_form_supported = if type18
+            row.iform in BPA_FIXED_ANALYTIC_SOURCE_TYPES
+        else
+            node in type14_voltage_nodes && row.layout_kind == :fixed_field &&
+                row.iform in (11, 14)
         end
-        return row.iform
+        return repeats_voltage_node && additive_form_supported ? -row.iform : row.iform
     end
 end
 
-function deck_over5a_source_update_inputs(result::DeckParseResult)
+function deck_over5a_source_update_inputs(
+    result::DeckParseResult;
+    for_execution::Bool = false,
+)
     rows = deck_over5a_source_rows(result)
     return DeckOVER5ASourceUpdateInputs(
         [row.name for row in rows],
         [row.node for row in rows],
         [row.node_value for row in rows],
-        _deck_over5a_source_execution_iform_values(rows),
+        _deck_over5a_source_execution_iform_values(rows; compose_standalone_type14 = for_execution),
         [row.line_no for row in rows],
         [row.layout_kind for row in rows],
         [row.tstart for row in rows],
