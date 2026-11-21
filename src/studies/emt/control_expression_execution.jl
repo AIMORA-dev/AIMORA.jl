@@ -4,7 +4,9 @@ function _deck_control_system_expression_runtimes(
 )
     runtimes = ControlExpressionRuntime[]
     for row in DeckParser.deck_control_system_expression_rows(parsed)
-        program = compile_control_expression(row.name, row.expression)
+        program = compile_control_expression(
+            row.name, row.expression; bpa_factor_arithmetic = true,
+        )
         for input_name in program.input_names
             haskey(state.values, input_name) ||
                 throw(ArgumentError(

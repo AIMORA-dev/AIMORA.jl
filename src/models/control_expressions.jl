@@ -162,6 +162,7 @@ mutable struct _ControlExpressionCompiler
     index::Int
     instructions::Vector{ControlExpressionInstruction}
     input_names::Vector{Symbol}
+    bpa_factor_arithmetic::Bool
 end
 
 _control_expression_current(compiler::_ControlExpressionCompiler) =
@@ -242,12 +243,34 @@ end
 
 function _parse_control_expression_multiplicative!(compiler::_ControlExpressionCompiler)
     _parse_control_expression_unary!(compiler)
+    _control_expression_current(compiler).kind in (:multiply, :divide) || return
+
+    first_factor_end = length(compiler.instructions)
+    operation_offsets = compiler.bpa_factor_arithmetic ? Int[] : nothing
     while _control_expression_current(compiler).kind in (:multiply, :divide)
         operation = _control_expression_current(compiler).kind
         compiler.index += 1
         _parse_control_expression_unary!(compiler)
+        if compiler.bpa_factor_arithmetic && operation == :divide
+            operation = :bpa_divide
+        end
         _control_expression_emit!(compiler, operation)
+        operation_offsets === nothing ||
+            push!(operation_offsets, length(compiler.instructions) - first_factor_end)
     end
+    operation_offsets === nothing && return
+
+    # CSUP accumulates factors from right to left before multiplying by the first factor.
+    # The division guard applies to that accumulator and the current divisor.
+    suffix = compiler.instructions[(first_factor_end + 1):end]
+    resize!(compiler.instructions, first_factor_end)
+    _control_expression_emit!(compiler, :literal; value = 1.0)
+    for index in reverse(eachindex(operation_offsets))
+        factor_start = index == 1 ? 1 : operation_offsets[index - 1] + 1
+        append!(compiler.instructions, @view suffix[factor_start:operation_offsets[index]])
+    end
+    _control_expression_emit!(compiler, :multiply)
+    return
 end
 
 function _parse_control_expression_unary!(compiler::_ControlExpressionCompiler)
@@ -283,6 +306,9 @@ function _parse_control_expression_primary!(compiler::_ControlExpressionCompiler
             _parse_control_expression_or!(compiler)
             _control_expression_accept!(compiler, :close) ||
                 throw(ArgumentError("control-expression function $(token.text) lacks a closing parenthesis"))
+            if compiler.bpa_factor_arithmetic && operation == :reciprocal
+                operation = :bpa_reciprocal
+            end
             _control_expression_emit!(compiler, operation)
         else
             name = Symbol(token.text)
@@ -298,19 +324,20 @@ function _parse_control_expression_primary!(compiler::_ControlExpressionCompiler
     end
 end
 
+const _CONTROL_EXPRESSION_BINARY_OPERATIONS = (
+    :add, :subtract, :multiply, :divide, :bpa_divide, :power,
+    :logical_or, :logical_nor, :logical_and, :logical_nand,
+    :equal, :not_equal, :less_than, :less_equal, :greater_than, :greater_equal,
+)
+
 function _control_expression_max_stack_depth(instructions)
     depth = 0
     maximum_depth = 0
-    binary_operations = (
-        :add, :subtract, :multiply, :divide, :power,
-        :logical_or, :logical_nor, :logical_and, :logical_nand,
-        :equal, :not_equal, :less_than, :less_equal, :greater_than, :greater_equal,
-    )
     for instruction in instructions
         if instruction.operation in (:literal, :signal)
             depth += 1
             maximum_depth = max(maximum_depth, depth)
-        elseif instruction.operation in binary_operations
+        elseif instruction.operation in _CONTROL_EXPRESSION_BINARY_OPERATIONS
             depth -= 1
         end
         depth > 0 || throw(ArgumentError("invalid compiled control-expression stack"))
@@ -319,7 +346,18 @@ function _control_expression_max_stack_depth(instructions)
     return maximum_depth
 end
 
-function compile_control_expression(output_name::Symbol, source_text::AbstractString)
+"""
+    compile_control_expression(output_name, source_text; bpa_factor_arithmetic=false)
+
+Compile a control expression. Fixed-card BPA deck intake selects legacy factor order
+and guarded division and reciprocal. The retained Linux glibc profile uses system
+`log10`; other builds use Julia's `log10` and can classify a rounded cutoff differently.
+"""
+function compile_control_expression(
+    output_name::Symbol,
+    source_text::AbstractString;
+    bpa_factor_arithmetic::Bool = false,
+)
     text = strip(String(source_text))
     isempty(text) && throw(ArgumentError("control expression must not be empty"))
     compiler = _ControlExpressionCompiler(
@@ -327,6 +365,7 @@ function compile_control_expression(output_name::Symbol, source_text::AbstractSt
         1,
         ControlExpressionInstruction[],
         Symbol[],
+        bpa_factor_arithmetic,
     )
     _parse_control_expression_or!(compiler)
     trailing = _control_expression_current(compiler)
@@ -347,6 +386,28 @@ _control_expression_truth(value::Float64) = value > CONTROL_SYSTEM_ZERO_TOLERANC
 function _control_expression_divide(left::Float64, right::Float64)
     left == 0.0 && return 0.0
     right == 0.0 && return signbit(left) == signbit(right) ? 1.0e300 : -1.0e300
+    return left / right
+end
+
+# The retained gfortran reference calls the glibc DLOG10 implementation.
+@static if Sys.islinux() && Base.BinaryPlatforms.libc(Base.BinaryPlatforms.HostPlatform()) == "glibc"
+    _bpa_control_log10(value::Float64) = ccall((:log10, "libm.so.6"), Cdouble, (Cdouble,), value)
+else
+    _bpa_control_log10(value::Float64) = log10(value)
+end
+
+function _bpa_control_expression_divide(left::Float64, right::Float64)
+    left == 0.0 && return 0.0
+    negative = (left < 0.0) != (right < 0.0)
+    saturation = negative ? -CONTROL_SYSTEM_INFINITY : CONTROL_SYSTEM_INFINITY
+    right == 0.0 && return saturation
+    isfinite(left) && isfinite(right) || return left / right
+
+    # CSUP truncates the decimal exponent difference before comparing it to the bound.
+    exponent = trunc(_bpa_control_log10(abs(left)) - _bpa_control_log10(abs(right)))
+    limit = log10(CONTROL_SYSTEM_INFINITY)
+    exponent < -limit && return 0.0
+    exponent > limit && return saturation
     return left / right
 end
 
@@ -389,6 +450,8 @@ function _control_expression_unary(operation::Symbol, value::Float64)
         return trunc(value)
     elseif operation == :reciprocal
         return _control_expression_divide(1.0, value)
+    elseif operation == :bpa_reciprocal
+        return _bpa_control_expression_divide(1.0, value)
     elseif operation == :degrees_to_radians
         return value * pi / 180.0
     elseif operation == :radians_to_degrees
@@ -407,6 +470,7 @@ function _control_expression_binary(operation::Symbol, left::Float64, right::Flo
     operation == :subtract && return left - right
     operation == :multiply && return left * right
     operation == :divide && return _control_expression_divide(left, right)
+    operation == :bpa_divide && return _bpa_control_expression_divide(left, right)
     operation == :power && return left ^ right
     operation == :equal && return left == right ? 1.0 : 0.0
     operation == :not_equal && return left != right ? 1.0 : 0.0
@@ -438,11 +502,7 @@ function evaluate_control_expression!(
                 throw(ArgumentError("missing control-expression signal $(instruction.name)"))
             stack_index += 1
             runtime.stack[stack_index] = Float64(values[instruction.name])
-        elseif operation in (
-            :add, :subtract, :multiply, :divide, :power,
-            :logical_or, :logical_nor, :logical_and, :logical_nand,
-            :equal, :not_equal, :less_than, :less_equal, :greater_than, :greater_equal,
-        )
+        elseif operation in _CONTROL_EXPRESSION_BINARY_OPERATIONS
             stack_index >= 2 || throw(ArgumentError("control-expression stack underflow"))
             right = runtime.stack[stack_index]
             left = runtime.stack[stack_index - 1]

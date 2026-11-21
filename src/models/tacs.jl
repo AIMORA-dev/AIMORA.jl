@@ -39,6 +39,7 @@ export TACSControlledSwitch,
 
 # TACS treats magnitudes through ten times its 1e-12 machine-zero as zero.
 const CONTROL_SYSTEM_ZERO_TOLERANCE = 1.0e-11
+const CONTROL_SYSTEM_INFINITY = 1.0e20
 
 include("control_expressions.jl")
 include(joinpath(@__DIR__, "tacs", "delayed_arc.jl"))
@@ -767,7 +768,7 @@ function _write_control_system_utilities!(
     values[:PLUS1] = 1.0
     values[:MINUS1] = -1.0
     values[:UNITY] = 1.0
-    values[:INFNTY] = 1.0e20
+    values[:INFNTY] = CONTROL_SYSTEM_INFINITY
     values[:PI] = pi
     return values
 end
