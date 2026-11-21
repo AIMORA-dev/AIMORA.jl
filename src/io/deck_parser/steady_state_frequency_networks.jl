@@ -168,6 +168,13 @@ function _steady_state_frequency_edges(result::DeckParseResult)
         )
     end
     for (index, element) in enumerate(result.elements)
+        if element isa IdealTransformerVoltageConstraint
+            _append_steady_state_frequency_clique_edges!(
+                edges, :ideal_transformer, index,
+                (element.terminal_nodes..., element.constraint_node),
+            )
+            continue
+        end
         hasproperty(element, :from_nodes) && hasproperty(element, :to_nodes) ||
             continue
         _append_steady_state_frequency_clique_edges!(

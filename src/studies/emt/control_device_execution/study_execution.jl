@@ -53,6 +53,47 @@ function _deck_uses_node_condition_initialization(
     )
 end
 
+function _deck_uses_fixed_voltage_source_runtime(parsed::DeckParser.DeckParseResult)
+    return any(element -> element isa IdealTransformerVoltageConstraint, parsed.elements) ||
+           any(
+               iform -> -15 <= iform <= -11,
+               DeckParser._deck_over5a_source_execution_iform_values(
+                   DeckParser.deck_over5a_source_rows(parsed),
+               ),
+           )
+end
+
+function _deck_fixed_source_initial_voltage_sample(
+    parsed::DeckParser.DeckParseResult,
+    time_horizon::Symbol,
+    initial_voltage_source::Symbol,
+    saturated_transformer_intake,
+)
+    if initial_voltage_source in (:zero, :node_conditions)
+        return _deck_runtime_initial_voltage_sample(parsed, initial_voltage_source)
+    end
+    initial_voltage_source == :none && time_horizon == :deck || return nothing
+
+    # BPA's phasor pass admits started Type 14 sources. The transient
+    # source transfer is evaluated by OVER16 only after recording this sample.
+    if any(DeckParser._active_steady_state_frequency_source, DeckParser.deck_over5a_source_rows(parsed))
+        phasor_sample = deck_steady_state_voltage_phasors(
+            parsed; saturated_transformer_intake, bpa_fixed_source_startup = true,
+        )
+        node_conditions = _deck_node_voltage_initial_sample(
+            parsed, copy(phasor_sample.node_voltage_values),
+        )
+        node_conditions === nothing && return phasor_sample
+        return merge(phasor_sample, (
+            node_voltage_values = node_conditions.node_voltage_values,
+            output_voltage_values = node_conditions.output_voltage_values,
+            node_voltage_condition_count = node_conditions.node_voltage_condition_count,
+        ))
+    end
+    node_conditions = _deck_node_voltage_initial_sample(parsed)
+    return node_conditions === nothing ? _deck_zero_initial_voltage_sample(parsed) : node_conditions
+end
+
 function _deck_uses_current_zero_switching(parsed::DeckParser.DeckParseResult)
     return !isempty(_deck_current_zero_switch_names(parsed))
 end
@@ -272,10 +313,7 @@ function _run_deck_emt(
         let intake = _deck_runtime_saturated_transformer_intake(parsed)
             intake !== nothing && !isempty(intake.breakpoints)
         end
-    ideal_transformer_source_runtime = any(
-        element -> element isa IdealTransformerVoltageConstraint,
-        parsed.elements,
-    )
+    fixed_voltage_source_runtime = _deck_uses_fixed_voltage_source_runtime(parsed)
     switched_nonlinear_dynamic_runtime =
         _deck_uses_dynamic_nonlinear_runtime(parsed)
     control_system_feedback_runtime =
@@ -288,11 +326,12 @@ function _run_deck_emt(
             _deck_has_frequency_dependent_line_runtime(parsed)
         ) ||
         saturated_transformer_dynamic_runtime ||
-        ideal_transformer_source_runtime ||
+        fixed_voltage_source_runtime ||
         switched_nonlinear_dynamic_runtime ||
         control_system_feedback_runtime
     ) &&
-       initial_voltage_source in (:none, :steady_state) &&
+       (initial_voltage_source in (:none, :steady_state) ||
+        (fixed_voltage_source_runtime && initial_voltage_source in (:zero, :node_conditions))) &&
        !synchronous_machine_output_runtime_enabled
         saturated_transformer_intake =
             _deck_runtime_saturated_transformer_intake(parsed)
@@ -308,6 +347,10 @@ function _run_deck_emt(
             augmented_node_count,
             runtime_dt_s,
         )
+        initial_sample = fixed_voltage_source_runtime ?
+            _deck_fixed_source_initial_voltage_sample(
+                parsed, time_horizon, initial_voltage_source, saturated_transformer_intake,
+            ) : nothing
         boundary_run = run_deck_emt_with_over16_boundary(
             parsed,
             boundary_state;
@@ -315,6 +358,7 @@ function _run_deck_emt(
             t_end_s = runtime_t_end_s,
             steady_state_initial_sample_enabled =
                 initial_voltage_source == :steady_state,
+            supplied_initial_sample = initial_sample,
             saturated_transformer_intake = saturated_transformer_intake,
             saturated_transformer_nonlinear_current_enabled =
                 saturated_transformer_intake !== nothing,
@@ -530,9 +574,11 @@ function prepare_emt_study(
         throw(ArgumentError("unsupported EMT output schedule $output_schedule"))
     recorded_step_indices !== nothing && output_schedule != :all_steps &&
         throw(ArgumentError("recorded_step_indices and a deck output schedule cannot both be supplied"))
-    initial_voltage_source in (:none, :steady_state) ||
+    fixed_voltage_source_runtime = _deck_uses_fixed_voltage_source_runtime(parsed)
+    (initial_voltage_source in (:none, :steady_state) ||
+     (fixed_voltage_source_runtime && initial_voltage_source in (:zero, :node_conditions))) ||
         throw(ArgumentError(
-            "prepared dynamic EMT execution supports :none or :steady_state initialization",
+            "prepared dynamic EMT execution supports :none or :steady_state initialization, or :zero or :node_conditions with fixed voltage-source composition or an ideal transformer",
         ))
     initial_voltage_sample === nothing || initial_voltage_source == :none ||
         throw(ArgumentError(
@@ -560,10 +606,11 @@ function prepare_emt_study(
     saturated_transformer_dynamic_runtime =
         saturated_transformer_intake !== nothing &&
         !isempty(saturated_transformer_intake.breakpoints)
-    ideal_transformer_source_runtime = any(
-        element -> element isa IdealTransformerVoltageConstraint,
-        parsed.elements,
-    )
+    if fixed_voltage_source_runtime && initial_voltage_sample === nothing
+        initial_voltage_sample = _deck_fixed_source_initial_voltage_sample(
+            parsed, time_horizon, initial_voltage_source, saturated_transformer_intake,
+        )
+    end
     dynamic_network_runtime =
         distributed_transposed_line_runtime_enabled &&
         (
@@ -572,7 +619,7 @@ function prepare_emt_study(
             _deck_has_frequency_dependent_line_runtime(parsed)
         ) ||
         saturated_transformer_dynamic_runtime ||
-        ideal_transformer_source_runtime ||
+        fixed_voltage_source_runtime ||
         _deck_uses_dynamic_nonlinear_runtime(parsed) ||
         _deck_uses_control_system_feedback_runtime(parsed) ||
         any(

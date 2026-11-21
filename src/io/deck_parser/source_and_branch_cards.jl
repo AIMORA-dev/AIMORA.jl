@@ -1822,12 +1822,14 @@ function parse_bpa_fixed_type18_ideal_transformer_card!(
         )
         return true
     end
-    isfinite(ratio) && ratio != 0.0 || begin
+    # BPA stores the signed reciprocal as a resistance before stamping its conductance.
+    terminal_resistance = inv(ratio)
+    isfinite(terminal_resistance) && isfinite(inv(terminal_resistance)) || begin
         add_issue!(
             result.validation,
             invalid_value(
                 "line $line_no",
-                "OVER5A type-18 ideal-transformer turns ratio must be finite and nonzero",
+                "OVER5A type-18 ideal-transformer turns ratio and its reciprocal must be finite and nonzero",
             ),
         )
         return true
@@ -1877,10 +1879,16 @@ function parse_bpa_fixed_type18_ideal_transformer_card!(
         bus3_index,
         previous_node_index,
         internal_node_index,
-        ratio,
+        terminal_resistance,
     )
 
-    remove_analytic_source_element!(result, previous.name)
+    # The transfer releases the preceding bus from its voltage-source role.
+    # Keep its source rows to form the auxiliary RHS in card order.
+    for row in result.over5a_source_rows
+        row.node_value == previous_node_index || continue
+        remove_analytic_source_element!(result, row.name)
+    end
+    # A signed current source still injects at that bus during a transient.
     push_element!(result, ["ideal_transformer_voltage_constraint", String(name)], constraint, line_no)
     push!(
         result.over5a_source_rows,

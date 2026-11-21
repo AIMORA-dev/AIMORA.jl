@@ -24,6 +24,50 @@ function _stamp_deck_source_steady_state_admittance!(
     return matrix
 end
 
+function _stamp_bpa_fixed_startup_sources!(
+    matrix::AbstractMatrix{ComplexF64},
+    rhs::AbstractVector{ComplexF64},
+    parsed::DeckParser.DeckParseResult,
+    partition::DeckParser.DeckSteadyStateFrequencyPartition,
+)
+    rows = DeckParser.deck_over5a_source_rows(parsed)
+    fixed_voltages = Dict{Int,ComplexF64}()
+    auxiliary_nodes = zeros(Int, length(rows))
+    for index in partition.active_source_row_indices
+        row = rows[index]
+        if index < length(rows) && rows[index + 1].iform == 18
+            auxiliary_nodes[index] = Int(rows[index + 1].time1)
+        elseif row.node_value > 0 || row.tstart == 5432.0
+            node = abs(row.node_value)
+            phasor = _deck_source_voltage_phasor(row)
+            fixed_voltages[node] = get(fixed_voltages, node, 0.0im) + phasor
+        end
+    end
+    for index in partition.active_source_row_indices
+        row = rows[index]
+        node = abs(row.node_value)
+        current_source = row.node_value < 0 && row.tstart != 5432.0
+        # OVER9 disables a steady-state current source on a voltage-fixed
+        # bus before OVER10 routes any remaining predecessor to its auxiliary.
+        current_source && haskey(fixed_voltages, node) && continue
+        auxiliary = auxiliary_nodes[index]
+        if auxiliary != 0
+            rhs[auxiliary] += _deck_source_voltage_phasor(row)
+        elseif current_source
+            rhs[node] += _deck_source_voltage_phasor(row)
+        end
+    end
+    for element in parsed.elements
+        element isa IdealTransformerVoltageConstraint || continue
+        auxiliary = element.constraint_node
+        for (node, coefficient) in zip(element.terminal_nodes, element.terminal_coefficients)
+            matrix[auxiliary, node] -= coefficient
+            matrix[node, auxiliary] -= coefficient
+        end
+    end
+    return fixed_voltages
+end
+
 function _stamp_coupled_lumped_sequence_steady_state_admittance!(
     matrix::AbstractMatrix{ComplexF64},
     parsed::DeckParser.DeckParseResult,
@@ -398,6 +442,7 @@ function _deck_steady_state_nodal_equations(
     parsed::DeckParser.DeckParseResult,
     node_count::Int;
     include_induction_machines::Bool=true,
+    bpa_fixed_source_startup::Bool=false,
     excluded_universal_machine_indices::AbstractVector{<:Integer}=Int[],
     transformer_admittance=nothing,
     frequency_partition::DeckParser.DeckSteadyStateFrequencyPartition=
@@ -411,6 +456,7 @@ function _deck_steady_state_nodal_equations(
         admittance,
         parsed,
         frequency_partition,
+        include_fixed_series_rlc = bpa_fixed_source_startup,
         excluded_universal_machine_indices =
             excluded_universal_machine_indices,
         formulation=formulation,
@@ -434,7 +480,7 @@ function _deck_steady_state_nodal_equations(
             frequency_partition,
         )
     _stamp_deck_open_switch_steady_state_admittance!(admittance, parsed)
-    _stamp_deck_source_steady_state_admittance!(admittance, rhs, parsed)
+    bpa_fixed_source_startup || _stamp_deck_source_steady_state_admittance!(admittance, rhs, parsed)
     _stamp_named_basic_harmonic_elements!(
         admittance,
         rhs,
@@ -582,6 +628,7 @@ function deck_steady_state_voltage_phasors(
     parsed::DeckParser.DeckParseResult;
     saturated_transformer_intake = nothing,
     winding_number::Int = 1,
+    bpa_fixed_source_startup::Bool = false,
 )
     node_map = Dict{Symbol,Int}(parsed.node_map)
     frequency_partition = DeckParser.deck_steady_state_frequency_partition(parsed)
@@ -624,11 +671,16 @@ function deck_steady_state_voltage_phasors(
         node_count;
         transformer_admittance = transformer_admittance,
         frequency_partition = frequency_partition,
+        bpa_fixed_source_startup,
     )
+    fixed_node_phasors = bpa_fixed_source_startup ?
+        _stamp_bpa_fixed_startup_sources!(admittance, rhs, parsed, frequency_partition) :
+        nothing
     topology_diagnostics = _grouped_steady_state_diagnostics(
         admittance,
         rhs,
-        switch_representatives,
+        switch_representatives;
+        fixed_node_phasors,
     )
     node_voltage_phasors = something(topology_diagnostics.solution)
     output_node_indices = DeckParser.deck_over16_output_node_indices(parsed)
@@ -637,7 +689,8 @@ function deck_steady_state_voltage_phasors(
         for index in output_node_indices
     ]
     return (
-        source = :deck_steady_state_voltage_phasors,
+        source = bpa_fixed_source_startup ?
+            :bpa_fixed_source_startup_voltage_phasors : :deck_steady_state_voltage_phasors,
         outcome = :steady_state_initial_voltage_sample,
         steady_state_frequency_hz = _deck_steady_state_frequency_hz(parsed),
         node_steady_state_frequencies_hz = copy(frequency_partition.node_frequencies_hz),
@@ -688,45 +741,53 @@ function deck_steady_state_voltage_phasors(
     )
 end
 
-function _deck_node_voltage_initial_sample(parsed::DeckParser.DeckParseResult)
+function _deck_node_voltage_initial_sample(
+    parsed::DeckParser.DeckParseResult,
+    values::Vector{Float64} = zeros(Float64, length(parsed.node_map)),
+)
     rows = [
         row for row in DeckParser.deck_node_initial_condition_rows(parsed)
         if row.condition_kind == :node_voltage_initial_condition && row.node_index > 0
     ]
     isempty(rows) && return nothing
-    values = zeros(Float64, length(parsed.node_map))
     for row in rows
         reference_value =
             row.reference_node_index isa Missing ? 0.0 : values[Int(row.reference_node_index)]
         values[Int(row.node_index)] = reference_value + Float64(row.real_value)
     end
-    output_node_indices = DeckParser.deck_over16_output_node_indices(parsed)
-    output_voltage_values = Float64[
-        index == 0 ? 0.0 : values[index]
-        for index in output_node_indices
-    ]
-    return (
-        source = :deck_node_voltage_initial_conditions,
-        outcome = :initial_voltage_sample,
-        steady_state_frequency_hz = _deck_steady_state_frequency_hz(parsed),
-        node_voltage_values = values,
-        output_node_indices = output_node_indices,
-        output_voltage_values = output_voltage_values,
-        node_voltage_condition_count = length(rows),
+    return _deck_transient_initial_voltage_sample(
+        parsed, values, :deck_node_voltage_initial_conditions; condition_count = length(rows),
     )
 end
 
 function _deck_zero_initial_voltage_sample(parsed::DeckParser.DeckParseResult)
-    values = zeros(Float64, length(parsed.node_map))
+    return _deck_transient_initial_voltage_sample(
+        parsed, zeros(Float64, length(parsed.node_map)), :zero_initial_network_state,
+    )
+end
+
+function _deck_transient_initial_voltage_sample(
+    parsed::DeckParser.DeckParseResult,
+    values::Vector{Float64},
+    source::Symbol;
+    condition_count::Int = 0,
+)
     output_node_indices = DeckParser.deck_over16_output_node_indices(parsed)
     return (
-        source = :zero_initial_network_state,
+        source = source,
         outcome = :initial_voltage_sample,
         steady_state_frequency_hz = _deck_steady_state_frequency_hz(parsed),
         node_voltage_values = values,
         output_node_indices = output_node_indices,
-        output_voltage_values = zeros(Float64, length(output_node_indices)),
-        node_voltage_condition_count = 0,
+        output_voltage_values = Float64[
+            index == 0 ? 0.0 : values[index] for index in output_node_indices
+        ],
+        node_voltage_condition_count = condition_count,
+        source_row_count = 0,
+        distributed_transposed_line_count = 0,
+        saturated_transformer_branch_count = 0,
+        saturated_transformer_ideal_branch_count = 0,
+        saturated_transformer_linearized_nonlinear_branch_count = 0,
     )
 end
 

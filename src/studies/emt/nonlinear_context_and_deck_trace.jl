@@ -1818,18 +1818,26 @@ function _prepare_dynamic_deck_runtime(
             winding_number = saturated_transformer_winding_number,
         ) :
         nothing
-    consistent_initial_state_enabled = supplied_initial_sample !== nothing
+    transient_initial_state =
+        steady_state_initial_sample !== nothing &&
+        hasproperty(steady_state_initial_sample, :source) &&
+        steady_state_initial_sample.source in (
+            :zero_initial_network_state, :deck_node_voltage_initial_conditions,
+        )
+    network_initial_sample = transient_initial_state ? nothing : steady_state_initial_sample
+    consistent_initial_state_enabled =
+        supplied_initial_sample !== nothing && !transient_initial_state
     if consistent_initial_state_enabled
         saturated_transformer_current_config =
             _saturated_transformer_initial_state_config(
                 saturated_transformer_current_config,
-                steady_state_initial_sample,
+                network_initial_sample,
             )
     end
     saturated_transformer_current_config =
         _pseudo_nonlinear_inductor_initial_state_config(
             saturated_transformer_current_config,
-            steady_state_initial_sample,
+            network_initial_sample,
         )
     deck_nonlinear_current_config =
         _deck_nonlinear_current_config(
@@ -1841,22 +1849,22 @@ function _prepare_dynamic_deck_runtime(
         deck_nonlinear_current_config =
             _saturated_transformer_initial_state_config(
                 deck_nonlinear_current_config,
-                steady_state_initial_sample,
+                network_initial_sample,
             )
         deck_nonlinear_current_config =
             _pseudo_nonlinear_inductor_initial_state_config(
                 deck_nonlinear_current_config,
-                steady_state_initial_sample,
+                network_initial_sample,
             )
         deck_nonlinear_current_config =
             _piecewise_nonlinear_inductor_initial_state_config(
                 deck_nonlinear_current_config,
-                steady_state_initial_sample,
+                network_initial_sample,
             )
         deck_nonlinear_current_config =
             _hysteretic_inductor_initial_state_config(
                 deck_nonlinear_current_config,
-                steady_state_initial_sample,
+                network_initial_sample,
             )
     end
     if deck_nonlinear_current_config !== nothing &&
@@ -1871,7 +1879,7 @@ function _prepare_dynamic_deck_runtime(
         merge_deck_owned_step_configs ?
         _deck_distributed_transposed_line_config(
             parsed;
-            steady_state_initial_sample = steady_state_initial_sample,
+            steady_state_initial_sample = network_initial_sample,
         ) :
         nothing
     deck_owned_over16_output_config =
@@ -1970,13 +1978,25 @@ function _prepare_dynamic_deck_runtime(
         )
         fill!(distributed_transposed_line_config.current_injection_values, 0.0)
     end
+    if transient_initial_state
+        steady_state_initial_sample = _initial_voltage_sample_for_context(
+            steady_state_initial_sample,
+            context.system.node_count,
+        )
+    end
     if steady_state_initial_sample !== nothing
-        _seed_steady_state_network_state!(context, steady_state_initial_sample)
+        _seed_steady_state_network_state!(
+            context,
+            steady_state_initial_sample;
+            stage_imposed_branch_voltage =
+                hasproperty(steady_state_initial_sample, :node_voltage_condition_count) &&
+                steady_state_initial_sample.node_voltage_condition_count > 0,
+        )
         length(over16_state.source.e_values) >= context.system.node_count ||
             throw(ArgumentError("source voltage state is smaller than the initialized network"))
         over16_state.source.e_values[1:context.system.node_count] .= context.system.v
     end
-    steady_state_initial_sample === nothing ||
+    network_initial_sample === nothing ||
         _initialize_control_system_network_steady_state!(
             context,
             context.system.v;
@@ -1989,8 +2009,13 @@ function _prepare_dynamic_deck_runtime(
         steady_state_initial_sample === nothing ?
         nothing :
         _steady_state_initial_output_values(context)
+    # The BPA phasor sample supplies the initialized companion histories.
+    # Its residual at tick zero is not a transient current source.
+    bpa_fixed_source_startup = network_initial_sample !== nothing &&
+        hasproperty(network_initial_sample, :source) &&
+        network_initial_sample.source == :bpa_fixed_source_startup_voltage_phasors
     steady_state_initial_current_injections =
-        steady_state_initial_sample === nothing ||
+        network_initial_sample === nothing || bpa_fixed_source_startup ||
         (
             hasproperty(steady_state_initial_sample, :exact_discrete_histories) &&
             steady_state_initial_sample.exact_discrete_histories
@@ -2090,6 +2115,7 @@ function run_deck_emt_with_over16_boundary(
     saturated_transformer_nonlinear_current_enabled::Bool = true,
     coupled_lumped_sequence_history_enabled::Bool = false,
     steady_state_initial_sample_enabled::Bool = false,
+    supplied_initial_sample = nothing,
     time_switch_event_delay_s::Float64 = 0.0,
     current_zero_switching::Bool = false,
     recorded_step_indices = nothing,
@@ -2116,6 +2142,7 @@ function run_deck_emt_with_over16_boundary(
         coupled_lumped_sequence_history_enabled =
             coupled_lumped_sequence_history_enabled,
         steady_state_initial_sample_enabled = steady_state_initial_sample_enabled,
+        supplied_initial_sample = supplied_initial_sample,
         time_switch_event_delay_s = time_switch_event_delay_s,
         current_zero_switching = current_zero_switching,
         recorded_step_indices = recorded_step_indices,

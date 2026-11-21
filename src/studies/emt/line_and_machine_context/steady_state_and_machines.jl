@@ -98,7 +98,7 @@ function _steady_state_reactive_angular_frequency(sample, frequency_hz::Float64)
     throw(ArgumentError("unsupported steady-state harmonic formulation $formulation"))
 end
 
-function _seed_steady_state_series_rl_branch!(
+function _seed_steady_state_scalar_branch!(
     branch::SeriesRLBranch,
     sample,
     frequency_hz::Float64,
@@ -136,7 +136,7 @@ function _seed_steady_state_series_rl_branch!(
     return branch
 end
 
-function _seed_steady_state_series_rlc_branch!(
+function _seed_steady_state_scalar_branch!(
     branch::SeriesRLCBranch,
     sample,
     frequency_hz::Float64,
@@ -166,7 +166,7 @@ function _seed_steady_state_series_rlc_branch!(
     return branch
 end
 
-function _seed_steady_state_capacitor_branch!(
+function _seed_steady_state_scalar_branch!(
     branch::CapacitorBranch,
     sample,
     frequency_hz::Float64,
@@ -389,7 +389,30 @@ function _steady_state_current_injections(context::EMTStepContext, sample)
     )
 end
 
-function _seed_steady_state_network_state!(context::EMTStepContext, sample)
+function _stage_scalar_branch_initial_voltage!(
+    element::Union{SeriesRLBranch,SeriesRLCBranch,CapacitorBranch},
+    imposed_voltage::Float64,
+    dt_s::Float64,
+)
+    # Apply the imposed tick-zero voltage to the existing Norton relation.
+    # This stages the next-step history without a new solve or time advance.
+    conductance, _ = companion(element, dt_s)
+    current_change = conductance * (imposed_voltage - element.v_prev)
+    element.i_prev += current_change
+    element.v_prev = imposed_voltage
+    if element isa SeriesRLCBranch
+        element.capacitor_voltage_prev += dt_s / (2.0 * element.c) * current_change
+        element.inductor_voltage_prev =
+            imposed_voltage - element.r * element.i_prev - element.capacitor_voltage_prev
+    end
+    return nothing
+end
+
+function _seed_steady_state_network_state!(
+    context::EMTStepContext,
+    sample;
+    stage_imposed_branch_voltage::Bool = false,
+)
     values = sample.node_voltage_values
     length(values) >= context.system.node_count ||
         throw(ArgumentError("steady-state network seed must cover context nodes"))
@@ -397,7 +420,31 @@ function _seed_steady_state_network_state!(context::EMTStepContext, sample)
         context.system.v[node] = Float64(values[node])
     end
     frequency_hz = Float64(sample.steady_state_frequency_hz)
+    has_phasors = hasproperty(sample, :node_voltage_phasors)
     for element in context.system.elements
+        if element isa Union{SeriesRLBranch,SeriesRLCBranch,CapacitorBranch}
+            imposed_voltage =
+                _deck_node_voltage(context.system.v, element.a) -
+                _deck_node_voltage(context.system.v, element.b)
+            if has_phasors
+                element_frequency_hz = _steady_state_branch_frequency_hz(
+                    sample, element.a, element.b, frequency_hz,
+                )
+                _seed_steady_state_scalar_branch!(element, sample, element_frequency_hz)
+            else
+                element.v_prev = stage_imposed_branch_voltage ? 0.0 : imposed_voltage
+                element.i_prev = 0.0
+                element.i_last = 0.0
+                if element isa SeriesRLCBranch
+                    element.inductor_voltage_prev = 0.0
+                    element.capacitor_voltage_prev = element.v_prev
+                end
+            end
+            stage_imposed_branch_voltage && _stage_scalar_branch_initial_voltage!(
+                element, imposed_voltage, context.dt_s,
+            )
+            continue
+        end
         if element isa ComplexModalBergeronLine &&
            hasproperty(sample, :node_voltage_phasors)
             _seed_complex_modal_line_steady_state!(element, sample, frequency_hz)
@@ -439,33 +486,6 @@ function _seed_steady_state_network_state!(context::EMTStepContext, sample)
                 end
             end
             continue
-        elseif element isa SeriesRLBranch && hasproperty(sample, :node_voltage_phasors)
-            element_frequency_hz = _steady_state_branch_frequency_hz(
-                sample,
-                element.a,
-                element.b,
-                frequency_hz,
-            )
-            _seed_steady_state_series_rl_branch!(element, sample, element_frequency_hz)
-            continue
-        elseif element isa SeriesRLCBranch && hasproperty(sample, :node_voltage_phasors)
-            element_frequency_hz = _steady_state_branch_frequency_hz(
-                sample,
-                element.a,
-                element.b,
-                frequency_hz,
-            )
-            _seed_steady_state_series_rlc_branch!(element, sample, element_frequency_hz)
-            continue
-        elseif element isa CapacitorBranch && hasproperty(sample, :node_voltage_phasors)
-            element_frequency_hz = _steady_state_branch_frequency_hz(
-                sample,
-                element.a,
-                element.b,
-                frequency_hz,
-            )
-            _seed_steady_state_capacitor_branch!(element, sample, element_frequency_hz)
-            continue
         elseif element isa CoupledInductiveBranch && hasproperty(sample, :node_voltage_phasors)
             _seed_steady_state_coupled_inductive_branch!(element, sample)
             continue
@@ -483,31 +503,8 @@ function _seed_steady_state_network_state!(context::EMTStepContext, sample)
             )
             continue
         end
-        if !hasproperty(sample, :node_voltage_phasors)
-            if element isa SeriesRLBranch
-                element.v_prev =
-                    _deck_node_voltage(context.system.v, element.a) -
-                    _deck_node_voltage(context.system.v, element.b)
-                element.i_prev = 0.0
-                element.i_last = 0.0
-                continue
-            elseif element isa SeriesRLCBranch
-                element.v_prev =
-                    _deck_node_voltage(context.system.v, element.a) -
-                    _deck_node_voltage(context.system.v, element.b)
-                element.i_prev = 0.0
-                element.i_last = 0.0
-                element.inductor_voltage_prev = 0.0
-                element.capacitor_voltage_prev = element.v_prev
-                continue
-            elseif element isa CapacitorBranch
-                element.v_prev =
-                    _deck_node_voltage(context.system.v, element.a) -
-                    _deck_node_voltage(context.system.v, element.b)
-                element.i_prev = 0.0
-                element.i_last = 0.0
-                continue
-            elseif element isa CoupledInductiveBranch
+        if !has_phasors
+            if element isa CoupledInductiveBranch
                 for port in eachindex(element.a)
                     element.previous_voltage[port] =
                         _deck_node_voltage(context.system.v, element.a[port]) -

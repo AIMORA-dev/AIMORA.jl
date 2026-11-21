@@ -2123,13 +2123,31 @@ deck_over5a_source_tstart_values(result::DeckParseResult) =
 deck_over5a_source_tstop_values(result::DeckParseResult) =
     Float64[row.tstop for row in deck_over5a_source_rows(result)]
 
+function _deck_over5a_source_execution_iform_values(rows::Vector{DeckOVER5ASourceRow})
+    # The retained Type 18 path composes repeated analytic voltage cards.
+    any(row -> row.iform == 18, rows) || return [row.iform for row in rows]
+    voltage_nodes = Set{Int}()
+    return map(rows) do row
+        node = row.node_value
+        node > 0 || return row.iform
+        repeats_voltage_node = node in voltage_nodes
+        push!(voltage_nodes, node)
+        # OVER5 marks succeeding voltage sources on the same bus as
+        # additive. Keep the source card type in the public intake rows.
+        if repeats_voltage_node && row.iform in BPA_FIXED_ANALYTIC_SOURCE_TYPES
+            return -row.iform
+        end
+        return row.iform
+    end
+end
+
 function deck_over5a_source_update_inputs(result::DeckParseResult)
     rows = deck_over5a_source_rows(result)
     return DeckOVER5ASourceUpdateInputs(
         [row.name for row in rows],
         [row.node for row in rows],
         [row.node_value for row in rows],
-        [row.iform for row in rows],
+        _deck_over5a_source_execution_iform_values(rows),
         [row.line_no for row in rows],
         [row.layout_kind for row in rows],
         [row.tstart for row in rows],

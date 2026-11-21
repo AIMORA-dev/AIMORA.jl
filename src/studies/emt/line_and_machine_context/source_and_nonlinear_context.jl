@@ -129,12 +129,18 @@ function _electromagnetic_source_voltage_constraints(
     constraint_nodes = Int[]
     constraint_values = Float64[]
     constraint_rows = Int[]
-    ideal_transformer_predecessor_rows = Set(
-        row - 1 for row in preview.ideal_transformer_source_rows if row > 1
-    )
+    transformer_transferred_ports = Dict{Int,Int}()
+    for transfer_row in preview.ideal_transformer_source_rows
+        transfer_row > 1 || continue
+        predecessor_node = abs(preview.node_values[transfer_row - 1])
+        transformer_transferred_ports[predecessor_node] = transfer_row
+    end
     for index in eachindex(preview.e_update_indices, preview.e_update_values)
-        preview.e_update_rows[index] in ideal_transformer_predecessor_rows && continue
         node = preview.e_update_indices[index]
+        source_row = preview.e_update_rows[index]
+        # A transfer clears the voltage constraint on the preceding bus.
+        # Only a later source card can reestablish that constraint.
+        source_row <= get(transformer_transferred_ports, node, 0) && continue
         1 <= node <= node_count || continue
         existing = findfirst(==(node), constraint_nodes)
         if existing === nothing

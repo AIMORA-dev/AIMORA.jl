@@ -284,6 +284,7 @@ function _stamp_deck_branch_steady_state_admittance!(
     parsed::DeckParser.DeckParseResult,
     frequency_partition::DeckParser.DeckSteadyStateFrequencyPartition=
         DeckParser.deck_steady_state_frequency_partition(parsed);
+    include_fixed_series_rlc::Bool=false,
     excluded_universal_machine_indices::AbstractVector{<:Integer}=Int[],
     formulation::AbstractEMTHarmonicFormulation=PhysicalFrequencyFormulation(),
 )
@@ -308,6 +309,19 @@ function _stamp_deck_branch_steady_state_admittance!(
             )
         elseif row.branch_kind == :series_rl
             impedance = complex(Float64(row.resistance), angular_frequency * Float64(row.inductance))
+            _stamp_complex_branch_admittance!(
+                matrix,
+                row.from_node_value,
+                row.to_node_value,
+                inv(impedance),
+            )
+        elseif include_fixed_series_rlc && row.branch_kind == :series_rlc &&
+               angular_frequency > 0.0
+            impedance = complex(
+                Float64(row.resistance),
+                angular_frequency * Float64(row.inductance) -
+                    inv(angular_frequency * Float64(row.capacitance)),
+            )
             _stamp_complex_branch_admittance!(
                 matrix,
                 row.from_node_value,
@@ -1021,17 +1035,20 @@ end
 function _grouped_steady_state_diagnostics(
     admittance::AbstractMatrix{ComplexF64},
     rhs::AbstractVector{ComplexF64},
-    representatives::AbstractVector{<:Integer},
+    representatives::AbstractVector{<:Integer};
+    fixed_node_phasors = nothing,
 )
-    result = _solve_grouped_harmonic_linear_system(
-        admittance,
-        rhs,
-        representatives;
+    tolerances = (
         current_absolute_a=1.0e-12,
         current_relative=1.0e-10,
         rank_relative_threshold_multiplier=10.0,
         maximum_condition_estimate=Inf,
     )
+    result = fixed_node_phasors === nothing ?
+        _solve_grouped_harmonic_linear_system(admittance, rhs, representatives; tolerances...) :
+        _solve_grouped_constrained_harmonic_linear_system(
+            admittance, rhs, representatives, fixed_node_phasors; tolerances...,
+        )
     result.classification === :unique || throw(ArgumentError(
         "grouped steady-state network classification $(result.classification): " *
         "rank $(result.numerical_rank)/$(result.reduced_node_count), " *
