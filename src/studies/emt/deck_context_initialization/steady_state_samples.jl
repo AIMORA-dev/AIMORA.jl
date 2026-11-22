@@ -758,6 +758,13 @@ struct DeckCoupledBranchInitialHistory
     card_terminal_voltage_v::Vector{Float64}
 end
 
+struct DeckDistributedLineInitialHistory
+    from_voltage_v::Vector{Float64}
+    to_voltage_v::Vector{Float64}
+    from_current_a::Vector{Float64}
+    to_current_a::Vector{Float64}
+end
+
 function _bpa_supported_branch_table_owners(
     parsed::DeckParser.DeckParseResult,
     line_element_type = Union{},
@@ -864,7 +871,9 @@ function _deck_initial_history_branch(parsed, condition)
                 position = findfirst(row -> row.line_no == slot.line_no, parsed.coupled_line_rows)
                 if position !== nothing
                     row = parsed.coupled_line_rows[position]
-                    row.phase_index == 1 && row.line_kind == :mutual_source_equivalent && return row
+                    row.phase_index == 1 &&
+                    row.line_kind in (:mutual_source_equivalent, :distributed_transmission_line) &&
+                    return row
                 end
             end
             throw(ArgumentError(
@@ -931,6 +940,35 @@ function _bpa_indexed_initial_voltage_bus_order(parsed::DeckParser.DeckParseResu
     return append!(order, fixed_nodes)
 end
 
+function _deck_coupled_history_cards(section, conditions, start_index::Int)
+    last_index = start_index + section.phase_count - 1
+    last_index <= length(conditions) || throw(ArgumentError(
+        "line $(conditions[start_index].line_no): coupled branch history requires a card for every phase",
+    ))
+    series_current = zeros(section.phase_count)
+    from_current = similar(series_current)
+    to_current = similar(series_current)
+    for phase in eachindex(series_current)
+        card = conditions[start_index + phase - 1]
+        from = section.from_node_indices[phase]
+        to = section.to_node_indices[phase]
+        card.condition_kind == :node_current_initial_condition &&
+        card.node_index == from &&
+        coalesce(card.reference_node_index, 0) == to || throw(ArgumentError(
+            "line $(card.line_no): coupled branch history is missing its ordered phase $phase terminals",
+        ))
+        field = DeckParser.fixed_field(DeckParser.fixed_image(card.raw_text), 45, 59)
+        receiving_current = isempty(field) ? 0.0 : DeckParser._tryparse_fixed_float(field, 8)
+        receiving_current !== nothing &&
+        all(isfinite, (card.real_value, card.imaginary_value, receiving_current)) ||
+            throw(ArgumentError("line $(card.line_no): coupled branch history currents must be finite"))
+        series_current[phase] = card.real_value
+        from_current[phase] = card.imaginary_value
+        to_current[phase] = receiving_current
+    end
+    return series_current, from_current, to_current
+end
+
 function _deck_coupled_branch_initial_history!(
     histories::Dict{Symbol,DeckScalarBranchInitialHistory},
     parsed::DeckParser.DeckParseResult,
@@ -953,33 +991,10 @@ function _deck_coupled_branch_initial_history!(
     if !phase_pi && section.input_kind != :sequence_shorthand
         throw(ArgumentError("line $(row.line_no): explicit history requires a sequence R-L shorthand group"))
     end
-    last_index = start_index + section.phase_count - 1
-    last_index <= length(conditions) || throw(ArgumentError(
-        "line $(conditions[start_index].line_no): coupled branch history requires a card for every phase",
-    ))
-    series_current = zeros(section.phase_count)
-    from_current = similar(series_current)
-    to_current = similar(series_current)
-    card_voltage = similar(series_current)
-    for phase in eachindex(series_current)
-        card = conditions[start_index + phase - 1]
-        from = section.from_node_indices[phase]
-        to = section.to_node_indices[phase]
-        card.condition_kind == :node_current_initial_condition &&
-        card.node_index == from &&
-        coalesce(card.reference_node_index, 0) == to || throw(ArgumentError(
-            "line $(card.line_no): coupled branch history is missing its ordered phase $phase terminals",
-        ))
-        field = DeckParser.fixed_field(DeckParser.fixed_image(card.raw_text), 45, 59)
-        receiving_current = isempty(field) ? 0.0 : DeckParser._tryparse_fixed_float(field, 8)
-        receiving_current !== nothing &&
-        all(isfinite, (card.real_value, card.imaginary_value, receiving_current)) ||
-            throw(ArgumentError("line $(card.line_no): coupled branch history currents must be finite"))
-        series_current[phase] = card.real_value
-        from_current[phase] = card.imaginary_value
-        to_current[phase] = receiving_current
-        card_voltage[phase] = _deck_node_voltage(values, from) - _deck_node_voltage(values, to)
-    end
+    series_current, from_current, to_current =
+        _deck_coupled_history_cards(section, conditions, start_index)
+    card_voltage = [_deck_node_voltage(values, from) - _deck_node_voltage(values, to)
+                    for (from, to) in zip(section.from_node_indices, section.to_node_indices)]
     history = DeckCoupledBranchInitialHistory(series_current, card_voltage)
     if !phase_pi
         all(iszero, from_current) && all(iszero, to_current) || throw(ArgumentError(
@@ -1018,12 +1033,62 @@ function _deck_coupled_branch_initial_history!(
     return (_coupled_phase_pi_series_name(section), history, section.phase_count)
 end
 
+function _deck_distributed_line_initial_history(
+    parsed::DeckParser.DeckParseResult,
+    row::DeckParser.DeckCoupledLineRow,
+    conditions,
+    start_index::Int,
+    values::Vector{Float64},
+)
+    all(source -> source.iform == 11, parsed.over5a_source_rows) &&
+    isempty(parsed.control_system_source_rows) || throw(ArgumentError(
+        "line $(row.line_no): explicit distributed-line history requires Type 11 DC startup",
+    ))
+    states = DeckParser.deck_distributed_transposed_line_modal_branch_states(parsed)
+    selected = findfirst(state -> first(state.line_numbers) == row.line_no, states)
+    selected === nothing && throw(ArgumentError(
+        "line $(row.line_no): explicit history requires a complete transposed distributed line",
+    ))
+    state = states[selected]
+    from_current, from_imaginary, to_current = _deck_coupled_history_cards(
+        state, conditions, start_index,
+    )
+    all(iszero, from_imaginary) || throw(ArgumentError(
+        "line $(row.line_no): explicit distributed-line history requires real DC terminal currents",
+    ))
+    for index in start_index:(start_index + state.phase_count - 1)
+        card = conditions[index]
+        field = DeckParser.fixed_field(DeckParser.fixed_image(card.raw_text), 60, 74)
+        isempty(field) || DeckParser._tryparse_fixed_float(field, 8) == 0.0 ||
+            throw(ArgumentError(
+                "line $(card.line_no): explicit distributed-line history requires real DC terminal currents",
+            ))
+    end
+    for condition in conditions
+        condition.condition_kind == :node_voltage_initial_condition || continue
+        frequency = DeckParser.fixed_field(DeckParser.fixed_image(condition.raw_text), 39, 53)
+        iszero(condition.imaginary_value) &&
+        (isempty(frequency) || DeckParser._tryparse_fixed_float(frequency, 8) == 0.0) ||
+            throw(ArgumentError(
+                "line $(condition.line_no): explicit distributed-line history requires real DC terminal voltages",
+            ))
+    end
+    history = DeckDistributedLineInitialHistory(
+        [_deck_node_voltage(values, node) for node in state.from_node_indices],
+        [_deck_node_voltage(values, node) for node in state.to_node_indices],
+        from_current,
+        to_current,
+    )
+    return history, state.phase_count
+end
+
 function _deck_node_voltage_initial_sample(
     parsed::DeckParser.DeckParseResult,
     values::Vector{Float64} = zeros(Float64, length(parsed.node_map)),
 )
     histories = Dict{Symbol,DeckScalarBranchInitialHistory}()
     coupled_histories = Dict{Symbol,DeckCoupledBranchInitialHistory}()
+    distributed_histories = Dict{Int,DeckDistributedLineInitialHistory}()
     conditions = DeckParser.deck_node_initial_condition_rows(parsed)
     next_condition_index = 1
     voltage_count = 0
@@ -1050,7 +1115,13 @@ function _deck_node_voltage_initial_sample(
             voltage_count += 1
         elseif row.condition_kind == :node_current_initial_condition
             branch = _deck_initial_history_branch(parsed, row)
-            if branch isa Union{DeckParser.DeckCoupledPhasePiSectionRow,DeckParser.DeckCoupledLineRow}
+            if branch isa DeckParser.DeckCoupledLineRow &&
+               branch.line_kind == :distributed_transmission_line
+                history, phase_count =
+                    _deck_distributed_line_initial_history(parsed, branch, conditions, index, values)
+                distributed_histories[branch.line_no] = history
+                next_condition_index = index + phase_count
+            elseif branch isa Union{DeckParser.DeckCoupledPhasePiSectionRow,DeckParser.DeckCoupledLineRow}
                 name, history, phase_count =
                     _deck_coupled_branch_initial_history!(histories, parsed, branch, conditions, index, values)
                 coupled_histories[name] = history
@@ -1068,13 +1139,15 @@ function _deck_node_voltage_initial_sample(
             scalar_conditions = false
         end
     end
-    voltage_count == 0 && isempty(histories) && isempty(coupled_histories) && return nothing
+    voltage_count == 0 && isempty(histories) && isempty(coupled_histories) &&
+        isempty(distributed_histories) && return nothing
     sample = _deck_transient_initial_voltage_sample(
         parsed, values, :deck_node_voltage_initial_conditions; condition_count = voltage_count,
     )
     return merge(sample, (
         scalar_branch_initial_histories = histories,
         coupled_branch_initial_histories = coupled_histories,
+        distributed_line_initial_histories = distributed_histories,
         stage_node_voltage_history = voltage_count > 0 && scalar_conditions,
     ))
 end

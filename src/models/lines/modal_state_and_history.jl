@@ -1658,6 +1658,13 @@ function distributed_transposed_line_initial_history_phasors(;
     )
 end
 
+function _distributed_line_initial_history_frequency(value::Real)
+    frequency = Float64(value)
+    isfinite(frequency) && frequency >= 0.0 ||
+        throw(ArgumentError("steady_state_frequency_hz must be finite and nonnegative"))
+    return frequency
+end
+
 function distributed_transposed_line_initial_history_seed(;
     timestep_s::Real,
     steady_state_frequency_hz::Real,
@@ -1679,8 +1686,7 @@ function distributed_transposed_line_initial_history_seed(;
     mode_count > 0 ||
         throw(ArgumentError("distributed transposed line initial history seed requires at least one mode"))
     timestep = _positive_finite_impedance_value("timestep_s", timestep_s)
-    frequency = _positive_finite_impedance_value("steady_state_frequency_hz",
-                                                 steady_state_frequency_hz)
+    frequency = _distributed_line_initial_history_frequency(steady_state_frequency_hz)
     angular_step = 2.0 * pi * frequency * timestep
     delay_counts = _copy_integer_modal_values("modal_delay_counts", modal_delay_counts, mode_count)
     from_amplitudes = _copy_real_modal_values(
@@ -1861,10 +1867,7 @@ function distributed_transposed_line_history_state(
     seed.modal_indices == collect(1:state.group_length) ||
         throw(ArgumentError("distributed transposed line seed modal indices must match branch state order"))
     timestep = _positive_finite_impedance_value("timestep_s", timestep_s)
-    frequency = _positive_finite_impedance_value(
-        "steady_state_frequency_hz",
-        steady_state_frequency_hz,
-    )
+    frequency = _distributed_line_initial_history_frequency(steady_state_frequency_hz)
     history_from = [copy(values) for values in seed.modal_history_from_values]
     history_to = [copy(values) for values in seed.modal_history_to_values]
     sample_counts = Int[length(values) for values in history_from]

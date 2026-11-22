@@ -91,27 +91,36 @@ function _distributed_transposed_line_modal_component_terms(phase_terms, phase_c
     )
 end
 
-function _distributed_transposed_line_steady_state_initial_history(
+function _distributed_transposed_line_initial_history(
     modal_state,
     pi_equivalent,
     sample,
     timestep_s::Real,
     history_storage_start_index::Integer,
-    index::Integer,
+    index::Integer;
+    prescribed = nothing,
 )
     phase_count = modal_state.phase_count
-    from_voltage =
-        _steady_state_terminal_phasors(sample, modal_state.from_node_indices)
-    to_voltage =
-        _steady_state_terminal_phasors(sample, modal_state.to_node_indices)
-    series_admittance = inv(pi_equivalent.phase_series_impedance_matrix)
-    shunt_admittance = pi_equivalent.phase_shunt_admittance_matrix
-    terminal_current_from =
-        series_admittance * (from_voltage - to_voltage) +
-        shunt_admittance * from_voltage
-    terminal_current_to =
-        series_admittance * (to_voltage - from_voltage) +
-        shunt_admittance * to_voltage
+    if prescribed === nothing
+        from_voltage =
+            _steady_state_terminal_phasors(sample, modal_state.from_node_indices)
+        to_voltage =
+            _steady_state_terminal_phasors(sample, modal_state.to_node_indices)
+        series_admittance = inv(pi_equivalent.phase_series_impedance_matrix)
+        shunt_admittance = pi_equivalent.phase_shunt_admittance_matrix
+        terminal_current_from =
+            series_admittance * (from_voltage - to_voltage) + shunt_admittance * from_voltage
+        terminal_current_to =
+            series_admittance * (to_voltage - from_voltage) + shunt_admittance * to_voltage
+        frequency_hz = sample.steady_state_frequency_hz
+    else
+        from_voltage = ComplexF64.(prescribed.from_voltage_v)
+        to_voltage = ComplexF64.(prescribed.to_voltage_v)
+        terminal_current_from = ComplexF64.(prescribed.from_current_a)
+        terminal_current_to = ComplexF64.(prescribed.to_current_a)
+        # OVER13 fills every prehistory slot from the same DC endpoint state.
+        frequency_hz = 0.0
+    end
     phase_matrix = distributed_transposed_line_initial_history_phase_matrix(
         modal_state;
         name = Symbol(
@@ -169,7 +178,7 @@ function _distributed_transposed_line_steady_state_initial_history(
         floor.(Int, modal_state.modal_propagation_times_s ./ Float64(timestep_s))
     seed = distributed_transposed_line_initial_history_seed(
         timestep_s = timestep_s,
-        steady_state_frequency_hz = sample.steady_state_frequency_hz,
+        steady_state_frequency_hz = frequency_hz,
         modal_delay_counts = delay_counts,
         outgoing_wave_from_amplitudes = phasors.modal_history_from_amplitudes,
         outgoing_wave_from_phases = phasors.modal_history_from_phases,
@@ -190,7 +199,7 @@ function _distributed_transposed_line_steady_state_initial_history(
         modal_state,
         seed;
         timestep_s = timestep_s,
-        steady_state_frequency_hz = sample.steady_state_frequency_hz,
+        steady_state_frequency_hz = frequency_hz,
         initialized_from_steady_state = true,
         name = Symbol("distributed_transposed_line_history_state_", index),
     )
@@ -268,54 +277,88 @@ function _shared_distributed_transposed_line_history_states(
     return shared_histories
 end
 
+function _stage_distributed_line_tick_zero!(
+    modal_states,
+    histories,
+    values::AbstractVector{Float64},
+)
+    # The packed seed's final slot holds OVER13's mixed incident sample.
+    # Move it into the slot read by SUBTS2 at tick zero, then advance the
+    # history once since the prescribed node sample replaces that tick's solve.
+    for history in histories
+        for slot in history.storage_end_indices
+            offset = slot - history.history_storage_start_index + 1
+            history.packed_history_from_values[offset - 1] =
+                history.packed_history_from_values[offset]
+            history.packed_history_to_values[offset - 1] =
+                history.packed_history_to_values[offset]
+        end
+        fill!(history.history_read_indices, 0)
+    end
+    for (state, history) in zip(modal_states, histories)
+        distributed_transposed_line_modal_timestep_update!(
+            state,
+            history,
+            _terminal_voltage_values(values, state.from_node_indices),
+            _terminal_voltage_values(values, state.to_node_indices);
+            collect_diagnostics = false,
+        )
+    end
+    return nothing
+end
+
 function _deck_distributed_transposed_line_config(
     parsed::DeckParser.DeckParseResult;
     steady_state_initial_sample = nothing,
+    prescribed_histories = nothing,
+    prescribed_initial_voltage_values = nothing,
 )
     modal_states = DeckParser.deck_distributed_transposed_line_modal_branch_states(parsed)
     isempty(modal_states) && return nothing
-    pi_equivalents =
-        DeckParser.deck_distributed_transposed_line_steady_state_pi_equivalents(parsed)
-    if steady_state_initial_sample !== nothing &&
-       length(pi_equivalents) != length(modal_states)
-        throw(ArgumentError("steady-state distributed-line initialization requires a PI equivalent for each modal line state"))
-    end
-    history_states =
-        steady_state_initial_sample === nothing ?
-        DeckParser.deck_distributed_transposed_line_history_states(
-            parsed;
-            first_history_storage_index = 1,
-        ) :
-        begin
-            options = DeckParser.deck_fixed_time_horizon_options(parsed)
-            storage_index = 1
-            histories = DistributedTransposedLineHistoryState[]
-            initial_history_results = Any[]
-            for index in eachindex(modal_states)
-                initial_history =
-                    _distributed_transposed_line_steady_state_initial_history(
-                    modal_states[index],
-                    pi_equivalents[index],
-                    steady_state_initial_sample,
-                    options.dt_s,
-                    storage_index,
-                    index,
+    initial_history_results = Any[]
+    has_prescribed_history = prescribed_histories !== nothing && !isempty(prescribed_histories)
+    if steady_state_initial_sample === nothing && !has_prescribed_history
+        history_states = DeckParser.deck_distributed_transposed_line_history_states(parsed)
+    else
+        pi_equivalents =
+            DeckParser.deck_distributed_transposed_line_steady_state_pi_equivalents(parsed)
+        length(pi_equivalents) == length(modal_states) ||
+            throw(ArgumentError("distributed-line initialization requires a PI equivalent for each modal line state"))
+        options = DeckParser.deck_fixed_time_horizon_options(parsed)
+        storage_index = 1
+        histories = DistributedTransposedLineHistoryState[]
+        for (index, state) in enumerate(modal_states)
+            prescribed = prescribed_histories === nothing ? nothing :
+                get(prescribed_histories, first(state.line_numbers), nothing)
+            if prescribed === nothing && steady_state_initial_sample === nothing
+                zero_phases = zeros(state.phase_count)
+                prescribed = DeckDistributedLineInitialHistory(
+                    zero_phases, zero_phases, zero_phases, zero_phases,
                 )
-                history = initial_history.history
-                push!(histories, history)
-                push!(initial_history_results, initial_history)
-                storage_index = history.next_history_storage_index
             end
-            _shared_distributed_transposed_line_history_states(histories)
+            result = _distributed_transposed_line_initial_history(
+                state, pi_equivalents[index], steady_state_initial_sample,
+                options.dt_s, storage_index, index; prescribed,
+            )
+            history = result.history
+            push!(initial_history_results, result)
+            push!(histories, history)
+            storage_index = history.next_history_storage_index
         end
+        history_states = _shared_distributed_transposed_line_history_states(histories)
+        if has_prescribed_history
+            _stage_distributed_line_tick_zero!(
+                modal_states, history_states, prescribed_initial_voltage_values,
+            )
+        end
+    end
     length(history_states) == length(modal_states) ||
         throw(ArgumentError("distributed transposed line modal/history state counts must match"))
     return (
         enabled = true,
         modal_states = modal_states,
         history_states = history_states,
-        steady_state_initial_history_results =
-            steady_state_initial_sample === nothing ? Any[] : initial_history_results,
+        steady_state_initial_history_results = initial_history_results,
         current_injection_values = Float64[],
     )
 end

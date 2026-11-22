@@ -1880,6 +1880,10 @@ function _prepare_dynamic_deck_runtime(
         _deck_distributed_transposed_line_config(
             parsed;
             steady_state_initial_sample = network_initial_sample,
+            prescribed_histories = hasproperty(steady_state_initial_sample, :distributed_line_initial_histories) ?
+                steady_state_initial_sample.distributed_line_initial_histories : nothing,
+            prescribed_initial_voltage_values = hasproperty(steady_state_initial_sample, :node_voltage_values) ?
+                steady_state_initial_sample.node_voltage_values : nothing,
         ) :
         nothing
     deck_owned_over16_output_config =

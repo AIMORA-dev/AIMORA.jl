@@ -97,6 +97,7 @@ function _apply_deck_node_voltage_conditions(parsed::DeckParser.DeckParseResult,
         node_voltage_condition_count = node_conditions.node_voltage_condition_count,
         scalar_branch_initial_histories = node_conditions.scalar_branch_initial_histories,
         coupled_branch_initial_histories = node_conditions.coupled_branch_initial_histories,
+        distributed_line_initial_histories = node_conditions.distributed_line_initial_histories,
         stage_node_voltage_history = node_conditions.stage_node_voltage_history,
     ))
 end
