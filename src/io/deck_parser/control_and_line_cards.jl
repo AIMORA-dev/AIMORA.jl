@@ -2143,10 +2143,24 @@ end
 
 function fixed_float_or_default!(result::DeckParseResult, image::AbstractString,
                                  line_no::Int, first_col::Int, last_col::Int,
-                                 field::AbstractString, default::Real)
+                                 field::AbstractString, default::Real;
+                                 implied_decimal_places::Int = 0)
     raw = fixed_field(image, first_col, last_col)
     isempty(raw) && return Float64(default)
-    value = tryparse_deck_float(raw)
+    value = if implied_decimal_places == 0
+        tryparse_deck_float(raw)
+    else
+        text = normalized_fortran_float_text(replace(raw, ' ' => ""))
+        omitted_point = match(r"^([+-]?\d+)(?:[Ee]([+-]?\d+))?$", text)
+        if omitted_point === nothing
+            tryparse_deck_float(text)
+        else
+            mantissa, exponent_text = omitted_point.captures
+            exponent = exponent_text === nothing ? 0 : tryparse(Int, exponent_text)
+            exponent === nothing ? nothing :
+                tryparse(Float64, string(mantissa, "E", exponent - implied_decimal_places))
+        end
+    end
     if value === nothing
         add_issue!(result.validation,
                    invalid_value("line $line_no",

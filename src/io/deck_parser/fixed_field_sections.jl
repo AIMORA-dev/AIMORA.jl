@@ -1597,6 +1597,7 @@ function parse_node_initial_condition_row!(result::DeckParseResult,
     # field starts immediately after the node name. Type 3 has a second A6.
     reference_node = code == 2 ? "" : fixed_field(image, 9, 14)
     first_value_column = code == 2 ? 9 : 15
+    implied_decimal_places = code == 2 ? 8 : 0
     real_value = fixed_float_or_default!(
         result,
         image,
@@ -1604,7 +1605,8 @@ function parse_node_initial_condition_row!(result::DeckParseResult,
         first_value_column,
         first_value_column + 14,
         "node_initial_condition_real_value",
-        0.0,
+        0.0;
+        implied_decimal_places,
     )
     imaginary_value = fixed_float_or_default!(
         result,
@@ -1613,8 +1615,13 @@ function parse_node_initial_condition_row!(result::DeckParseResult,
         first_value_column + 15,
         first_value_column + 29,
         "node_initial_condition_imaginary_value",
-        0.0,
+        0.0;
+        implied_decimal_places,
     )
+    if code == 2
+        bus_index = fixed_int_or_default!(result, image, line_no, 75, 80, "initial_bus_index", 0)
+        bus_index === nothing && return true
+    end
     if real_value === nothing || imaginary_value === nothing
         return true
     end

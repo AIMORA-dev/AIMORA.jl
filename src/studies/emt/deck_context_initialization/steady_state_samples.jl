@@ -753,6 +753,63 @@ struct DeckCapacitorInitialHistory
     terminal_voltage_v::Float64
 end
 
+function _bpa_indexed_initial_voltage_bus_order(parsed::DeckParser.DeckParseResult)
+    branches = parsed.over2_branch_rows
+    sources = parsed.over5a_source_rows
+    # OVER6/7 number the ground and active scalar network before source
+    # buses. Expansion, switching and exceptional source ordering need
+    # their own original bus-table reconstruction.
+    isempty(parsed.over5_switch_rows) &&
+    all(branch -> branch.source_kind == :scalar && branch.branch_type == 0, branches) &&
+    all(source -> source.node_value > 0 && source.iform in (11, 14) &&
+                  source.tstart != -9988.0, sources) &&
+    all(element -> element isa Union{
+        ConductanceBranch, SeriesRLBranch, SeriesRLCBranch, CapacitorBranch, TheveninSource,
+    }, parsed.elements) || throw(ArgumentError(
+        "an indexed BPA node voltage requires a supported fixed scalar bus table",
+    ))
+
+    fixed_nodes = BitSet(source.node_value for source in sources)
+    nodes = union(BitSet((0,)), fixed_nodes)
+    for branch in branches
+        push!(nodes, branch.from_node_value, branch.to_node_value)
+    end
+    neighbors = Dict(node => BitSet() for node in nodes)
+    for branch in branches
+        a, b = branch.from_node_value, branch.to_node_value
+        (a == 0 || b == 0 || a == b) && continue
+        push!(neighbors[a], b)
+        push!(neighbors[b], a)
+    end
+
+    # The original algorithm uses the newest entry at each degree. A
+    # neighbor is reinserted only when its degree changes after fill-in.
+    remaining = setdiff(nodes, fixed_nodes)
+    priority = Dict(node => position for (position, node) in enumerate(nodes))
+    clock = length(nodes)
+    order = Int[]
+    while !isempty(remaining)
+        node = argmin(n -> (length(neighbors[n]), -priority[n]), remaining)
+        delete!(remaining, node)
+        push!(order, node)
+        adjacent = neighbors[node]
+        for other in adjacent
+            connections = neighbors[other]
+            previous_degree = length(connections)
+            delete!(connections, node)
+            union!(connections, adjacent)
+            delete!(connections, other)
+            if other in remaining && length(connections) != previous_degree
+                clock += 1
+                priority[other] = clock
+            end
+        end
+    end
+    ground = findfirst(iszero, order)
+    order[1], order[ground] = order[ground], order[1]
+    return append!(order, fixed_nodes)
+end
+
 function _deck_node_voltage_initial_sample(
     parsed::DeckParser.DeckParseResult,
     values::Vector{Float64} = zeros(Float64, length(parsed.node_map)),
@@ -760,8 +817,22 @@ function _deck_node_voltage_initial_sample(
     histories = Dict{Tuple{Int,Int},DeckCapacitorInitialHistory}()
     voltage_count = 0
     scalar_conditions = true
+    indexed_bus_order = nothing
     for row in DeckParser.deck_node_initial_condition_rows(parsed)
         if row.condition_kind == :node_voltage_initial_condition && row.node_index > 0
+            image = DeckParser.fixed_image(row.raw_text)
+            bus_index = something(DeckParser.fixed_int_value(image, 75, 80), 0)
+            if bus_index > 0
+                if indexed_bus_order === nothing
+                    indexed_bus_order = _bpa_indexed_initial_voltage_bus_order(parsed)
+                end
+                if !checkbounds(Bool, indexed_bus_order, bus_index) ||
+                   indexed_bus_order[bus_index] != row.node_index
+                    throw(ArgumentError(
+                        "line $(row.line_no): BPA initial-voltage bus index $bus_index does not name $(row.node)",
+                    ))
+                end
+            end
             reference = coalesce(row.reference_node_index, 0)
             values[row.node_index] = _deck_node_voltage(values, reference) + row.real_value
             voltage_count += 1
