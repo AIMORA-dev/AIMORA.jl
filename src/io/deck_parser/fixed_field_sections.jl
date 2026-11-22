@@ -1,10 +1,33 @@
 
 function validate_coupled_phase_pi_section_rows!(result::DeckParseResult)
-    groups = _coupled_phase_pi_row_groups(result.coupled_phase_pi_section_rows)
+    rows = result.coupled_phase_pi_section_rows
+    isempty(rows) && return result
+    groups = _coupled_phase_pi_row_groups(rows)
+    grouped_lines = Set(row.line_no for group in groups for row in group)
+    for row in rows
+        row.line_no in grouped_lines && continue
+        record_fixed_blocker!(
+            result, :bpa_fixed_branch_blocked, :fixed_card_coupled_phase_pi_section_deferred,
+        )
+        add_issue!(result.validation, invalid_value(
+            "line $(row.line_no)",
+            "out-of-order fixed-card coupled phase pi row $(row.phase_index)",
+        ))
+    end
+    other_branch_lines = sort!(unique!(vcat(
+        result.element_line_numbers,
+        [row.line_no for row in result.over2_branch_rows],
+        [row.line_no for row in result.coupled_line_rows],
+    )))
     accepted_sections = CoupledLumpedPhasePiSection[]
     for (index, group) in enumerate(groups)
         first_row = first(group)
         try
+            intervening = searchsortedlast(other_branch_lines, first_row.line_no) + 1
+            if intervening <= length(other_branch_lines) &&
+               other_branch_lines[intervening] < last(group).line_no
+                throw(ArgumentError("coupled phase pi rows must be consecutive branch cards"))
+            end
             section =
                 _coupled_phase_pi_section_from_rows(result, group, index, accepted_sections)
             push!(accepted_sections, section)

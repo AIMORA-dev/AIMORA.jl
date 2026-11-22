@@ -801,10 +801,14 @@ function _bpa_initial_history_branch_slots(parsed::DeckParser.DeckParseResult)
         length(parsed.coupled_line_rows) || return nothing
 
     # OVER2 allocates one slot per physical phase in input order.
-    slots = [(line_no = row.line_no, scalar_index = index)
+    slots = [(line_no = row.line_no,
+              terminals = (row.from_node_value, row.to_node_value),
+              scalar_index = index)
              for (index, row) in enumerate(parsed.over2_branch_rows)]
     for rows in (parsed.coupled_phase_pi_section_rows, parsed.coupled_line_rows), row in rows
-        push!(slots, (line_no = row.line_no, scalar_index = 0))
+        push!(slots, (line_no = row.line_no,
+                      terminals = (row.from_node_value, row.to_node_value),
+                      scalar_index = 0))
     end
     allunique(slot -> slot.line_no, slots) || return nothing
     return sort!(slots; by = slot -> slot.line_no)
@@ -819,26 +823,36 @@ function _deck_scalar_initial_history_branch(parsed, condition)
     ))
     terminals = (condition.node_index, coalesce(condition.reference_node_index, 0))
     branches = parsed.over2_branch_rows
-    same_endpoints(branch) = (branch.from_node_value, branch.to_node_value) == terminals
-    if branch_index <= 0
-        branch_index = findfirst(same_endpoints, branches)
-        branch_index === nothing && throw(ArgumentError(
+    expanded = !isempty(parsed.coupled_phase_pi_section_rows) ||
+               !isempty(parsed.coupled_line_rows)
+    if branch_index <= 0 && !expanded
+        scalar_index = findfirst(branches) do branch
+            (branch.from_node_value, branch.to_node_value) == terminals
+        end
+        scalar_index === nothing && throw(ArgumentError(
             "line $(condition.line_no): no BPA initial-history branch matches the oriented terminals",
         ))
     else
         slots = _bpa_initial_history_branch_slots(parsed)
         slots === nothing && throw(ArgumentError(
-            "line $(condition.line_no): BPA initial-history branch index requires a supported fixed branch table",
+            "line $(condition.line_no): BPA initial-history branch selection requires a supported fixed branch table",
         ))
-        scalar_index = checkbounds(Bool, slots, branch_index) ? slots[branch_index].scalar_index : 0
-        if scalar_index == 0 || !same_endpoints(branches[scalar_index])
+        if branch_index <= 0
+            branch_index = findfirst(slot -> slot.terminals == terminals, slots)
+            branch_index === nothing && throw(ArgumentError(
+                "line $(condition.line_no): no BPA initial-history branch matches the oriented terminals",
+            ))
+        elseif !checkbounds(Bool, slots, branch_index) || slots[branch_index].terminals != terminals
             throw(ArgumentError(
-                "line $(condition.line_no): BPA initial-history branch index $branch_index does not match the oriented terminals of a scalar branch",
+                "line $(condition.line_no): BPA initial-history branch index $branch_index does not match the oriented terminals",
             ))
         end
-        branch_index = scalar_index
+        scalar_index = slots[branch_index].scalar_index
+        scalar_index == 0 && throw(ArgumentError(
+            "line $(condition.line_no): BPA initial-history branch index $branch_index selects a coupled branch with unsupported explicit history",
+        ))
     end
-    branch = branches[branch_index]
+    branch = branches[scalar_index]
     return branch.branch_kind in (:capacitor, :series_rl, :series_rlc) ? branch : nothing
 end
 
