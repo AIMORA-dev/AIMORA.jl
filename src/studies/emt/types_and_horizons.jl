@@ -1082,6 +1082,8 @@ mutable struct ControlSystemNetworkRuntime
     signal_slot_names::Vector{Symbol}
     network_voltage_source_names::Vector{Symbol}
     network_voltage_source_node_indices::Vector{Int}
+    # Declared fixed-card windows are rebuilt from the prepared deck on restore.
+    network_voltage_source_windows::Dict{Symbol,Tuple{Float64,Float64}}
     switch_observations::Vector{ControlSwitchObservation}
     switch_elements::Vector{TACSControlledSwitch}
     switch_signal_names::Vector{Symbol}

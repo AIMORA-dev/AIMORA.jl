@@ -2417,6 +2417,7 @@ function _control_system_supplemental_device_runtime(
     end
     for row in parsed_rows
         for term in row.input_terms
+            term.polarity == 0 && continue
             term.name in device_name_set || push!(ordinary_name_set, term.name)
         end
         for name in (row.control_signal, row.reference_signal)
@@ -2522,7 +2523,13 @@ function _control_system_supplemental_device_runtime(
         false,
         0,
     )
-    _initialize_control_system_device_histories!(runtime)
+    # TACS2 runs its DC selector sweep only for a negative-start DC source.
+    initialize_dc_selectors = any(parsed.control_system_source_rows) do source
+        source.activation_start_time_s < 0.0 &&
+            (source.source_type in (11, 92, 93) ||
+             (source.source_type in (90, 91) && source.amplitude === 1.0))
+    end
+    _initialize_control_system_device_histories!(runtime; initialize_dc_selectors)
     for index in eachindex(device_names)
         state.values[device_names[index]] = runtime.state.xtcs_values[output_slots[index]]
     end

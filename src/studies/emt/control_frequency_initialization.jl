@@ -79,6 +79,10 @@ function _control_system_frequency_device_value(
                 phasors[term.xtcs_index] * term.scale
         elseif selector == 6 && row.control_index > 0
             return phasors[row.control_index]
+        elseif selector == 7
+            return complex(p3)
+        elseif selector == 8
+            return complex(p2)
         end
         return 0.0 + 0.0im
     elseif row.device_type == 62

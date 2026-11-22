@@ -186,12 +186,15 @@ function _initialize_control_system_device_outputs!(
 end
 
 function _initialize_control_system_device_histories!(
-    runtime::ControlSystemSupplementalDeviceRuntime,
+    runtime::ControlSystemSupplementalDeviceRuntime;
+    initialize_dc_selectors::Bool = true,
 )
     runtime.initialized && return runtime
     _initialize_control_system_device_outputs!(runtime) do slot, row
         state = runtime.state
-        if row.device_type == 66
+        if row.device_type == 61 && !initialize_dc_selectors
+            state.xtcs_values[slot] = 0.0
+        elseif row.device_type == 66
             first_slot = row.parsup_index + 1
             history = @view state.parsup_values[first_slot:(row.parsup_index + row.control_index)]
             # VALUE is a signed input sample. The transient ring stores squares.
@@ -704,6 +707,11 @@ function _advance_control_system_network_runtime!(
                     Float64(network_voltage[runtime.network_voltage_source_node_indices[index]])
             end
             _project_closed_controlled_switch_voltages!(runtime, network_voltage)
+            for (name, (start_time, stop_time)) in runtime.network_voltage_source_windows
+                name in runtime.network_voltage_source_names || continue
+                _control_voltage_observation_active(start_time, stop_time, time) ||
+                    (runtime.state.values[name] = 0.0)
+            end
             _sample_control_switch_observations!(
                 runtime,
                 network_voltage,
@@ -741,6 +749,8 @@ end
 function _control_system_network_phasors(
     runtime::ControlSystemNetworkRuntime,
     sample,
+    declared_sources::Dict{Symbol,DeckParser.DeckControlSystemSourceRow},
+    initialize_declared_ac::Bool,
 )
     phasors = Dict{Symbol,Tuple{Float64,ComplexF64}}()
     hasproperty(sample, :node_voltage_phasors) &&
@@ -749,6 +759,11 @@ function _control_system_network_phasors(
         node = runtime.network_voltage_source_node_indices[index]
         node <= length(sample.node_steady_state_frequencies_hz) || continue
         frequency = sample.node_steady_state_frequencies_hz[node]
+        source = get(declared_sources, name, nothing)
+        if source !== nothing
+            initialize_declared_ac && source.activation_start_time_s < 0.0 || continue
+            frequency = coalesce(source.delay_or_time_constant, 0.0)
+        end
         isfinite(frequency) && frequency > 0.0 || continue
         projected = any(runtime.switch_elements) do switch
             switch.last_conductance == switch.on_conductance &&
@@ -762,22 +777,47 @@ function _control_system_network_phasors(
     return phasors
 end
 
+function _uses_bpa_startup_sample(sample)
+    return (hasproperty(sample, :bpa_control_startup) && sample.bpa_control_startup) ||
+        (hasproperty(sample, :source) && sample.source == :bpa_fixed_source_startup_voltage_phasors)
+end
+
 function _initialize_control_system_network_steady_state!(
     runtime::ControlSystemNetworkRuntime,
     network_voltage::AbstractVector{<:Real};
     parsed::DeckParser.DeckParseResult,
     steady_state_sample = nothing,
 )
+    bpa_control_startup = _uses_bpa_startup_sample(steady_state_sample)
+    declared_sources = Dict(
+        source.name => source for source in parsed.control_system_source_rows if
+        source.source_type == 90 &&
+        (bpa_control_startup || !_short_control_voltage_observation(source))
+    )
+    initialize_declared_ac = any(parsed.control_system_source_rows) do source
+        source.activation_start_time_s < 0.0 &&
+            (source.source_type == 14 ||
+             (source.source_type in (90, 91) && coalesce(source.amplitude, 0.0) == 0.0))
+    end
     for index in eachindex(runtime.network_voltage_source_names)
         runtime.state.values[runtime.network_voltage_source_names[index]] =
             Float64(network_voltage[runtime.network_voltage_source_node_indices[index]])
     end
     _project_closed_controlled_switch_voltages!(runtime, network_voltage)
-    network_phasors = _control_system_network_phasors(runtime, steady_state_sample)
-    # The frequency initializer restores these voltages at t = 0.
-    # Exclude them from the DC solve and history fill to avoid adding them twice.
+    network_phasors = _control_system_network_phasors(
+        runtime, steady_state_sample, declared_sources, initialize_declared_ac,
+    )
     for name in keys(network_phasors)
-        runtime.state.values[name] = 0.0
+        # Short observations are initialized from the network AC solution.
+        # Fixed-card mode 1 can contribute independently to the DC sweep.
+        haskey(declared_sources, name) || (runtime.state.values[name] = 0.0)
+    end
+    for (name, source) in declared_sources
+        if source.amplitude !== 1.0 || !_control_voltage_observation_active(
+            source.activation_start_time_s, source.activation_stop_time_s, 0.0,
+        )
+            runtime.state.values[name] = 0.0
+        end
     end
     initialize_control_function_steady_state!(runtime.state)
     supplemental = runtime.supplemental_devices

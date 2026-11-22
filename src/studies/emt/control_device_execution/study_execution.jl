@@ -80,22 +80,52 @@ function _deck_fixed_source_initial_voltage_sample(
         phasor_sample = deck_steady_state_voltage_phasors(
             parsed; saturated_transformer_intake, bpa_fixed_source_startup = true,
         )
-        node_conditions = _deck_node_voltage_initial_sample(
-            parsed, copy(phasor_sample.node_voltage_values),
-        )
-        node_conditions === nothing && return phasor_sample
-        return merge(phasor_sample, (
-            node_voltage_values = node_conditions.node_voltage_values,
-            output_voltage_values = node_conditions.output_voltage_values,
-            node_voltage_condition_count = node_conditions.node_voltage_condition_count,
-        ))
+        return _apply_deck_node_voltage_conditions(parsed, phasor_sample)
     end
     node_conditions = _deck_node_voltage_initial_sample(parsed)
     return node_conditions === nothing ? _deck_zero_initial_voltage_sample(parsed) : node_conditions
 end
 
+function _apply_deck_node_voltage_conditions(parsed::DeckParser.DeckParseResult, phasor_sample)
+    node_conditions = _deck_node_voltage_initial_sample(
+        parsed, copy(phasor_sample.node_voltage_values),
+    )
+    node_conditions === nothing && return phasor_sample
+    return merge(phasor_sample, (
+        node_voltage_values = node_conditions.node_voltage_values,
+        output_voltage_values = node_conditions.output_voltage_values,
+        node_voltage_condition_count = node_conditions.node_voltage_condition_count,
+        node_voltage_conditions_only = node_conditions.node_voltage_conditions_only,
+    ))
+end
+
 function _deck_uses_current_zero_switching(parsed::DeckParser.DeckParseResult)
     return !isempty(_deck_current_zero_switch_names(parsed))
+end
+
+function _deck_bpa_control_initial_sample(
+    parsed::DeckParser.DeckParseResult,
+    time_horizon::Symbol,
+    initial_voltage_source::Symbol,
+    saturated_transformer_intake = nothing,
+)
+    time_horizon == :deck && initial_voltage_source == :none || return nothing
+    # With the deck selecting startup, started TACS AC rows require the
+    # harmonic solution even on the impedance-source network route.
+    starts_in_ac = any(parsed.control_system_source_rows) do source
+        source.activation_start_time_s < 0.0 &&
+            (source.source_type == 14 ||
+             (source.source_type in (90, 91) &&
+              coalesce(source.amplitude, 0.0) == 0.0))
+    end
+    has_voltage_observations = any(source -> source.source_type == 90,
+        parsed.control_system_source_rows)
+    starts_in_ac || has_voltage_observations || return nothing
+    sample = deck_steady_state_voltage_phasors(
+        parsed; saturated_transformer_intake, bpa_control_startup = true,
+    )
+    startup = merge(sample, (bpa_control_startup = true,))
+    return _apply_deck_node_voltage_conditions(parsed, startup)
 end
 
 function _deck_has_nonlinear_runtime_owners(
@@ -351,6 +381,11 @@ function _run_deck_emt(
             _deck_fixed_source_initial_voltage_sample(
                 parsed, time_horizon, initial_voltage_source, saturated_transformer_intake,
             ) : nothing
+        if initial_sample === nothing
+            initial_sample = _deck_bpa_control_initial_sample(
+                parsed, time_horizon, initial_voltage_source, saturated_transformer_intake,
+            )
+        end
         boundary_run = run_deck_emt_with_over16_boundary(
             parsed,
             boundary_state;
@@ -468,6 +503,12 @@ function _run_deck_emt(
         saturated_transformer_branch_runtime_enabled ?
         _deck_runtime_saturated_transformer_intake(parsed) :
         nothing
+    if initial_sample === nothing || type11_zero_state_initialization || node_condition_initialization
+        control_startup_sample = _deck_bpa_control_initial_sample(
+            parsed, time_horizon, initial_voltage_source, saturated_transformer_intake,
+        )
+        control_startup_sample === nothing || (initial_sample = control_startup_sample)
+    end
     context =
         saturated_transformer_intake !== nothing ?
         saturated_transformer_branch_augmented_step_context(
@@ -608,6 +649,11 @@ function prepare_emt_study(
         !isempty(saturated_transformer_intake.breakpoints)
     if fixed_voltage_source_runtime && initial_voltage_sample === nothing
         initial_voltage_sample = _deck_fixed_source_initial_voltage_sample(
+            parsed, time_horizon, initial_voltage_source, saturated_transformer_intake,
+        )
+    end
+    if initial_voltage_sample === nothing
+        initial_voltage_sample = _deck_bpa_control_initial_sample(
             parsed, time_horizon, initial_voltage_source, saturated_transformer_intake,
         )
     end
@@ -1328,7 +1374,13 @@ function run_deck_emt(
     )
     _apply_due_series_rlc_alterations!(context)
     if initial_voltage_sample !== nothing
-        _seed_steady_state_network_state!(context, initial_voltage_sample)
+        _seed_steady_state_network_state!(
+            context,
+            initial_voltage_sample;
+            stage_imposed_branch_voltage =
+                hasproperty(initial_voltage_sample, :node_voltage_conditions_only) &&
+                initial_voltage_sample.node_voltage_conditions_only,
+        )
         initial_output_values = _steady_state_initial_output_values(context)
         _apply_steady_state_initial_sample!(
             context,

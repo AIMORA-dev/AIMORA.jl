@@ -2011,11 +2011,8 @@ function _prepare_dynamic_deck_runtime(
         _steady_state_initial_output_values(context)
     # The BPA phasor sample supplies the initialized companion histories.
     # Its residual at tick zero is not a transient current source.
-    bpa_fixed_source_startup = network_initial_sample !== nothing &&
-        hasproperty(network_initial_sample, :source) &&
-        network_initial_sample.source == :bpa_fixed_source_startup_voltage_phasors
     steady_state_initial_current_injections =
-        network_initial_sample === nothing || bpa_fixed_source_startup ||
+        network_initial_sample === nothing || _uses_bpa_startup_sample(network_initial_sample) ||
         (
             hasproperty(steady_state_initial_sample, :exact_discrete_histories) &&
             steady_state_initial_sample.exact_discrete_histories

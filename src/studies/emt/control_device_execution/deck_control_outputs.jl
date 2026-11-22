@@ -229,6 +229,7 @@ function _deck_control_system_network_runtime(
 
     network_voltage_source_names = Symbol[]
     network_voltage_source_node_indices = Int[]
+    network_voltage_source_windows = Dict{Symbol,Tuple{Float64,Float64}}()
     for row in source_rows
         row.source_type == 90 || continue
         node_index = get(parsed.node_map, row.name, 0)
@@ -236,6 +237,10 @@ function _deck_control_system_network_runtime(
             throw(ArgumentError("control-system voltage source $(row.name) has no network node"))
         push!(network_voltage_source_names, row.name)
         push!(network_voltage_source_node_indices, node_index)
+        if !_short_control_voltage_observation(row)
+            network_voltage_source_windows[row.name] =
+                (row.activation_start_time_s, row.activation_stop_time_s)
+        end
     end
 
     switch_elements = TACSControlledSwitch[]
@@ -310,6 +315,7 @@ function _deck_control_system_network_runtime(
         signal_slot_names,
         network_voltage_source_names,
         network_voltage_source_node_indices,
+        network_voltage_source_windows,
         switch_observations,
         switch_elements,
         switch_signal_names,
@@ -439,6 +445,17 @@ function _deck_control_system_output_names(
     return names
 end
 
+function _short_control_voltage_observation(source::DeckParser.DeckControlSystemSourceRow)
+    # The short voltage-observation form has no startup mode or time fields.
+    return ncodeunits(rstrip(source.raw_text)) <= 8
+end
+
+function _control_voltage_observation_active(start_time::Float64, stop_time::Float64, time::Float64)
+    time == 0.0 && return start_time < 0.0 && time < stop_time
+    tolerance = 1.0e-11 # Ten times BPA's FLZERO for transient source activation.
+    return start_time - tolerance <= time < stop_time - tolerance
+end
+
 function _deck_control_system_source_values(
     parsed::DeckParser.DeckParseResult,
     steady_values::Dict{Symbol,Float64},
@@ -462,7 +479,14 @@ function _deck_control_system_source_values(
     end
     for row in parsed.control_system_source_rows
         if row.source_type == 90
-            values[row.name] = get(network_source_values, row.name, 0.0)
+            observes_voltage = _short_control_voltage_observation(row) ||
+                _control_voltage_observation_active(
+                    row.activation_start_time_s, row.activation_stop_time_s, time_s,
+                )
+            if time_s == 0.0 && !_short_control_voltage_observation(row)
+                observes_voltage &= row.amplitude === 1.0
+            end
+            values[row.name] = observes_voltage ? get(network_source_values, row.name, 0.0) : 0.0
         elseif row.source_type == 14
             values[row.name] = sinusoidal_control_signal_value(
                 _deck_control_system_sinusoidal_signal(row),

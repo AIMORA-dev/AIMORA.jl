@@ -1,7 +1,8 @@
 function _stamp_deck_source_steady_state_admittance!(
     matrix::AbstractMatrix{ComplexF64},
     rhs::AbstractVector{ComplexF64},
-    parsed::DeckParser.DeckParseResult,
+    parsed::DeckParser.DeckParseResult;
+    bpa_control_startup::Bool = false,
 )
     source_conductance_by_node = Dict{Int,Float64}()
     for element in parsed.elements
@@ -11,15 +12,16 @@ function _stamp_deck_source_steady_state_admittance!(
     for row in DeckParser.deck_over5a_source_rows(parsed)
         node_value = Int(row.node_value)
         target_node = abs(node_value)
+        active = !bpa_control_startup || DeckParser._active_steady_state_frequency_source(row)
         if node_value < 0
             abs(Int(row.iform)) in (11, 14) || continue
-            rhs[target_node] += _deck_source_voltage_phasor(row)
+            active && (rhs[target_node] += _deck_source_voltage_phasor(row))
             continue
         end
         conductance = get(source_conductance_by_node, target_node, 1.0e12)
         admittance = complex(conductance, 0.0)
         _stamp_complex_branch_admittance!(matrix, target_node, 0, admittance)
-        rhs[target_node] += admittance * _deck_source_voltage_phasor(row)
+        active && (rhs[target_node] += admittance * _deck_source_voltage_phasor(row))
     end
     return matrix
 end
@@ -443,6 +445,7 @@ function _deck_steady_state_nodal_equations(
     node_count::Int;
     include_induction_machines::Bool=true,
     bpa_fixed_source_startup::Bool=false,
+    bpa_control_startup::Bool=false,
     excluded_universal_machine_indices::AbstractVector{<:Integer}=Int[],
     transformer_admittance=nothing,
     frequency_partition::DeckParser.DeckSteadyStateFrequencyPartition=
@@ -480,7 +483,8 @@ function _deck_steady_state_nodal_equations(
             frequency_partition,
         )
     _stamp_deck_open_switch_steady_state_admittance!(admittance, parsed)
-    bpa_fixed_source_startup || _stamp_deck_source_steady_state_admittance!(admittance, rhs, parsed)
+    bpa_fixed_source_startup ||
+        _stamp_deck_source_steady_state_admittance!(admittance, rhs, parsed; bpa_control_startup)
     _stamp_named_basic_harmonic_elements!(
         admittance,
         rhs,
@@ -629,6 +633,7 @@ function deck_steady_state_voltage_phasors(
     saturated_transformer_intake = nothing,
     winding_number::Int = 1,
     bpa_fixed_source_startup::Bool = false,
+    bpa_control_startup::Bool = false,
 )
     node_map = Dict{Symbol,Int}(parsed.node_map)
     frequency_partition = DeckParser.deck_steady_state_frequency_partition(parsed)
@@ -672,6 +677,7 @@ function deck_steady_state_voltage_phasors(
         transformer_admittance = transformer_admittance,
         frequency_partition = frequency_partition,
         bpa_fixed_source_startup,
+        bpa_control_startup,
     )
     fixed_node_phasors = bpa_fixed_source_startup ?
         _stamp_bpa_fixed_startup_sources!(admittance, rhs, parsed, frequency_partition) :
@@ -745,8 +751,9 @@ function _deck_node_voltage_initial_sample(
     parsed::DeckParser.DeckParseResult,
     values::Vector{Float64} = zeros(Float64, length(parsed.node_map)),
 )
+    conditions = DeckParser.deck_node_initial_condition_rows(parsed)
     rows = [
-        row for row in DeckParser.deck_node_initial_condition_rows(parsed)
+        row for row in conditions
         if row.condition_kind == :node_voltage_initial_condition && row.node_index > 0
     ]
     isempty(rows) && return nothing
@@ -755,9 +762,14 @@ function _deck_node_voltage_initial_sample(
             row.reference_node_index isa Missing ? 0.0 : values[Int(row.reference_node_index)]
         values[Int(row.node_index)] = reference_value + Float64(row.real_value)
     end
-    return _deck_transient_initial_voltage_sample(
+    sample = _deck_transient_initial_voltage_sample(
         parsed, values, :deck_node_voltage_initial_conditions; condition_count = length(rows),
     )
+    return merge(sample, (
+        node_voltage_conditions_only = all(
+            row -> row.condition_kind == :node_voltage_initial_condition, conditions,
+        ),
+    ))
 end
 
 function _deck_zero_initial_voltage_sample(parsed::DeckParser.DeckParseResult)

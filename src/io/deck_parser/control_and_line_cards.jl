@@ -2226,15 +2226,18 @@ function control_system_first_signed_signal(line::AbstractString)
     return Symbol(found.captures[1])
 end
 
-function control_system_device_input_terms(line::AbstractString)
+function control_system_device_input_terms(line::AbstractString, device_type::Int)
     image = fixed_image(line)
     terms = DeckControlSystemSignalTerm[]
     for first_col in 11:8:43
         sign = image[first_col]
         name = fixed_field(image, first_col + 1, first_col + 6)
-        isempty(name) && continue
-        polarity = sign == '-' ? -1 : sign == '*' ? 9 : sign == '+' ? 1 : 0
-        polarity == 0 && continue
+        if isempty(name)
+            # The fixed-card input selector addresses all five card positions.
+            device_type == 61 && push!(terms, DeckControlSystemSignalTerm(Symbol(""), 0))
+            continue
+        end
+        polarity = sign == '-' ? -1 : sign == '*' ? 9 : 1
         push!(terms, DeckControlSystemSignalTerm(Symbol(name), polarity))
     end
     return terms
@@ -2457,15 +2460,26 @@ function parse_control_system_source_card!(
     stop_value = fixed_float_value(image, 71, 80)
     activation_stop_time_s = stop_value === nothing || stop_value == 0.0 ?
         Inf : Float64(stop_value)
+    amplitude, delay_or_time_constant, phase_or_width = if source_type in (90, 91)
+        # These observation cards use the first fixed field as the mode.
+        # A frequency in the second field cannot fill a blank mode.
+        (something(fixed_float_value(image, 11, 20), missing),
+         something(fixed_float_value(image, 21, 30), missing),
+         something(fixed_float_value(image, 31, 40), missing))
+    else
+        (control_system_optional_value(values, 1),
+         control_system_optional_value(values, 2),
+         control_system_optional_value(values, 3))
+    end
     push!(
         result.control_system_source_rows,
         DeckControlSystemSourceRow(
             line_no,
             source_type,
             control_system_fixed_name(line),
-            control_system_optional_value(values, 1),
-            control_system_optional_value(values, 2),
-            control_system_optional_value(values, 3),
+            amplitude,
+            delay_or_time_constant,
+            phase_or_width,
             activation_start_time_s,
             activation_stop_time_s,
             values,
@@ -2495,8 +2509,9 @@ function parse_control_system_device_card!(
         record_control_system_card_blocker!(result, :control_system_device_card_parse_error)
         return true
     end
-    input_terms = control_system_device_input_terms(line)
-    first_input = isempty(input_terms) ? missing : first(input_terms).name
+    input_terms = control_system_device_input_terms(line, device_type)
+    first_connected = findfirst(term -> term.polarity != 0, input_terms)
+    first_input = first_connected === nothing ? missing : input_terms[first_connected].name
     control_signal = control_system_optional_fixed_name(image, 69, 74)
     reference_signal = control_system_optional_fixed_name(image, 75, 80)
     tail_signal_names = Symbol[]
