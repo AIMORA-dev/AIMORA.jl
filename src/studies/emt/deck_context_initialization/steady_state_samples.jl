@@ -753,6 +753,26 @@ struct DeckCapacitorInitialHistory
     terminal_voltage_v::Float64
 end
 
+function _bpa_unexpanded_scalar_branch_table(parsed::DeckParser.DeckParseResult)
+    # Some fixed branch cards are assembled later and do not appear in
+    # either the immediate elements or the OVER2 scalar record vector.
+    line_owners = (
+        parsed.bergeron_line_rows, parsed.coupled_line_rows,
+        parsed.coupled_phase_pi_section_rows, parsed.cascaded_pi_request_rows,
+        parsed.sampled_frequency_line_rows, parsed.semlyen_line_groups,
+        parsed.rational_frequency_line_groups, parsed.generator_equivalent_rows,
+        parsed.universal_machine_section_rows, parsed.synchronous_machine_terminal_voltage_rows,
+    )
+    return all(isempty, line_owners) &&
+        iszero(get(parsed.card_counts, :fixed_card_saturated_transformer_intake, 0)) &&
+        all(branch -> branch.source_kind == :scalar && branch.branch_type == 0,
+            parsed.over2_branch_rows) &&
+        all(element -> element isa Union{
+            ConductanceBranch, SeriesRLBranch, SeriesRLCBranch, CapacitorBranch,
+            TheveninSource, CurrentInjection,
+        }, parsed.elements)
+end
+
 function _bpa_indexed_initial_voltage_bus_order(parsed::DeckParser.DeckParseResult)
     branches = parsed.over2_branch_rows
     sources = parsed.over5a_source_rows
@@ -760,12 +780,10 @@ function _bpa_indexed_initial_voltage_bus_order(parsed::DeckParser.DeckParseResu
     # buses. Expansion, switching and exceptional source ordering need
     # their own original bus-table reconstruction.
     isempty(parsed.over5_switch_rows) &&
-    all(branch -> branch.source_kind == :scalar && branch.branch_type == 0, branches) &&
+    _bpa_unexpanded_scalar_branch_table(parsed) &&
+    !_deck_has_nonlinear_runtime_owners(parsed) &&
     all(source -> source.node_value > 0 && source.iform in (11, 14) &&
-                  source.tstart != -9988.0, sources) &&
-    all(element -> element isa Union{
-        ConductanceBranch, SeriesRLBranch, SeriesRLCBranch, CapacitorBranch, TheveninSource,
-    }, parsed.elements) || throw(ArgumentError(
+                  source.tstart != -9988.0, sources) || throw(ArgumentError(
         "an indexed BPA node voltage requires a supported fixed scalar bus table",
     ))
 
