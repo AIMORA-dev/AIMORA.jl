@@ -409,7 +409,7 @@ function _stage_scalar_branch_initial_voltage!(
 end
 
 function _stage_scalar_branch_initial_history!(
-    element::Union{CapacitorBranch,SeriesRLCBranch},
+    element::Union{SeriesRLBranch,SeriesRLCBranch,CapacitorBranch},
     history::DeckScalarBranchInitialHistory,
     terminal_voltage::Float64,
     dt_s::Float64,
@@ -424,7 +424,7 @@ function _stage_scalar_branch_initial_history!(
     if element isa CapacitorBranch
         element.history_voltage_offset =
             history.capacitor_voltage_v - history.terminal_voltage_v
-    else
+    elseif element isa SeriesRLCBranch
         element.capacitor_voltage_prev =
             history.capacitor_voltage_v + dt_s / (2.0 * element.c) * current_change
         element.inductor_voltage_prev =
@@ -470,8 +470,7 @@ function _seed_steady_state_network_state!(
             if element isa CapacitorBranch
                 element.history_voltage_offset = 0.0
             end
-            history = element isa Union{CapacitorBranch,SeriesRLCBranch} &&
-                      branch_histories !== nothing && index <= length(context.element_names) ?
+            history = branch_histories !== nothing && index <= length(context.element_names) ?
                 get(branch_histories, context.element_names[index], nothing) : nothing
             if history !== nothing
                 _stage_scalar_branch_initial_history!(

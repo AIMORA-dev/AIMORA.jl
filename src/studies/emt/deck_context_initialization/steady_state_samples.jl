@@ -839,7 +839,7 @@ function _deck_scalar_initial_history_branch(parsed, condition)
         branch_index = scalar_index
     end
     branch = branches[branch_index]
-    return branch.branch_kind in (:capacitor, :series_rlc) ? branch : nothing
+    return branch.branch_kind in (:capacitor, :series_rl, :series_rlc) ? branch : nothing
 end
 
 function _bpa_indexed_initial_voltage_bus_order(parsed::DeckParser.DeckParseResult)

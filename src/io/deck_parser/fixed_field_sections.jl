@@ -1594,10 +1594,10 @@ function parse_node_initial_condition_row!(result::DeckParseResult,
     code = fixed_int_value(image, 1, 2)
     node = fixed_field(image, 3, 8)
     # BPA OVER13 reads Type 2 as I2,A6,3E15.8. Its first numeric
-    # field starts immediately after the node name. Type 3 has a second A6.
+    # field starts immediately after the node name. Type 3 reads
+    # I2,2A6,4E15.8,I6. Both numeric layouts use eight implied decimals.
     reference_node = code == 2 ? "" : fixed_field(image, 9, 14)
     first_value_column = code == 2 ? 9 : 15
-    implied_decimal_places = code == 2 ? 8 : 0
     real_value = fixed_float_or_default!(
         result,
         image,
@@ -1606,7 +1606,7 @@ function parse_node_initial_condition_row!(result::DeckParseResult,
         first_value_column + 14,
         "node_initial_condition_real_value",
         0.0;
-        implied_decimal_places,
+        implied_decimal_places = 8,
     )
     imaginary_value = fixed_float_or_default!(
         result,
@@ -1616,7 +1616,7 @@ function parse_node_initial_condition_row!(result::DeckParseResult,
         first_value_column + 29,
         "node_initial_condition_imaginary_value",
         0.0;
-        implied_decimal_places,
+        implied_decimal_places = 8,
     )
     if code == 2
         bus_index = fixed_int_or_default!(result, image, line_no, 75, 80, "initial_bus_index", 0)

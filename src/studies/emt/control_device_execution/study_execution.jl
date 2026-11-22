@@ -104,9 +104,7 @@ function _deck_uses_current_zero_switching(parsed::DeckParser.DeckParseResult)
     return !isempty(_deck_current_zero_switch_names(parsed))
 end
 
-function _deck_uses_expanded_branch_initial_history(parsed::DeckParser.DeckParseResult)
-    isempty(parsed.coupled_line_rows) && isempty(parsed.coupled_phase_pi_section_rows) &&
-        return false
+function _deck_has_branch_initial_history(parsed::DeckParser.DeckParseResult)
     return any(row -> row.condition_kind == :node_current_initial_condition,
         parsed.node_initial_condition_rows)
 end
@@ -130,7 +128,7 @@ function _deck_bpa_initial_sample(
         parsed.control_system_source_rows)
     if !starts_in_ac && !has_voltage_observations
         if _deck_uses_type11_zero_state_initialization(parsed) &&
-           (_deck_uses_expanded_branch_initial_history(parsed) ||
+           (_deck_has_branch_initial_history(parsed) ||
             !isempty(parsed.coupled_phase_pi_section_rows))
             sample = _deck_node_voltage_initial_sample(parsed)
             return sample === nothing ? _deck_zero_initial_voltage_sample(parsed) : sample
@@ -378,7 +376,7 @@ function _run_deck_emt(
         (runtime_t_end_s > 0.0 && !isempty(parsed.coupled_phase_pi_section_rows)) ||
         (time_horizon == :deck && initial_voltage_source == :none &&
          _deck_uses_type11_zero_state_initialization(parsed) &&
-         _deck_uses_expanded_branch_initial_history(parsed))
+         !isempty(parsed.coupled_line_rows) && _deck_has_branch_initial_history(parsed))
     ) &&
        (initial_voltage_source in (:none, :steady_state) ||
         (fixed_voltage_source_runtime && initial_voltage_source in (:zero, :node_conditions))) &&
