@@ -448,8 +448,8 @@ function _seed_steady_state_network_state!(
     has_phasors = hasproperty(sample, :node_voltage_phasors)
     branch_histories = hasproperty(sample, :scalar_branch_initial_histories) ?
         sample.scalar_branch_initial_histories : nothing
-    phase_pi_histories = hasproperty(sample, :phase_pi_initial_histories) ?
-        sample.phase_pi_initial_histories : nothing
+    coupled_histories = hasproperty(sample, :coupled_branch_initial_histories) ?
+        sample.coupled_branch_initial_histories : nothing
     for (index, element) in enumerate(context.system.elements)
         if element isa Union{SeriesRLBranch,SeriesRLCBranch,CapacitorBranch}
             imposed_voltage =
@@ -492,7 +492,14 @@ function _seed_steady_state_network_state!(
             _seed_semlyen_line_steady_state!(element, sample, frequency_hz)
             continue
         elseif element isa BreqivHistoryInjection
-            if hasproperty(sample, :node_voltage_phasors)
+            history = coupled_histories !== nothing && index <= length(context.element_names) ?
+                get(coupled_histories, context.element_names[index], nothing) : nothing
+            if history !== nothing
+                _seed_breqiv_series_rl_history!(
+                    element, context.system.v, history.series_current_a,
+                    history.card_terminal_voltage_v, context.dt_s,
+                )
+            elseif has_phasors
                 element_frequency_hz = _steady_state_branch_frequency_hz(
                     sample,
                     first(element.a),
@@ -528,8 +535,8 @@ function _seed_steady_state_network_state!(
             _seed_steady_state_coupled_inductive_branch!(element, sample)
             continue
         elseif element isa CoupledSeriesRLBranch
-            history = phase_pi_histories !== nothing && index <= length(context.element_names) ?
-                get(phase_pi_histories, context.element_names[index], nothing) : nothing
+            history = coupled_histories !== nothing && index <= length(context.element_names) ?
+                get(coupled_histories, context.element_names[index], nothing) : nothing
             if history !== nothing
                 for port in eachindex(element.previous_voltage)
                     element.previous_voltage[port] =

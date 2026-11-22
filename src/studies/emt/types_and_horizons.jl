@@ -5,6 +5,7 @@ using TOML
 
 using ..Branches: BranchCompanionSnapshot,
                   _coupled_series_rl_conductance_matrix!,
+                  _seed_breqiv_series_rl_history!,
                   BreqivHistoryInjection,
                   GeneratorEquivalentModalBranch,
                   IdealTransformerVoltageConstraint,

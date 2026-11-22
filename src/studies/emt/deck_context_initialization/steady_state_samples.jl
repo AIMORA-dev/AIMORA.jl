@@ -753,8 +753,7 @@ struct DeckScalarBranchInitialHistory
     terminal_voltage_v::Float64
 end
 
-struct DeckCoupledPhasePiInitialHistory
-    section::DeckParser.CoupledLumpedPhasePiSection
+struct DeckCoupledBranchInitialHistory
     series_current_a::Vector{Float64}
     card_terminal_voltage_v::Vector{Float64}
 end
@@ -858,12 +857,19 @@ function _deck_initial_history_branch(parsed, condition)
         if scalar_index == 0
             position = findfirst(row -> row.line_no == slot.line_no,
                 parsed.coupled_phase_pi_section_rows)
-            if position === nothing || parsed.coupled_phase_pi_section_rows[position].phase_index != 1
-                throw(ArgumentError(
-                    "line $(condition.line_no): BPA initial-history branch index $branch_index selects a coupled branch with unsupported explicit history",
-                ))
+            if position !== nothing
+                row = parsed.coupled_phase_pi_section_rows[position]
+                row.phase_index == 1 && return row
+            else
+                position = findfirst(row -> row.line_no == slot.line_no, parsed.coupled_line_rows)
+                if position !== nothing
+                    row = parsed.coupled_line_rows[position]
+                    row.phase_index == 1 && row.line_kind == :mutual_source_equivalent && return row
+                end
             end
-            return parsed.coupled_phase_pi_section_rows[position]
+            throw(ArgumentError(
+                "line $(condition.line_no): BPA initial-history branch index $branch_index selects a coupled branch with unsupported explicit history",
+            ))
         end
     end
     branch = branches[scalar_index]
@@ -925,26 +931,31 @@ function _bpa_indexed_initial_voltage_bus_order(parsed::DeckParser.DeckParseResu
     return append!(order, fixed_nodes)
 end
 
-function _deck_phase_pi_initial_history!(
+function _deck_coupled_branch_initial_history!(
     histories::Dict{Symbol,DeckScalarBranchInitialHistory},
     parsed::DeckParser.DeckParseResult,
-    row::DeckParser.DeckCoupledPhasePiSectionRow,
+    row::Union{DeckParser.DeckCoupledPhasePiSectionRow,DeckParser.DeckCoupledLineRow},
     conditions,
     start_index::Int,
     values::Vector{Float64},
 )
     all(source -> source.iform == 11, parsed.over5a_source_rows) || throw(ArgumentError(
-        "line $(row.line_no): explicit coupled phase pi history requires Type 11 startup",
+        "line $(row.line_no): explicit coupled branch history requires Type 11 startup",
     ))
-    sections = DeckParser.deck_coupled_lumped_phase_pi_sections(parsed)
+    phase_pi = row isa DeckParser.DeckCoupledPhasePiSectionRow
+    sections = phase_pi ? DeckParser.deck_coupled_lumped_phase_pi_sections(parsed) :
+        DeckParser.deck_coupled_lumped_sequence_impedances(parsed)
     selected = findfirst(section -> first(section.line_numbers) == row.line_no, sections)
     selected === nothing && throw(ArgumentError(
-        "line $(row.line_no): indexed history cannot select a cascaded phase pi section",
+        "line $(row.line_no): indexed history cannot select this coupled branch layout",
     ))
     section = sections[selected]
+    if !phase_pi && section.input_kind != :sequence_shorthand
+        throw(ArgumentError("line $(row.line_no): explicit history requires a sequence R-L shorthand group"))
+    end
     last_index = start_index + section.phase_count - 1
     last_index <= length(conditions) || throw(ArgumentError(
-        "line $(conditions[start_index].line_no): coupled phase pi history requires a card for every phase",
+        "line $(conditions[start_index].line_no): coupled branch history requires a card for every phase",
     ))
     series_current = zeros(section.phase_count)
     from_current = similar(series_current)
@@ -957,17 +968,24 @@ function _deck_phase_pi_initial_history!(
         card.condition_kind == :node_current_initial_condition &&
         card.node_index == from &&
         coalesce(card.reference_node_index, 0) == to || throw(ArgumentError(
-            "line $(card.line_no): coupled phase pi history is missing its ordered phase $phase terminals",
+            "line $(card.line_no): coupled branch history is missing its ordered phase $phase terminals",
         ))
         field = DeckParser.fixed_field(DeckParser.fixed_image(card.raw_text), 45, 59)
         receiving_current = isempty(field) ? 0.0 : DeckParser._tryparse_fixed_float(field, 8)
         receiving_current !== nothing &&
         all(isfinite, (card.real_value, card.imaginary_value, receiving_current)) ||
-            throw(ArgumentError("line $(card.line_no): coupled phase pi history currents must be finite"))
+            throw(ArgumentError("line $(card.line_no): coupled branch history currents must be finite"))
         series_current[phase] = card.real_value
         from_current[phase] = card.imaginary_value
         to_current[phase] = receiving_current
         card_voltage[phase] = _deck_node_voltage(values, from) - _deck_node_voltage(values, to)
+    end
+    history = DeckCoupledBranchInitialHistory(series_current, card_voltage)
+    if !phase_pi
+        all(iszero, from_current) && all(iszero, to_current) || throw(ArgumentError(
+            "line $(row.line_no): sequence R-L history has no shunt current owner",
+        ))
+        return (_coupled_lumped_sequence_history_name(section), history, section.phase_count)
     end
     # OVER13 adds separate sending/receiving terminal shunt histories.
     # Seed prescribed currents on grounded capacitors, and record the
@@ -997,7 +1015,7 @@ function _deck_phase_pi_initial_history!(
             end
         end
     end
-    return DeckCoupledPhasePiInitialHistory(section, series_current, card_voltage)
+    return (_coupled_phase_pi_series_name(section), history, section.phase_count)
 end
 
 function _deck_node_voltage_initial_sample(
@@ -1005,7 +1023,7 @@ function _deck_node_voltage_initial_sample(
     values::Vector{Float64} = zeros(Float64, length(parsed.node_map)),
 )
     histories = Dict{Symbol,DeckScalarBranchInitialHistory}()
-    phase_pi_histories = Dict{Symbol,DeckCoupledPhasePiInitialHistory}()
+    coupled_histories = Dict{Symbol,DeckCoupledBranchInitialHistory}()
     conditions = DeckParser.deck_node_initial_condition_rows(parsed)
     next_condition_index = 1
     voltage_count = 0
@@ -1032,10 +1050,11 @@ function _deck_node_voltage_initial_sample(
             voltage_count += 1
         elseif row.condition_kind == :node_current_initial_condition
             branch = _deck_initial_history_branch(parsed, row)
-            if branch isa DeckParser.DeckCoupledPhasePiSectionRow
-                history = _deck_phase_pi_initial_history!(histories, parsed, branch, conditions, index, values)
-                phase_pi_histories[_coupled_phase_pi_series_name(history.section)] = history
-                next_condition_index = index + history.section.phase_count
+            if branch isa Union{DeckParser.DeckCoupledPhasePiSectionRow,DeckParser.DeckCoupledLineRow}
+                name, history, phase_count =
+                    _deck_coupled_branch_initial_history!(histories, parsed, branch, conditions, index, values)
+                coupled_histories[name] = history
+                next_condition_index = index + phase_count
             elseif branch !== nothing
                 card_voltage = _deck_node_voltage(values, branch.from_node_value) -
                                _deck_node_voltage(values, branch.to_node_value)
@@ -1049,13 +1068,13 @@ function _deck_node_voltage_initial_sample(
             scalar_conditions = false
         end
     end
-    voltage_count == 0 && isempty(histories) && isempty(phase_pi_histories) && return nothing
+    voltage_count == 0 && isempty(histories) && isempty(coupled_histories) && return nothing
     sample = _deck_transient_initial_voltage_sample(
         parsed, values, :deck_node_voltage_initial_conditions; condition_count = voltage_count,
     )
     return merge(sample, (
         scalar_branch_initial_histories = histories,
-        phase_pi_initial_histories = phase_pi_histories,
+        coupled_branch_initial_histories = coupled_histories,
         stage_node_voltage_history = voltage_count > 0 && scalar_conditions,
     ))
 end

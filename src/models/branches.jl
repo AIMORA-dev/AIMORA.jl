@@ -981,6 +981,27 @@ function initialize_breqiv_history_injection!(b::BreqivHistoryInjection, dt::Flo
     return b
 end
 
+function _seed_breqiv_series_rl_history!(
+    branch::BreqivHistoryInjection,
+    voltage::AbstractVector{Float64},
+    card_current::AbstractVector{Float64},
+    card_drop::AbstractVector{Float64},
+    dt::Float64,
+)
+    initialize_breqiv_history_injection!(branch, dt)
+    final_drop = _coupled_branch_port_voltages(voltage, branch.a, branch.b)
+    previous_current = card_current + branch.phase_admittance * (final_drop - card_drop)
+    # This field is the modal Norton current entering the tick-zero
+    # companion. The sequence owner uses opposite internal port signs.
+    internal_voltage = branch.history_voltage_scale .* final_drop
+    internal_current = previous_current ./ branch.history_current_scale
+    history = breqiv_modal_transform(internal_current - branch.phase_admittance * internal_voltage)
+    branch.state.zero_history[1, 1] = history[1]
+    branch.state.positive_history[1, 1, :] .= @view history[2:end]
+    advance_breqiv_history_current!(branch, voltage, dt; consumed_for_step = false)
+    return branch
+end
+
 function advance_breqiv_history_current!(
     b::BreqivHistoryInjection,
     voltage::AbstractVector{<:Real},

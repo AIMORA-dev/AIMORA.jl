@@ -614,6 +614,8 @@ function _coupled_lumped_sequence_timestep_inductance(
     )
 end
 
+_coupled_lumped_sequence_history_name(impedance) = Symbol(impedance.name, "_source_equivalent_history")
+
 function coupled_lumped_sequence_history_injection_elements(
     parsed::DeckParser.DeckParseResult;
     initial_time_s::Float64 = 0.0,
@@ -686,7 +688,7 @@ function coupled_lumped_sequence_history_injection_elements(
         )
         push!(
             element_names,
-            Symbol(String(impedance.name), "_source_equivalent_history"),
+            _coupled_lumped_sequence_history_name(impedance),
         )
         push!(
             element_line_numbers,
