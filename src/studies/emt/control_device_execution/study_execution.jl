@@ -127,6 +127,12 @@ function _deck_bpa_initial_sample(
     has_voltage_observations = any(source -> source.source_type == 90,
         parsed.control_system_source_rows)
     if !starts_in_ac && !has_voltage_observations
+        if !isempty(parsed.coupled_phase_pi_section_rows) &&
+           any(DeckParser._active_steady_state_frequency_source, parsed.over5a_source_rows)
+            return _deck_fixed_source_initial_voltage_sample(
+                parsed, time_horizon, initial_voltage_source, saturated_transformer_intake,
+            )
+        end
         if _deck_uses_type11_zero_state_initialization(parsed) &&
            (_deck_has_branch_initial_history(parsed) ||
             !isempty(parsed.coupled_phase_pi_section_rows))
