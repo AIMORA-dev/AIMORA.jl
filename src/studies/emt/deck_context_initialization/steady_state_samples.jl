@@ -747,7 +747,7 @@ function deck_steady_state_voltage_phasors(
     )
 end
 
-struct DeckCapacitorInitialHistory
+struct DeckScalarBranchInitialHistory
     current_a::Float64
     capacitor_voltage_v::Float64
     terminal_voltage_v::Float64
@@ -771,6 +771,39 @@ function _bpa_unexpanded_scalar_branch_table(parsed::DeckParser.DeckParseResult)
             ConductanceBranch, SeriesRLBranch, SeriesRLCBranch, CapacitorBranch,
             TheveninSource, CurrentInjection,
         }, parsed.elements)
+end
+
+function _deck_scalar_initial_history_branch(parsed, condition)
+    image = DeckParser.fixed_image(condition.raw_text)
+    branch_field = DeckParser.fixed_field(image, 75, 80)
+    branch_index = isempty(branch_field) ? 0 : tryparse(Int, branch_field)
+    branch_index === nothing && throw(ArgumentError(
+        "line $(condition.line_no): invalid BPA initial-history branch index",
+    ))
+    terminals = (condition.node_index, coalesce(condition.reference_node_index, 0))
+    branches = parsed.over2_branch_rows
+    same_endpoints(branch) = (branch.from_node_value, branch.to_node_value) == terminals
+    if branch_index <= 0
+        branch_index = findfirst(same_endpoints, branches)
+        branch_index === nothing && throw(ArgumentError(
+            "line $(condition.line_no): no BPA initial-history branch matches the oriented terminals",
+        ))
+    else
+        # In an all-scalar fixed branch table, OVER2 records and BPA branch
+        # numbers are one-to-one. Other tables can expand or reorder entries.
+        _bpa_unexpanded_scalar_branch_table(parsed) &&
+        isempty(parsed.over5_switch_rows) && !_deck_has_nonlinear_runtime_owners(parsed) ||
+            throw(ArgumentError(
+                "line $(condition.line_no): BPA initial-history branch index requires an unexpanded scalar branch table",
+            ))
+        if !checkbounds(Bool, branches, branch_index) || !same_endpoints(branches[branch_index])
+            throw(ArgumentError(
+                "line $(condition.line_no): BPA initial-history branch index $branch_index does not match the oriented terminals",
+            ))
+        end
+    end
+    branch = branches[branch_index]
+    return branch.branch_kind in (:capacitor, :series_rlc) ? branch : nothing
 end
 
 function _bpa_indexed_initial_voltage_bus_order(parsed::DeckParser.DeckParseResult)
@@ -832,7 +865,7 @@ function _deck_node_voltage_initial_sample(
     parsed::DeckParser.DeckParseResult,
     values::Vector{Float64} = zeros(Float64, length(parsed.node_map)),
 )
-    histories = Dict{Tuple{Int,Int},DeckCapacitorInitialHistory}()
+    histories = Dict{Symbol,DeckScalarBranchInitialHistory}()
     voltage_count = 0
     scalar_conditions = true
     indexed_bus_order = nothing
@@ -855,18 +888,11 @@ function _deck_node_voltage_initial_sample(
             values[row.node_index] = _deck_node_voltage(values, reference) + row.real_value
             voltage_count += 1
         elseif row.condition_kind == :node_current_initial_condition
-            image = DeckParser.fixed_image(row.raw_text)
-            branch_field = DeckParser.fixed_field(image, 75, 80)
-            terminals = (row.node_index, coalesce(row.reference_node_index, 0))
-            matching = filter(
-                branch -> (branch.from_node_value, branch.to_node_value) == terminals,
-                parsed.over2_branch_rows,
-            )
-            if (isempty(branch_field) || tryparse(Int, branch_field) == 0) &&
-               length(matching) == 1 && only(matching).branch_kind == :capacitor
-                card_voltage = _deck_node_voltage(values, terminals[1]) -
-                               _deck_node_voltage(values, terminals[2])
-                histories[terminals] = DeckCapacitorInitialHistory(
+            branch = _deck_scalar_initial_history_branch(parsed, row)
+            if branch !== nothing
+                card_voltage = _deck_node_voltage(values, branch.from_node_value) -
+                               _deck_node_voltage(values, branch.to_node_value)
+                histories[branch.name] = DeckScalarBranchInitialHistory(
                     row.real_value, row.imaginary_value, card_voltage,
                 )
             else
@@ -881,7 +907,7 @@ function _deck_node_voltage_initial_sample(
         parsed, values, :deck_node_voltage_initial_conditions; condition_count = voltage_count,
     )
     return merge(sample, (
-        capacitor_initial_histories = histories,
+        scalar_branch_initial_histories = histories,
         stage_node_voltage_history = voltage_count > 0 && scalar_conditions,
     ))
 end

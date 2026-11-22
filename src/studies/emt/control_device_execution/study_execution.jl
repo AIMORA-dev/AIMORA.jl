@@ -95,7 +95,7 @@ function _apply_deck_node_voltage_conditions(parsed::DeckParser.DeckParseResult,
         node_voltage_values = node_conditions.node_voltage_values,
         output_voltage_values = node_conditions.output_voltage_values,
         node_voltage_condition_count = node_conditions.node_voltage_condition_count,
-        capacitor_initial_histories = node_conditions.capacitor_initial_histories,
+        scalar_branch_initial_histories = node_conditions.scalar_branch_initial_histories,
         stage_node_voltage_history = node_conditions.stage_node_voltage_history,
     ))
 end

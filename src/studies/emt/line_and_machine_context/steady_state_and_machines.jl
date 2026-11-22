@@ -408,6 +408,31 @@ function _stage_scalar_branch_initial_voltage!(
     return nothing
 end
 
+function _stage_scalar_branch_initial_history!(
+    element::Union{CapacitorBranch,SeriesRLCBranch},
+    history::DeckScalarBranchInitialHistory,
+    terminal_voltage::Float64,
+    dt_s::Float64,
+)
+    # OVER13 captures the terminal drop at the Type 3 card. The first
+    # SUBTS2 update uses the final bus voltage and the independently saved history.
+    conductance, _ = companion(element, dt_s)
+    current_change = conductance * (terminal_voltage - history.terminal_voltage_v)
+    element.v_prev = terminal_voltage
+    element.i_prev = history.current_a + current_change
+    element.i_last = element.i_prev
+    if element isa CapacitorBranch
+        element.history_voltage_offset =
+            history.capacitor_voltage_v - history.terminal_voltage_v
+    else
+        element.capacitor_voltage_prev =
+            history.capacitor_voltage_v + dt_s / (2.0 * element.c) * current_change
+        element.inductor_voltage_prev =
+            terminal_voltage - element.r * element.i_prev - element.capacitor_voltage_prev
+    end
+    return nothing
+end
+
 function _seed_steady_state_network_state!(
     context::EMTStepContext,
     sample;
@@ -421,9 +446,9 @@ function _seed_steady_state_network_state!(
     end
     frequency_hz = Float64(sample.steady_state_frequency_hz)
     has_phasors = hasproperty(sample, :node_voltage_phasors)
-    capacitor_histories = hasproperty(sample, :capacitor_initial_histories) ?
-        sample.capacitor_initial_histories : nothing
-    for element in context.system.elements
+    branch_histories = hasproperty(sample, :scalar_branch_initial_histories) ?
+        sample.scalar_branch_initial_histories : nothing
+    for (index, element) in enumerate(context.system.elements)
         if element isa Union{SeriesRLBranch,SeriesRLCBranch,CapacitorBranch}
             imposed_voltage =
                 _deck_node_voltage(context.system.v, element.a) -
@@ -442,21 +467,16 @@ function _seed_steady_state_network_state!(
                     element.capacitor_voltage_prev = element.v_prev
                 end
             end
-            history = element isa CapacitorBranch && capacitor_histories !== nothing ?
-                get(capacitor_histories, (element.a, element.b), nothing) : nothing
             if element isa CapacitorBranch
                 element.history_voltage_offset = 0.0
             end
+            history = element isa Union{CapacitorBranch,SeriesRLCBranch} &&
+                      branch_histories !== nothing && index <= length(context.element_names) ?
+                get(branch_histories, context.element_names[index], nothing) : nothing
             if history !== nothing
-                # BPA captures the terminal drop at the Type 3 card, before any
-                # subsequent voltage prescriptions. OVER16 then advances both currents.
-                conductance, _ = companion(element, context.dt_s)
-                element.v_prev = imposed_voltage
-                element.i_prev = history.current_a +
-                    conductance * (imposed_voltage - history.terminal_voltage_v)
-                element.i_last = element.i_prev
-                element.history_voltage_offset =
-                    history.capacitor_voltage_v - history.terminal_voltage_v
+                _stage_scalar_branch_initial_history!(
+                    element, history, imposed_voltage, context.dt_s,
+                )
             elseif stage_imposed_branch_voltage
                 _stage_scalar_branch_initial_voltage!(element, imposed_voltage, context.dt_s)
             end
