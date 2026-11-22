@@ -104,7 +104,14 @@ function _deck_uses_current_zero_switching(parsed::DeckParser.DeckParseResult)
     return !isempty(_deck_current_zero_switch_names(parsed))
 end
 
-function _deck_bpa_control_initial_sample(
+function _deck_uses_expanded_branch_initial_history(parsed::DeckParser.DeckParseResult)
+    isempty(parsed.coupled_line_rows) && isempty(parsed.coupled_phase_pi_section_rows) &&
+        return false
+    return any(row -> row.condition_kind == :node_current_initial_condition,
+        parsed.node_initial_condition_rows)
+end
+
+function _deck_bpa_initial_sample(
     parsed::DeckParser.DeckParseResult,
     time_horizon::Symbol,
     initial_voltage_source::Symbol,
@@ -121,7 +128,15 @@ function _deck_bpa_control_initial_sample(
     end
     has_voltage_observations = any(source -> source.source_type == 90,
         parsed.control_system_source_rows)
-    starts_in_ac || has_voltage_observations || return nothing
+    if !starts_in_ac && !has_voltage_observations
+        if _deck_uses_type11_zero_state_initialization(parsed) &&
+           (_deck_uses_expanded_branch_initial_history(parsed) ||
+            !isempty(parsed.coupled_phase_pi_section_rows))
+            sample = _deck_node_voltage_initial_sample(parsed)
+            return sample === nothing ? _deck_zero_initial_voltage_sample(parsed) : sample
+        end
+        return nothing
+    end
     sample = deck_steady_state_voltage_phasors(
         parsed; saturated_transformer_intake, bpa_control_startup = true,
     )
@@ -359,7 +374,11 @@ function _run_deck_emt(
         saturated_transformer_dynamic_runtime ||
         fixed_voltage_source_runtime ||
         switched_nonlinear_dynamic_runtime ||
-        control_system_feedback_runtime
+        control_system_feedback_runtime ||
+        (runtime_t_end_s > 0.0 && !isempty(parsed.coupled_phase_pi_section_rows)) ||
+        (time_horizon == :deck && initial_voltage_source == :none &&
+         _deck_uses_type11_zero_state_initialization(parsed) &&
+         _deck_uses_expanded_branch_initial_history(parsed))
     ) &&
        (initial_voltage_source in (:none, :steady_state) ||
         (fixed_voltage_source_runtime && initial_voltage_source in (:zero, :node_conditions))) &&
@@ -383,7 +402,7 @@ function _run_deck_emt(
                 parsed, time_horizon, initial_voltage_source, saturated_transformer_intake,
             ) : nothing
         if initial_sample === nothing
-            initial_sample = _deck_bpa_control_initial_sample(
+            initial_sample = _deck_bpa_initial_sample(
                 parsed, time_horizon, initial_voltage_source, saturated_transformer_intake,
             )
         end
@@ -505,10 +524,10 @@ function _run_deck_emt(
         _deck_runtime_saturated_transformer_intake(parsed) :
         nothing
     if initial_sample === nothing || type11_zero_state_initialization || node_condition_initialization
-        control_startup_sample = _deck_bpa_control_initial_sample(
+        deck_startup_sample = _deck_bpa_initial_sample(
             parsed, time_horizon, initial_voltage_source, saturated_transformer_intake,
         )
-        control_startup_sample === nothing || (initial_sample = control_startup_sample)
+        deck_startup_sample === nothing || (initial_sample = deck_startup_sample)
     end
     context =
         saturated_transformer_intake !== nothing ?
@@ -654,7 +673,7 @@ function prepare_emt_study(
         )
     end
     if initial_voltage_sample === nothing
-        initial_voltage_sample = _deck_bpa_control_initial_sample(
+        initial_voltage_sample = _deck_bpa_initial_sample(
             parsed, time_horizon, initial_voltage_source, saturated_transformer_intake,
         )
     end
@@ -669,6 +688,7 @@ function prepare_emt_study(
         fixed_voltage_source_runtime ||
         _deck_uses_dynamic_nonlinear_runtime(parsed) ||
         _deck_uses_control_system_feedback_runtime(parsed) ||
+        (runtime_t_end_s > 0.0 && !isempty(parsed.coupled_phase_pi_section_rows)) ||
         any(
             element -> element isa PowerSemiconductorSwitch ||
                 element isa PowerSemiconductorBridgeLeg,

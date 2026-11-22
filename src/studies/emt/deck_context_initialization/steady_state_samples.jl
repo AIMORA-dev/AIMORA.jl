@@ -753,12 +753,14 @@ struct DeckScalarBranchInitialHistory
     terminal_voltage_v::Float64
 end
 
-function _bpa_unexpanded_scalar_branch_table(parsed::DeckParser.DeckParseResult)
+function _bpa_supported_branch_table_owners(
+    parsed::DeckParser.DeckParseResult,
+    line_element_type = Union{},
+)
     # Some fixed branch cards are assembled later and do not appear in
     # either the immediate elements or the OVER2 scalar record vector.
     line_owners = (
-        parsed.bergeron_line_rows, parsed.coupled_line_rows,
-        parsed.coupled_phase_pi_section_rows, parsed.cascaded_pi_request_rows,
+        parsed.bergeron_line_rows, parsed.cascaded_pi_request_rows,
         parsed.sampled_frequency_line_rows, parsed.semlyen_line_groups,
         parsed.rational_frequency_line_groups, parsed.generator_equivalent_rows,
         parsed.universal_machine_section_rows, parsed.synchronous_machine_terminal_voltage_rows,
@@ -769,8 +771,43 @@ function _bpa_unexpanded_scalar_branch_table(parsed::DeckParser.DeckParseResult)
             parsed.over2_branch_rows) &&
         all(element -> element isa Union{
             ConductanceBranch, SeriesRLBranch, SeriesRLCBranch, CapacitorBranch,
-            TheveninSource, CurrentInjection,
+            TheveninSource, CurrentInjection, line_element_type,
         }, parsed.elements)
+end
+
+function _bpa_unexpanded_scalar_branch_table(parsed::DeckParser.DeckParseResult)
+    return isempty(parsed.coupled_phase_pi_section_rows) &&
+        isempty(parsed.coupled_line_rows) && _bpa_supported_branch_table_owners(parsed)
+end
+
+function _bpa_initial_history_branch_slots(parsed::DeckParser.DeckParseResult)
+    _bpa_supported_branch_table_owners(
+        parsed, DeckParser.DistributedTransposedLineCompanionAdmittance,
+    ) &&
+    isempty(parsed.over5_switch_rows) &&
+    !_deck_has_nonlinear_runtime_owners(parsed) || return nothing
+
+    all(row -> row.reference_kind == :none, parsed.coupled_phase_pi_section_rows) &&
+    all(row -> ismissing(row.reference_from_node_value) &&
+               ismissing(row.reference_to_node_value), parsed.coupled_line_rows) ||
+        return nothing
+
+    pi_groups = DeckParser._coupled_phase_pi_row_groups(parsed.coupled_phase_pi_section_rows)
+    sequence_groups = DeckParser._coupled_lumped_sequence_row_groups(parsed.coupled_line_rows)
+    distributed_groups = DeckParser._distributed_transposed_line_row_groups(parsed.coupled_line_rows)
+    sum(length, pi_groups; init = 0) == length(parsed.coupled_phase_pi_section_rows) ||
+        return nothing
+    sum(length, sequence_groups; init = 0) + sum(length, distributed_groups; init = 0) ==
+        length(parsed.coupled_line_rows) || return nothing
+
+    # OVER2 allocates one slot per physical phase in input order.
+    slots = [(line_no = row.line_no, scalar_index = index)
+             for (index, row) in enumerate(parsed.over2_branch_rows)]
+    for rows in (parsed.coupled_phase_pi_section_rows, parsed.coupled_line_rows), row in rows
+        push!(slots, (line_no = row.line_no, scalar_index = 0))
+    end
+    allunique(slot -> slot.line_no, slots) || return nothing
+    return sort!(slots; by = slot -> slot.line_no)
 end
 
 function _deck_scalar_initial_history_branch(parsed, condition)
@@ -789,18 +826,17 @@ function _deck_scalar_initial_history_branch(parsed, condition)
             "line $(condition.line_no): no BPA initial-history branch matches the oriented terminals",
         ))
     else
-        # In an all-scalar fixed branch table, OVER2 records and BPA branch
-        # numbers are one-to-one. Other tables can expand or reorder entries.
-        _bpa_unexpanded_scalar_branch_table(parsed) &&
-        isempty(parsed.over5_switch_rows) && !_deck_has_nonlinear_runtime_owners(parsed) ||
+        slots = _bpa_initial_history_branch_slots(parsed)
+        slots === nothing && throw(ArgumentError(
+            "line $(condition.line_no): BPA initial-history branch index requires a supported fixed branch table",
+        ))
+        scalar_index = checkbounds(Bool, slots, branch_index) ? slots[branch_index].scalar_index : 0
+        if scalar_index == 0 || !same_endpoints(branches[scalar_index])
             throw(ArgumentError(
-                "line $(condition.line_no): BPA initial-history branch index requires an unexpanded scalar branch table",
-            ))
-        if !checkbounds(Bool, branches, branch_index) || !same_endpoints(branches[branch_index])
-            throw(ArgumentError(
-                "line $(condition.line_no): BPA initial-history branch index $branch_index does not match the oriented terminals",
+                "line $(condition.line_no): BPA initial-history branch index $branch_index does not match the oriented terminals of a scalar branch",
             ))
         end
+        branch_index = scalar_index
     end
     branch = branches[branch_index]
     return branch.branch_kind in (:capacitor, :series_rlc) ? branch : nothing

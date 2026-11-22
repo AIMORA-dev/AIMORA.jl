@@ -1524,6 +1524,7 @@ function initialize_step_context(
     _delay_deck_time_switch_events!(elements, time_switch_event_delay_s, t_end_s)
     current_zero_switching &&
         _convert_deck_current_zero_switches!(elements, element_names, parsed)
+    _append_coupled_phase_pi_elements!(elements, element_names, parsed, t_end_s)
     source_function_runtime, control_system_runtime =
         _append_dynamic_source_and_control_elements!(
         elements,

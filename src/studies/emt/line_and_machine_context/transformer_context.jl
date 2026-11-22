@@ -552,6 +552,7 @@ function saturated_transformer_augmented_step_context(
         append!(elements, source_equivalent.elements)
         append!(element_names, source_equivalent.element_names)
     end
+    _append_coupled_phase_pi_elements!(elements, element_names, parsed, t_end_s)
     source_function_runtime, control_system_runtime =
         _append_dynamic_source_and_control_elements!(
         elements,
@@ -849,6 +850,7 @@ function saturated_transformer_branch_augmented_step_context(
         append!(elements, source_equivalent.elements)
         append!(element_names, source_equivalent.element_names)
     end
+    _append_coupled_phase_pi_elements!(elements, element_names, parsed, t_end_s)
     source_function_runtime, control_system_runtime =
         _append_dynamic_source_and_control_elements!(
         elements,

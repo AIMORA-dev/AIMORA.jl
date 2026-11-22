@@ -1,3 +1,46 @@
+function _append_coupled_phase_pi_elements!(
+    elements::Vector,
+    element_names::Vector{Symbol},
+    parsed::DeckParser.DeckParseResult,
+    t_end_s::Float64,
+)
+    t_end_s > 0.0 || return nothing
+    for section in DeckParser.deck_coupled_lumped_phase_pi_sections(parsed)
+        push!(elements, CoupledSeriesRLBranch(
+            section.from_node_indices,
+            section.to_node_indices,
+            section.phase_resistance_matrix,
+            section.phase_inductance_matrix,
+        ))
+        push!(element_names, Symbol(section.name, "_series"))
+
+        # Each terminal sees half the Maxwell capacitance matrix.
+        # Mutual capacitors implement its negative off-diagonals, with
+        # the row sums implemented by the capacitors to the reference.
+        shunt = section.phase_capacitance_matrix / 2
+        ground = vec(sum(shunt; dims = 2))
+        for (side, nodes) in ((:from, section.from_node_indices), (:to, section.to_node_indices))
+            for phase in eachindex(nodes)
+                ground[phase] >= 0.0 ||
+                    throw(ArgumentError("$(section.name) has a negative phase-pi capacitance to ground"))
+                if ground[phase] > 0.0 && nodes[phase] != 0
+                    push!(elements, CapacitorBranch(nodes[phase], 0, ground[phase]))
+                    push!(element_names, Symbol(section.name, "_", side, "_ground_", phase))
+                end
+                for other in firstindex(nodes):(phase - 1)
+                    mutual = -shunt[phase, other]
+                    mutual >= 0.0 ||
+                        throw(ArgumentError("$(section.name) has a positive phase-pi off-diagonal capacitance"))
+                    if mutual > 0.0 && nodes[phase] != nodes[other]
+                        push!(elements, CapacitorBranch(nodes[phase], nodes[other], mutual))
+                        push!(element_names, Symbol(section.name, "_", side, "_mutual_", phase, "_", other))
+                    end
+                end
+            end
+        end
+    end
+    return nothing
+end
 
 function coupled_lumped_sequence_augmented_step_context(
     parsed::DeckParser.DeckParseResult;
@@ -26,6 +69,7 @@ function coupled_lumped_sequence_augmented_step_context(
         _convert_deck_current_zero_switches!(deck_elements, deck_element_names, parsed)
     elements = Any[deck_elements...; source_equivalent.elements...]
     element_names = Symbol[deck_element_names...; source_equivalent.element_names...]
+    _append_coupled_phase_pi_elements!(elements, element_names, parsed, t_end_s)
     source_function_runtime, control_system_runtime =
         _append_dynamic_source_and_control_elements!(
         elements,
