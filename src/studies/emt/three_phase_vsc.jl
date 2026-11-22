@@ -305,6 +305,15 @@ mutable struct ThreePhaseVSCIntegrator{R,S,T,C,P}
     last_failure::Union{Nothing,String}
 end
 
+# Keep the historical integrator and its serialized layout intact. The
+# explicit causal route retains its selection across checkpoints.
+struct CausalThreePhaseVSCIntegrator{I<:ThreePhaseVSCIntegrator}
+    state::I
+end
+
+_three_phase_vsc_state(integrator::ThreePhaseVSCIntegrator) = integrator
+_three_phase_vsc_state(integrator::CausalThreePhaseVSCIntegrator) = integrator.state
+
 function _three_phase_vsc_bridge(
     parameters::SwitchDetailedVSC.ThreePhaseTwoLevelVSCParameters,
     pole_node::Int,
@@ -608,7 +617,68 @@ function _next_three_phase_vsc_task_time(
     return task_time_s <= endpoint_time_s + tolerance_s ? task_time_s : Inf
 end
 
-function _advance_three_phase_vsc_network_window!(
+function _three_phase_vsc_applied_gates(runtime::ThreePhaseVSCRuntime)
+    return map(runtime.bridges) do bridge
+        (bridge.upper_switch.gate_driver.applied_on, bridge.lower_switch.gate_driver.applied_on)
+    end
+end
+
+function _three_phase_vsc_source_edge(runtime::ThreePhaseVSCRuntime, time_s::Float64)
+    p = runtime.parameters
+    tolerance = 64 * eps(max(1.0, abs(time_s)))
+    for edge_s in (p.sag_start_s, p.sag_end_s, p.fault_start_s, p.fault_end_s)
+        abs(time_s - edge_s) <= tolerance && return edge_s
+    end
+    return nothing
+end
+
+struct ThreePhaseVSCIntervalVoltage
+    start_time_s::Float64
+    end_time_s::Float64
+    start_filter_voltage_v::NTuple{3,Float64}
+    end_filter_voltage_v::NTuple{3,Float64}
+end
+
+function _advance_three_phase_vsc_interval!(
+    integrator::ThreePhaseVSCIntegrator,
+    start_time_s::Float64,
+    endpoint_time_s::Float64,
+    intervals::Union{Nothing,Vector{ThreePhaseVSCIntervalVoltage}},
+)
+    runtime = integrator.runtime
+    dt_s = endpoint_time_s - start_time_s
+    source_edge = _three_phase_vsc_source_edge(runtime, endpoint_time_s)
+    left_evaluation_s = source_edge === nothing ? endpoint_time_s : prevfloat(source_edge)
+
+    _advance_three_phase_vsc_causal_storage!(
+        runtime, start_time_s, endpoint_time_s, left_evaluation_s, intervals,
+    )
+
+    gates_before = _three_phase_vsc_applied_gates(runtime)
+    _apply_three_phase_vsc_boundaries!(integrator, endpoint_time_s)
+    if source_edge !== nothing
+        # A measurement coincident with a source edge sees the new grid
+        # voltage and the same accepted inductor current.
+        p = runtime.parameters
+        for (phase, filter) in enumerate(runtime.phase_filters)
+            source_v = ThreePhaseGridVoltageSignal(p, phase)(source_edge)
+            runtime.system.v[filter.b] = source_v + p.grid_source_resistance_ohm * filter.i_prev
+        end
+    end
+    run_due_sampled_tasks!(integrator.scheduler, runtime, endpoint_time_s)
+    for bridge in runtime.bridges
+        Nonlinear.apply_power_semiconductor_bridge_gate_transitions!(bridge, endpoint_time_s)
+    end
+    if _three_phase_vsc_applied_gates(runtime) != gates_before || source_edge !== nothing
+        right_evaluation_s = source_edge === nothing ? endpoint_time_s : source_edge
+        _resolve_three_phase_vsc_boundary!(
+            runtime, endpoint_time_s; source_time_s = right_evaluation_s,
+        )
+    end
+    return runtime
+end
+
+function _advance_historical_three_phase_vsc_window!(
     integrator::ThreePhaseVSCIntegrator,
     start_time_s::Float64,
     endpoint_time_s::Float64,
@@ -620,7 +690,7 @@ function _advance_three_phase_vsc_network_window!(
     if endpoint_time_s - start_time_s <= scheduler.tick_s + tolerance
         _apply_three_phase_vsc_boundaries!(integrator, endpoint_time_s)
         run_due_sampled_tasks!(scheduler, runtime, endpoint_time_s)
-        _stabilize_three_phase_vsc_topology!(
+        _stabilize_historical_three_phase_vsc_topology!(
             runtime,
             endpoint_time_s,
             endpoint_time_s - start_time_s,
@@ -650,12 +720,48 @@ function _advance_three_phase_vsc_network_window!(
         ))
         _apply_three_phase_vsc_boundaries!(integrator, segment_endpoint_s)
         run_due_sampled_tasks!(scheduler, runtime, segment_endpoint_s)
-        _stabilize_three_phase_vsc_topology!(
+        _stabilize_historical_three_phase_vsc_topology!(
             runtime,
             segment_endpoint_s,
             segment_timestep_s,
         )
         Nodal.accept_algebraic_state!(runtime.system, segment_timestep_s)
+        current_time_s = segment_endpoint_s
+    end
+    abs(current_time_s - endpoint_time_s) <= tolerance || throw(ArgumentError(
+        "converter network window did not reach its requested endpoint",
+    ))
+    return runtime
+end
+
+function _advance_three_phase_vsc_network_window!(
+    integrator::ThreePhaseVSCIntegrator,
+    start_time_s::Float64,
+    endpoint_time_s::Float64,
+    intervals::Union{Nothing,Vector{ThreePhaseVSCIntervalVoltage}},
+)
+    runtime = integrator.runtime
+    scheduler = integrator.scheduler
+    tolerance = runtime.parameters.scheduler_tick_s * 1.0e-9
+    if endpoint_time_s - start_time_s <= scheduler.tick_s + tolerance
+        return _advance_three_phase_vsc_interval!(integrator, start_time_s, endpoint_time_s, intervals)
+    end
+    current_time_s = start_time_s
+    while current_time_s < endpoint_time_s - tolerance
+        task_time_s = _next_three_phase_vsc_task_time(
+            integrator, current_time_s, endpoint_time_s, tolerance,
+        )
+        boundary_time_s = _next_three_phase_vsc_boundary_time(
+            runtime, current_time_s, endpoint_time_s,
+        )
+        gate_time_s = minimum(runtime.bridges) do bridge
+            something(Nonlinear.power_semiconductor_bridge_gate_transition_time(bridge), Inf)
+        end
+        segment_endpoint_s = min(endpoint_time_s, task_time_s, boundary_time_s, gate_time_s)
+        segment_endpoint_s - current_time_s > tolerance || throw(ArgumentError(
+            "converter scheduler produced a nonadvancing network interval at $current_time_s s",
+        ))
+        _advance_three_phase_vsc_interval!(integrator, current_time_s, segment_endpoint_s, intervals)
         current_time_s = segment_endpoint_s
     end
     abs(current_time_s - endpoint_time_s) <= tolerance || throw(ArgumentError(
@@ -743,20 +849,186 @@ function _apply_three_phase_vsc_topology_action!(
     throw(ArgumentError("unsupported converter topology transition $transition"))
 end
 
+function _three_phase_vsc_guard(device, voltage, transition)
+    v, i = _three_phase_vsc_device_current(device, voltage)
+    transition === :forward_extinction && return device.holding_current - i
+    transition === :reverse_diode_extinction &&
+        return device.antiparallel_diode.holding_current_a + i
+    transition === :forward_turn_on &&
+        return v - Nonlinear.power_semiconductor_forward_turn_on_voltage(device)
+    return -v - Nonlinear.power_semiconductor_reverse_turn_on_voltage(device)
+end
+
+function _three_phase_vsc_incoming_guards(runtime::ThreePhaseVSCRuntime)
+    return [
+        (; phase, position, device, transition,
+           left = _three_phase_vsc_guard(device, runtime.system.v, transition))
+        for (phase, bridge) in enumerate(runtime.bridges), position in (:upper, :lower)
+        for device in (Nonlinear.power_semiconductor_bridge_switch(bridge, position),)
+        for transition in (device.closed ? (:forward_extinction,) :
+            device.reverse_diode_conducting ? (:reverse_diode_extinction,) :
+            device.gate_driver.applied_on ? (:forward_turn_on, :reverse_diode_turn_on) :
+            (:reverse_diode_turn_on,))
+    ]
+end
+
+function _solve_three_phase_vsc_causal_segment!(runtime, time_s, dt_s, matrix, rhs, solution)
+    system = runtime.system
+    capacitor = runtime.dc_link_capacitor
+    fill!(matrix, 0.0)
+    fill!(rhs, 0.0)
+    y = @view matrix[1:system.node_count, 1:system.node_count]
+    nodal_rhs = @view rhs[1:system.node_count]
+    for element in system.elements
+        element === capacitor || Branches.stamp!(y, nodal_rhs, element, time_s, dt_s)
+    end
+    # Keep capacitor current as an unknown. The equivalent voltage equation
+    # avoids the very large 2C/dt Norton coefficient in short event probes.
+    slot = length(rhs)
+    matrix[capacitor.a, slot] = matrix[slot, capacitor.a] = 1.0
+    matrix[capacitor.b, slot] = matrix[slot, capacitor.b] = -1.0
+    scale = dt_s / (2.0 * capacitor.c)
+    matrix[slot, slot] = -scale
+    rhs[slot] = muladd(scale, capacitor.i_prev, capacitor.v_prev)
+    copyto!(system.y, y)
+    copyto!(system.rhs, nodal_rhs)
+    Nodal.solve_dense!(solution, matrix, rhs)
+    copyto!(system.v, 1, solution, 1, system.node_count)
+    Branches.stamp_history_current!(system.rhs, capacitor.a, capacitor.b, solution[slot])
+    return solution[slot]
+end
+
+function _accept_three_phase_vsc_causal_segment!(runtime, start_s, end_s, capacitor_i, intervals)
+    start_v = intervals === nothing ? nothing : map(filter -> filter.v_prev, runtime.phase_filters)
+    dt_s = end_s - start_s
+    system = runtime.system
+    capacitor = runtime.dc_link_capacitor
+    for element in system.elements
+        element === capacitor || Branches.update!(element, system.v, dt_s)
+    end
+    capacitor.v_prev = muladd(dt_s / (2.0 * capacitor.c),
+        capacitor.i_prev + capacitor_i, capacitor.v_prev)
+    capacitor.i_prev = capacitor.i_last = capacitor_i
+    if start_v !== nothing
+        push!(intervals, ThreePhaseVSCIntervalVoltage(
+            start_s, end_s, start_v, map(filter -> filter.v_prev, runtime.phase_filters),
+        ))
+    end
+    return nothing
+end
+
+function _three_phase_vsc_guard_bounds(root, bracket_start_s)
+    upper_s = root.time_s
+    # Width and endpoint are Float64. Round the reconstructed lower
+    # endpoint outwards so cancellation cannot overstate separation.
+    lower_s = max(bracket_start_s, prevfloat(upper_s - nextfloat(root.bracket_width_s)))
+    return (; lower_s, upper_s)
+end
+
+function _unique_three_phase_vsc_guard(candidates, tolerance_s)
+    isempty(candidates) && return nothing
+    winner = argmin(candidate -> candidate.upper_s, candidates)
+    for rival in candidates
+        rival.index == winner.index && continue
+        # The upward-rounded threshold gives a conservative strict comparison.
+        rival.lower_s > nextfloat(winner.upper_s + tolerance_s) || throw(ArgumentError(
+            "converter intrinsic guard ordering is unresolved at t=$(winner.upper_s) s",
+        ))
+    end
+    return winner
+end
+
+function _advance_three_phase_vsc_causal_storage!(
+    runtime, start_s::Float64, end_s::Float64, source_end_s::Float64, intervals,
+)
+    hybrid = OVER16TimestepIntegration
+    policy = hybrid.HybridEventPolicy()
+    cursor_s = start_s
+    event_count = 0
+    size = runtime.system.node_count + 1
+    matrix = zeros(size, size)
+    rhs = zeros(size)
+    solution = zeros(size)
+    while cursor_s < end_s
+        guards = _three_phase_vsc_incoming_guards(runtime)
+        solve(t) = _solve_three_phase_vsc_causal_segment!(
+            runtime, t == end_s ? source_end_s : t, t - cursor_s, matrix, rhs, solution,
+        )
+        solve(end_s)
+        # Capture all endpoint values before any root probe changes the trial arrays.
+        right = map(guards) do guard
+            _three_phase_vsc_guard(guard.device, runtime.system.v, guard.transition)
+        end
+        candidates = NamedTuple{(:index, :lower_s, :upper_s),Tuple{Int,Float64,Float64}}[]
+        for (index, (guard, value)) in enumerate(zip(guards, right))
+            value > 1.0e-9 || continue
+            bounds = if guard.left >= 0.0
+                guard.left <= 1.0e-9 || throw(ArgumentError(
+                    "infeasible converter guard at the incoming boundary for $(guard.transition)",
+                ))
+                (; lower_s = cursor_s, upper_s = cursor_s)
+            else
+                bracket = hybrid.HybridEventBracket(cursor_s, guard.left, end_s, value)
+                root = hybrid.localize_hybrid_event!(
+                    hybrid.HYBRID_EVENT_RISING, bracket, policy,
+                ) do probe_s
+                    solve(probe_s)
+                    _three_phase_vsc_guard(guard.device, runtime.system.v, guard.transition)
+                end
+                root.converged || throw(ArgumentError("converter guard root did not converge"))
+                _three_phase_vsc_guard_bounds(root, cursor_s)
+            end
+            push!(candidates, (; index, bounds...))
+        end
+        winner = _unique_three_phase_vsc_guard(candidates, policy.simultaneity_tolerance_s)
+        if winner === nothing
+            capacitor_i = solve(end_s)
+            _accept_three_phase_vsc_causal_segment!(runtime, cursor_s, end_s, capacitor_i, intervals)
+            return runtime
+        end
+        guard = guards[winner.index]
+        earliest_s = winner.upper_s
+        if earliest_s > cursor_s
+            earliest_s - cursor_s >= policy.minimum_progress_s || throw(ArgumentError(
+                "converter intrinsic guard spacing is below the minimum progression interval",
+            ))
+            capacitor_i = solve(earliest_s)
+            _accept_three_phase_vsc_causal_segment!(runtime, cursor_s, earliest_s, capacitor_i, intervals)
+        else
+            _solve_three_phase_vsc_boundary!(runtime, cursor_s)
+        end
+        residual = _three_phase_vsc_guard(guard.device, runtime.system.v, guard.transition)
+        _apply_three_phase_vsc_topology_action!(guard.device, guard.transition, earliest_s)
+        tick = round(Int, earliest_s / runtime.parameters.scheduler_tick_s)
+        phase_name = Char(Int('a') + guard.phase - 1)
+        push!(runtime.commutation_occurrences, ThreePhaseVSCCommutationOccurrence(
+            Symbol(:phase_, phase_name, :_, guard.position, :_, guard.transition),
+            earliest_s, tick, guard.phase, guard.position, guard.transition, residual, 1,
+        ))
+        evaluation_s = earliest_s == end_s ? source_end_s : earliest_s
+        _stage_three_phase_vsc_boundary!(runtime, earliest_s,
+            _solve_three_phase_vsc_boundary!(runtime, evaluation_s))
+        cursor_s = earliest_s
+        event_count += 1
+        event_count <= policy.maximum_events_per_step || throw(ArgumentError(
+            "converter intrinsic events did not re-arm with finite progress",
+        ))
+    end
+    return runtime
+end
+
 function _stabilize_three_phase_vsc_topology!(
+    solve_state!,
     runtime::ThreePhaseVSCRuntime,
-    time_s::Float64,
-    dt_s::Float64;
+    time_s::Float64;
     maximum_iterations::Int = 32,
+    record_actions::Bool = true,
 )
     maximum_iterations > 0 || throw(ArgumentError(
         "converter topology maximum iterations must be positive",
     ))
-    for bridge in runtime.bridges
-        Nonlinear.apply_power_semiconductor_bridge_gate_transitions!(bridge, time_s)
-    end
     for iteration in 1:maximum_iterations
-        Nodal.solve_algebraic_state!(runtime.system, time_s, dt_s)
+        solve_state!()
         selected = nothing
         for phase in 1:3, position in (:upper, :lower)
             device = Nonlinear.power_semiconductor_bridge_switch(
@@ -782,7 +1054,7 @@ function _stabilize_three_phase_vsc_topology!(
             time_s,
         )
         tick = round(Int, time_s / runtime.parameters.scheduler_tick_s)
-        push!(
+        record_actions && push!(
             runtime.commutation_occurrences,
             ThreePhaseVSCCommutationOccurrence(
                 Symbol(
@@ -806,6 +1078,104 @@ function _stabilize_three_phase_vsc_topology!(
     throw(ArgumentError(
         "converter semiconductor topology did not stabilize within $maximum_iterations algebraic solves at t=$time_s s",
     ))
+end
+
+
+function _stabilize_three_phase_vsc_topology!(
+    runtime::ThreePhaseVSCRuntime, time_s::Float64, dt_s::Float64;
+    source_time_s::Float64 = time_s,
+)
+    return _stabilize_three_phase_vsc_topology!(runtime, time_s) do
+        Nodal.solve_algebraic_state!(runtime.system, source_time_s, dt_s)
+    end
+end
+
+function _stabilize_historical_three_phase_vsc_topology!(
+    runtime::ThreePhaseVSCRuntime, time_s::Float64, dt_s::Float64,
+)
+    for bridge in runtime.bridges
+        Nonlinear.apply_power_semiconductor_bridge_gate_transitions!(bridge, time_s)
+    end
+    return _stabilize_three_phase_vsc_topology!(runtime, time_s, dt_s)
+end
+
+function _solve_three_phase_vsc_boundary!(runtime::ThreePhaseVSCRuntime, time_s::Float64)
+    system = runtime.system
+    p = runtime.parameters
+    positive = _VSC_DC_POSITIVE_NODE
+    negative = _VSC_DC_NEGATIVE_NODE
+    y, rhs, v = system.y, system.rhs, system.v
+    fill!(y, 0.0)
+    fill!(rhs, 0.0)
+    for bridge in runtime.bridges
+        Branches.stamp!(y, rhs, bridge, time_s, 0.0)
+    end
+    dc_g = inv(p.dc_source_resistance_ohm)
+    Branches.stamp_conductance!(y, positive, negative, dc_g)
+    Branches.stamp_history_current!(rhs, positive, negative, -dc_g * p.dc_source_voltage_v)
+
+    # Use the negative rail as a temporary voltage reference. With storage
+    # held fixed, the pole KCL equations are scalar and the DC link voltage
+    # is known. Recover common mode from d(sum(i_phase))/dt = 0.
+    v[negative] = 0.0
+    v[positive] = runtime.dc_link_capacitor.v_prev
+    common_mode_sum_v = 0.0
+    for (phase, filter) in enumerate(runtime.phase_filters)
+        pole, terminal = filter.a, filter.b
+        current_a = filter.i_prev
+        source_v = ThreePhaseGridVoltageSignal(p, phase)(time_s)
+        grid_g = inv(p.grid_source_resistance_ohm)
+        Branches.stamp_conductance!(y, terminal, 0, grid_g)
+        Branches.stamp_history_current!(rhs, terminal, 0, -grid_g * source_v)
+        Branches.stamp_history_current!(rhs, pole, terminal, current_a)
+        v[terminal] = source_v + p.grid_source_resistance_ohm * current_a
+        if y[pole, pole] > 0.0
+            v[pole] = (rhs[pole] - y[pole, positive] * v[positive]) / y[pole, pole]
+        else
+            # With ideal off switches a disconnected pole needs a nonzero
+            # filter current to select its diode. At zero current keep its
+            # previous voltage within the two nonconducting thresholds.
+            diode_drop = p.diode_forward_voltage_v
+            previous_pole_v = runtime.bridges[phase].last_ac_terminal_voltage_v -
+                runtime.bridges[phase].last_dc_negative_voltage_v
+            v[pole] = current_a > 0 ? -diode_drop - 1.0 :
+                current_a < 0 ? v[positive] + diode_drop + 1.0 :
+                clamp(previous_pole_v, -diode_drop, v[positive] + diode_drop)
+        end
+        common_mode_sum_v += v[terminal] + filter.r * current_a - v[pole]
+    end
+    common_mode_v = common_mode_sum_v / length(runtime.phase_filters)
+    for node in (positive, negative, _three_phase_vsc_pole_node.(1:3)...)
+        v[node] += common_mode_v
+    end
+    # The fixed-voltage capacitor supplies the current required by rail KCL.
+    return rhs[positive] - sum(y[positive, node] * v[node] for node in eachindex(v))
+end
+
+function _resolve_three_phase_vsc_boundary!(
+    runtime::ThreePhaseVSCRuntime, time_s::Float64;
+    source_time_s::Float64 = time_s,
+)
+    capacitor_current_a = 0.0
+    _stabilize_three_phase_vsc_topology!(runtime, time_s; record_actions = false) do
+        capacitor_current_a = _solve_three_phase_vsc_boundary!(runtime, source_time_s)
+    end
+    return _stage_three_phase_vsc_boundary!(runtime, time_s, capacitor_current_a)
+end
+
+function _stage_three_phase_vsc_boundary!(runtime, time_s, capacitor_current_a)
+    system = runtime.system
+    capacitor = runtime.dc_link_capacitor
+    Branches.stamp_history_current!(system.rhs, capacitor.a, capacitor.b, capacitor_current_a)
+    capacitor.i_prev = capacitor_current_a
+    capacitor.i_last = capacitor_current_a
+    for filter in runtime.phase_filters
+        filter.v_prev = Branches.branch_voltage(system.v, filter.a, filter.b)
+    end
+    for bridge in runtime.bridges
+        Branches.update!(bridge, system.v, 0.0)
+    end
+    return runtime
 end
 
 function _three_phase_vsc_source_quantities(runtime::ThreePhaseVSCRuntime, time_s::Float64)
@@ -926,10 +1296,16 @@ function _record_three_phase_vsc_sample!(
     return recorder
 end
 
-"""Construct a coupled converter network, exact sampled controller/PWM scheduler, reversible transaction, and preallocated typed recorder."""
+"""
+Construct the converter integrator. The default preserves the historical
+sampled topology execution. Set `causal_events=true` to localize directed
+intrinsic guards between scheduled boundaries and preserve that selection
+across checkpoint/restart.
+"""
 function configure_three_phase_vsc(
     parameters::SwitchDetailedVSC.ThreePhaseTwoLevelVSCParameters =
-        SwitchDetailedVSC.ThreePhaseTwoLevelVSCParameters(),
+        SwitchDetailedVSC.ThreePhaseTwoLevelVSCParameters();
+    causal_events::Bool = false,
 )
     runtime = _three_phase_vsc_runtime(parameters)
     scheduler, controller, pwm_tasks = _three_phase_vsc_scheduler(runtime)
@@ -950,12 +1326,17 @@ function configure_three_phase_vsc(
     occurrence_count = length(scheduler.occurrences)
     begin_timestep_transaction!(integrator.transaction)
     try
-        run_due_sampled_tasks!(scheduler, runtime, 0.0)
-        _stabilize_three_phase_vsc_topology!(
-            runtime,
-            0.0,
-            parameters.timestep_s,
-        )
+        if causal_events
+            _apply_three_phase_vsc_boundaries!(integrator, 0.0)
+            run_due_sampled_tasks!(scheduler, runtime, 0.0)
+            for bridge in runtime.bridges
+                Nonlinear.apply_power_semiconductor_bridge_gate_transitions!(bridge, 0.0)
+            end
+            _resolve_three_phase_vsc_boundary!(runtime, 0.0)
+        else
+            run_due_sampled_tasks!(scheduler, runtime, 0.0)
+            _stabilize_historical_three_phase_vsc_topology!(runtime, 0.0, parameters.timestep_s)
+        end
         commit_timestep_transaction!(integrator.transaction)
     catch error
         restore_timestep_transaction!(integrator.transaction)
@@ -963,11 +1344,23 @@ function configure_three_phase_vsc(
         rethrow(error)
     end
     _record_three_phase_vsc_sample!(integrator.recorder, runtime, 0.0)
-    return integrator
+    return causal_events ? CausalThreePhaseVSCIntegrator(integrator) : integrator
 end
 
 """Advance exactly one accepted converter timestep with atomic scheduler, protection, network, companion, and device mutation."""
-function advance_three_phase_vsc!(integrator::ThreePhaseVSCIntegrator)
+advance_three_phase_vsc!(integrator::ThreePhaseVSCIntegrator) =
+    _advance_three_phase_vsc!(integrator, false)
+
+function advance_three_phase_vsc!(
+    integrator::CausalThreePhaseVSCIntegrator; accepted_intervals = nothing,
+)
+    return _advance_three_phase_vsc!(integrator.state, true; accepted_intervals)
+end
+
+function _advance_three_phase_vsc!(
+    integrator::ThreePhaseVSCIntegrator, causal_events::Bool;
+    accepted_intervals::Union{Nothing,Vector{ThreePhaseVSCIntervalVoltage}} = nothing,
+)
     integrator.failed && throw(ArgumentError(
         "three-phase VSC integrator is terminally failed: $(integrator.last_failure)",
     ))
@@ -983,13 +1376,15 @@ function advance_three_phase_vsc!(integrator::ThreePhaseVSCIntegrator)
     task_states = _three_phase_vsc_task_states(integrator)
     occurrence_count = length(integrator.scheduler.occurrences)
     recorder_write_index = integrator.recorder.write_index
+    intervals = accepted_intervals === nothing ? nothing : ThreePhaseVSCIntervalVoltage[]
     begin_timestep_transaction!(integrator.transaction)
     try
-        _advance_three_phase_vsc_network_window!(
-            integrator,
-            (next_step - 1) * p.timestep_s,
-            time_s,
-        )
+        start_s = (next_step - 1) * p.timestep_s
+        if causal_events
+            _advance_three_phase_vsc_network_window!(integrator, start_s, time_s, intervals)
+        else
+            _advance_historical_three_phase_vsc_window!(integrator, start_s, time_s)
+        end
         _record_three_phase_vsc_sample!(
             integrator.recorder,
             integrator.runtime,
@@ -1007,21 +1402,23 @@ function advance_three_phase_vsc!(integrator::ThreePhaseVSCIntegrator)
     end
     integrator.accepted_step_index = next_step
     integrator.completed = next_step == final_step
+    accepted_intervals === nothing || append!(accepted_intervals, intervals)
     return true
 end
 
 function run_three_phase_vsc!(
-    integrator::ThreePhaseVSCIntegrator;
+    integrator::Union{ThreePhaseVSCIntegrator,CausalThreePhaseVSCIntegrator};
     stop_time_s::Union{Nothing,Real} = nothing,
 )
+    state = _three_phase_vsc_state(integrator)
     stop_step = stop_time_s === nothing ? typemax(Int) : begin
         stop_time = Float64(stop_time_s)
         isfinite(stop_time) && stop_time >= 0.0 || throw(ArgumentError(
             "converter stop time must be finite and nonnegative",
         ))
-        round(Int, stop_time / integrator.runtime.parameters.timestep_s)
+        round(Int, stop_time / state.runtime.parameters.timestep_s)
     end
-    while !integrator.completed && integrator.accepted_step_index < stop_step
+    while !state.completed && state.accepted_step_index < stop_step
         advance_three_phase_vsc!(integrator)
     end
     return integrator
@@ -1241,6 +1638,9 @@ function _three_phase_vsc_metrics(integrator::ThreePhaseVSCIntegrator)
     )
 end
 
+three_phase_vsc_trace(integrator::CausalThreePhaseVSCIntegrator) =
+    three_phase_vsc_trace(integrator.state)
+
 function three_phase_vsc_trace(integrator::ThreePhaseVSCIntegrator)
     integrator.completed || throw(ArgumentError(
         "converter trace requires a completed horizon",
@@ -1284,9 +1684,10 @@ end
 
 function simulate_three_phase_vsc(
     parameters::SwitchDetailedVSC.ThreePhaseTwoLevelVSCParameters =
-        SwitchDetailedVSC.ThreePhaseTwoLevelVSCParameters(),
+        SwitchDetailedVSC.ThreePhaseTwoLevelVSCParameters();
+    causal_events::Bool = false,
 )
-    integrator = configure_three_phase_vsc(parameters)
+    integrator = configure_three_phase_vsc(parameters; causal_events)
     run_three_phase_vsc!(integrator)
     return three_phase_vsc_trace(integrator)
 end
@@ -1300,9 +1701,9 @@ end
 """Write an integrity-checked, trusted Julia checkpoint for a non-active converter integrator."""
 function write_three_phase_vsc_checkpoint(
     path::AbstractString,
-    integrator::ThreePhaseVSCIntegrator,
+    integrator::Union{ThreePhaseVSCIntegrator,CausalThreePhaseVSCIntegrator},
 )
-    timestep_transaction_active(integrator.transaction) && throw(ArgumentError(
+    timestep_transaction_active(_three_phase_vsc_state(integrator).transaction) && throw(ArgumentError(
         "converter checkpoint cannot be written during an active timestep transaction",
     ))
     payload_io = IOBuffer()
@@ -1374,14 +1775,15 @@ function read_three_phase_vsc_checkpoint(
         "converter checkpoint Julia version $(payload.julia_version) does not match $VERSION",
     ))
     integrator = payload.integrator
-    integrator isa ThreePhaseVSCIntegrator || throw(ArgumentError(
+    integrator isa Union{ThreePhaseVSCIntegrator,CausalThreePhaseVSCIntegrator} || throw(ArgumentError(
         "converter checkpoint does not contain a converter integrator",
     ))
-    timestep_transaction_active(integrator.transaction) && throw(ArgumentError(
+    state = _three_phase_vsc_state(integrator)
+    timestep_transaction_active(state.transaction) && throw(ArgumentError(
         "converter checkpoint contains an active timestep transaction",
     ))
     SwitchDetailedVSC.validate_three_phase_vsc_parameters(
-        integrator.runtime.parameters,
+        state.runtime.parameters,
     )
     return integrator
 end
