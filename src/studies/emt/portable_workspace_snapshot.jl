@@ -231,6 +231,12 @@ function _portable_emt_element_state_fields(
         _portable_emt_state_field("$prefix.previous_voltage", "emt.branch_history", :history, "V", element.v_prev),
         _portable_emt_state_field("$prefix.last_current", "emt.branch_state", :algebraic, "A", element.i_last),
     ])
+    if !iszero(element.history_voltage_offset)
+        push!(fields, _portable_emt_state_field(
+            "$prefix.history_voltage_offset", "emt.branch_history", :history, "V",
+            element.history_voltage_offset,
+        ))
+    end
     return fields
 end
 
@@ -1200,6 +1206,9 @@ function _restore_portable_emt_element_state!(
     element.i_prev = _portable_emt_scalar(fields, "$prefix.previous_current", :history, "A", Float64)
     element.v_prev = _portable_emt_scalar(fields, "$prefix.previous_voltage", :history, "V", Float64)
     element.i_last = _portable_emt_scalar(fields, "$prefix.last_current", :algebraic, "A", Float64)
+    offset_field = "$prefix.history_voltage_offset"
+    element.history_voltage_offset = haskey(fields, offset_field) ?
+        _portable_emt_scalar(fields, offset_field, :history, "V", Float64) : 0.0
     return element
 end
 

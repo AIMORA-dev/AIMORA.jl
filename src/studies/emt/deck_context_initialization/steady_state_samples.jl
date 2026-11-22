@@ -747,28 +747,53 @@ function deck_steady_state_voltage_phasors(
     )
 end
 
+struct DeckCapacitorInitialHistory
+    current_a::Float64
+    capacitor_voltage_v::Float64
+    terminal_voltage_v::Float64
+end
+
 function _deck_node_voltage_initial_sample(
     parsed::DeckParser.DeckParseResult,
     values::Vector{Float64} = zeros(Float64, length(parsed.node_map)),
 )
-    conditions = DeckParser.deck_node_initial_condition_rows(parsed)
-    rows = [
-        row for row in conditions
+    histories = Dict{Tuple{Int,Int},DeckCapacitorInitialHistory}()
+    voltage_count = 0
+    scalar_conditions = true
+    for row in DeckParser.deck_node_initial_condition_rows(parsed)
         if row.condition_kind == :node_voltage_initial_condition && row.node_index > 0
-    ]
-    isempty(rows) && return nothing
-    for row in rows
-        reference_value =
-            row.reference_node_index isa Missing ? 0.0 : values[Int(row.reference_node_index)]
-        values[Int(row.node_index)] = reference_value + Float64(row.real_value)
+            reference = coalesce(row.reference_node_index, 0)
+            values[row.node_index] = _deck_node_voltage(values, reference) + row.real_value
+            voltage_count += 1
+        elseif row.condition_kind == :node_current_initial_condition
+            image = DeckParser.fixed_image(row.raw_text)
+            branch_field = DeckParser.fixed_field(image, 75, 80)
+            terminals = (row.node_index, coalesce(row.reference_node_index, 0))
+            matching = filter(
+                branch -> (branch.from_node_value, branch.to_node_value) == terminals,
+                parsed.over2_branch_rows,
+            )
+            if (isempty(branch_field) || tryparse(Int, branch_field) == 0) &&
+               length(matching) == 1 && only(matching).branch_kind == :capacitor
+                card_voltage = _deck_node_voltage(values, terminals[1]) -
+                               _deck_node_voltage(values, terminals[2])
+                histories[terminals] = DeckCapacitorInitialHistory(
+                    row.real_value, row.imaginary_value, card_voltage,
+                )
+            else
+                scalar_conditions = false
+            end
+        else
+            scalar_conditions = false
+        end
     end
+    voltage_count == 0 && isempty(histories) && return nothing
     sample = _deck_transient_initial_voltage_sample(
-        parsed, values, :deck_node_voltage_initial_conditions; condition_count = length(rows),
+        parsed, values, :deck_node_voltage_initial_conditions; condition_count = voltage_count,
     )
     return merge(sample, (
-        node_voltage_conditions_only = all(
-            row -> row.condition_kind == :node_voltage_initial_condition, conditions,
-        ),
+        capacitor_initial_histories = histories,
+        stage_node_voltage_history = voltage_count > 0 && scalar_conditions,
     ))
 end
 

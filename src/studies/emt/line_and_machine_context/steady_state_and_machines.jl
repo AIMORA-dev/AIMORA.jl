@@ -421,6 +421,8 @@ function _seed_steady_state_network_state!(
     end
     frequency_hz = Float64(sample.steady_state_frequency_hz)
     has_phasors = hasproperty(sample, :node_voltage_phasors)
+    capacitor_histories = hasproperty(sample, :capacitor_initial_histories) ?
+        sample.capacitor_initial_histories : nothing
     for element in context.system.elements
         if element isa Union{SeriesRLBranch,SeriesRLCBranch,CapacitorBranch}
             imposed_voltage =
@@ -440,9 +442,24 @@ function _seed_steady_state_network_state!(
                     element.capacitor_voltage_prev = element.v_prev
                 end
             end
-            stage_imposed_branch_voltage && _stage_scalar_branch_initial_voltage!(
-                element, imposed_voltage, context.dt_s,
-            )
+            history = element isa CapacitorBranch && capacitor_histories !== nothing ?
+                get(capacitor_histories, (element.a, element.b), nothing) : nothing
+            if element isa CapacitorBranch
+                element.history_voltage_offset = 0.0
+            end
+            if history !== nothing
+                # BPA captures the terminal drop at the Type 3 card, before any
+                # subsequent voltage prescriptions. OVER16 then advances both currents.
+                conductance, _ = companion(element, context.dt_s)
+                element.v_prev = imposed_voltage
+                element.i_prev = history.current_a +
+                    conductance * (imposed_voltage - history.terminal_voltage_v)
+                element.i_last = element.i_prev
+                element.history_voltage_offset =
+                    history.capacitor_voltage_v - history.terminal_voltage_v
+            elseif stage_imposed_branch_voltage
+                _stage_scalar_branch_initial_voltage!(element, imposed_voltage, context.dt_s)
+            end
             continue
         end
         if element isa ComplexModalBergeronLine &&

@@ -319,7 +319,11 @@ mutable struct CapacitorBranch <: EMTElement
     i_prev::Float64
     v_prev::Float64
     i_last::Float64
+    history_voltage_offset::Float64
 end
+
+CapacitorBranch(a, b, c, i_prev, v_prev, i_last) =
+    CapacitorBranch(a, b, c, i_prev, v_prev, i_last, 0.0)
 
 CapacitorBranch(a::Int, b::Int, c::Float64) = CapacitorBranch(a, b, c, 0.0, 0.0, 0.0)
 
@@ -1290,7 +1294,11 @@ function companion(b::SeriesRLCBranch, dt::Float64)
 end
 
 function companion(b::CapacitorBranch, dt::Float64)
-    return capacitor_companion(b.c, b.i_prev, b.v_prev, dt)
+    conductance, history_current = capacitor_companion(b.c, b.i_prev, b.v_prev, dt)
+    iszero(b.history_voltage_offset) && return conductance, history_current
+    # The BPA capacitor's independently prescribed stored voltage can differ
+    # from its terminal voltage. The trapezoidal update reverses that difference.
+    return conductance, history_current - 2.0 * (conductance * b.history_voltage_offset)
 end
 
 companion(b::SeriesRLBranch, dt::Float64, ::Val{TrapezoidalCompanion}) =
@@ -1347,6 +1355,9 @@ companion(b::CapacitorBranch, dt::Float64, ::Val{TrapezoidalCompanion}) =
     companion(b, dt)
 
 function companion(b::CapacitorBranch, dt::Float64, ::Val{BackwardEulerCompanion})
+    iszero(b.history_voltage_offset) || throw(ArgumentError(
+        "capacitor history with an independent initial voltage requires trapezoidal stepping",
+    ))
     isfinite(dt) && dt > 0.0 || throw(ArgumentError(
         "capacitor backward-Euler timestep must be finite and positive",
     ))
@@ -1663,6 +1674,8 @@ function update!(b::CapacitorBranch, v, dt::Float64)
     b.v_prev = vb
     b.i_prev = i
     b.i_last = i
+    iszero(b.history_voltage_offset) ||
+        (b.history_voltage_offset = -b.history_voltage_offset)
     return nothing
 end
 

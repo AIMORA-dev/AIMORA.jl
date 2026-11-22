@@ -95,7 +95,8 @@ function _apply_deck_node_voltage_conditions(parsed::DeckParser.DeckParseResult,
         node_voltage_values = node_conditions.node_voltage_values,
         output_voltage_values = node_conditions.output_voltage_values,
         node_voltage_condition_count = node_conditions.node_voltage_condition_count,
-        node_voltage_conditions_only = node_conditions.node_voltage_conditions_only,
+        capacitor_initial_histories = node_conditions.capacitor_initial_histories,
+        stage_node_voltage_history = node_conditions.stage_node_voltage_history,
     ))
 end
 
@@ -1378,8 +1379,8 @@ function run_deck_emt(
             context,
             initial_voltage_sample;
             stage_imposed_branch_voltage =
-                hasproperty(initial_voltage_sample, :node_voltage_conditions_only) &&
-                initial_voltage_sample.node_voltage_conditions_only,
+                hasproperty(initial_voltage_sample, :stage_node_voltage_history) &&
+                initial_voltage_sample.stage_node_voltage_history,
         )
         initial_output_values = _steady_state_initial_output_values(context)
         _apply_steady_state_initial_sample!(
