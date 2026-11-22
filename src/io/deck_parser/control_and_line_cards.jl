@@ -2141,13 +2141,8 @@ function validate_fixed_source_load_flow_rows!(result::DeckParseResult)
     return result
 end
 
-function fixed_float_or_default!(result::DeckParseResult, image::AbstractString,
-                                 line_no::Int, first_col::Int, last_col::Int,
-                                 field::AbstractString, default::Real;
-                                 implied_decimal_places::Int = 0)
-    raw = fixed_field(image, first_col, last_col)
-    isempty(raw) && return Float64(default)
-    value = if implied_decimal_places == 0
+function _tryparse_fixed_float(raw::AbstractString, implied_decimal_places::Int)
+    return if implied_decimal_places == 0
         tryparse_deck_float(raw)
     else
         text = normalized_fortran_float_text(replace(raw, ' ' => ""))
@@ -2161,6 +2156,15 @@ function fixed_float_or_default!(result::DeckParseResult, image::AbstractString,
                 tryparse(Float64, string(mantissa, "E", exponent - implied_decimal_places))
         end
     end
+end
+
+function fixed_float_or_default!(result::DeckParseResult, image::AbstractString,
+                                 line_no::Int, first_col::Int, last_col::Int,
+                                 field::AbstractString, default::Real;
+                                 implied_decimal_places::Int = 0)
+    raw = fixed_field(image, first_col, last_col)
+    isempty(raw) && return Float64(default)
+    value = _tryparse_fixed_float(raw, implied_decimal_places)
     if value === nothing
         add_issue!(result.validation,
                    invalid_value("line $line_no",

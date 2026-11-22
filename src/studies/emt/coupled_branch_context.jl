@@ -1,10 +1,16 @@
+_coupled_phase_pi_series_name(section) = Symbol(section.name, "_series")
+_coupled_phase_pi_ground_name(section, side, phase) =
+    Symbol(section.name, "_", side, "_ground_", phase)
+_coupled_phase_pi_mutual_name(section, side, phase, other) =
+    Symbol(section.name, "_", side, "_mutual_", phase, "_", other)
+
 function _append_coupled_phase_pi_elements!(
     elements::Vector,
     element_names::Vector{Symbol},
     parsed::DeckParser.DeckParseResult,
     t_end_s::Float64,
 )
-    t_end_s > 0.0 || return nothing
+    t_end_s > 0.0 || _deck_has_branch_initial_history(parsed) || return nothing
     for section in DeckParser.deck_coupled_lumped_phase_pi_sections(parsed)
         push!(elements, CoupledSeriesRLBranch(
             section.from_node_indices,
@@ -12,7 +18,7 @@ function _append_coupled_phase_pi_elements!(
             section.phase_resistance_matrix,
             section.phase_inductance_matrix,
         ))
-        push!(element_names, Symbol(section.name, "_series"))
+        push!(element_names, _coupled_phase_pi_series_name(section))
 
         # Each terminal sees half the Maxwell capacitance matrix.
         # Mutual capacitors implement its negative off-diagonals, with
@@ -25,7 +31,7 @@ function _append_coupled_phase_pi_elements!(
                     throw(ArgumentError("$(section.name) has a negative phase-pi capacitance to ground"))
                 if ground[phase] > 0.0 && nodes[phase] != 0
                     push!(elements, CapacitorBranch(nodes[phase], 0, ground[phase]))
-                    push!(element_names, Symbol(section.name, "_", side, "_ground_", phase))
+                    push!(element_names, _coupled_phase_pi_ground_name(section, side, phase))
                 end
                 for other in firstindex(nodes):(phase - 1)
                     mutual = -shunt[phase, other]
@@ -33,7 +39,7 @@ function _append_coupled_phase_pi_elements!(
                         throw(ArgumentError("$(section.name) has a positive phase-pi off-diagonal capacitance"))
                     if mutual > 0.0 && nodes[phase] != nodes[other]
                         push!(elements, CapacitorBranch(nodes[phase], nodes[other], mutual))
-                        push!(element_names, Symbol(section.name, "_", side, "_mutual_", phase, "_", other))
+                        push!(element_names, _coupled_phase_pi_mutual_name(section, side, phase, other))
                     end
                 end
             end

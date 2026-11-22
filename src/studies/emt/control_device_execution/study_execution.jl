@@ -96,6 +96,7 @@ function _apply_deck_node_voltage_conditions(parsed::DeckParser.DeckParseResult,
         output_voltage_values = node_conditions.output_voltage_values,
         node_voltage_condition_count = node_conditions.node_voltage_condition_count,
         scalar_branch_initial_histories = node_conditions.scalar_branch_initial_histories,
+        phase_pi_initial_histories = node_conditions.phase_pi_initial_histories,
         stage_node_voltage_history = node_conditions.stage_node_voltage_history,
     ))
 end
@@ -138,6 +139,9 @@ function _deck_bpa_initial_sample(
             !isempty(parsed.coupled_phase_pi_section_rows))
             sample = _deck_node_voltage_initial_sample(parsed)
             return sample === nothing ? _deck_zero_initial_voltage_sample(parsed) : sample
+        end
+        if !isempty(parsed.coupled_phase_pi_section_rows) && _deck_has_branch_initial_history(parsed)
+            return _deck_node_voltage_initial_sample(parsed)
         end
         return nothing
     end

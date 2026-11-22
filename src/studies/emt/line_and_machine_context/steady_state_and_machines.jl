@@ -448,6 +448,8 @@ function _seed_steady_state_network_state!(
     has_phasors = hasproperty(sample, :node_voltage_phasors)
     branch_histories = hasproperty(sample, :scalar_branch_initial_histories) ?
         sample.scalar_branch_initial_histories : nothing
+    phase_pi_histories = hasproperty(sample, :phase_pi_initial_histories) ?
+        sample.phase_pi_initial_histories : nothing
     for (index, element) in enumerate(context.system.elements)
         if element isa Union{SeriesRLBranch,SeriesRLCBranch,CapacitorBranch}
             imposed_voltage =
@@ -525,19 +527,31 @@ function _seed_steady_state_network_state!(
         elseif element isa CoupledInductiveBranch && hasproperty(sample, :node_voltage_phasors)
             _seed_steady_state_coupled_inductive_branch!(element, sample)
             continue
-        elseif element isa CoupledSeriesRLBranch && hasproperty(sample, :node_voltage_phasors)
-            element_frequency_hz = _steady_state_branch_frequency_hz(
-                sample,
-                first(element.a),
-                first(element.b),
-                frequency_hz,
-            )
-            _seed_steady_state_coupled_series_rl_branch!(
-                element,
-                sample,
-                element_frequency_hz,
-            )
-            continue
+        elseif element isa CoupledSeriesRLBranch
+            history = phase_pi_histories !== nothing && index <= length(context.element_names) ?
+                get(phase_pi_histories, context.element_names[index], nothing) : nothing
+            if history !== nothing
+                for port in eachindex(element.previous_voltage)
+                    element.previous_voltage[port] =
+                        _deck_node_voltage(context.system.v, element.a[port]) -
+                        _deck_node_voltage(context.system.v, element.b[port])
+                end
+                conductance = _coupled_series_rl_conductance_matrix!(
+                    element.conductance_workspace, element, context.dt_s,
+                )
+                # Convert the OVER13 card-time Norton seed to the final
+                # tick-zero terminal drop before the first SUBTS2 update.
+                element.previous_current .= history.series_current_a .+
+                    conductance * (element.previous_voltage - history.card_terminal_voltage_v)
+                element.last_current .= element.previous_current
+                continue
+            elseif has_phasors
+                element_frequency_hz = _steady_state_branch_frequency_hz(
+                    sample, first(element.a), first(element.b), frequency_hz,
+                )
+                _seed_steady_state_coupled_series_rl_branch!(element, sample, element_frequency_hz)
+                continue
+            end
         end
         if !has_phasors
             if element isa CoupledInductiveBranch

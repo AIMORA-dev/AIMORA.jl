@@ -4,6 +4,7 @@ using Printf
 using TOML
 
 using ..Branches: BranchCompanionSnapshot,
+                  _coupled_series_rl_conductance_matrix!,
                   BreqivHistoryInjection,
                   GeneratorEquivalentModalBranch,
                   IdealTransformerVoltageConstraint,
