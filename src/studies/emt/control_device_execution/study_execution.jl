@@ -161,10 +161,10 @@ function _deck_uses_harmonic_transposed_line_startup(parsed::DeckParser.DeckPars
            ))
 end
 
-function _deck_uses_scalar_rl_ac_startup(parsed::DeckParser.DeckParseResult)
+function _deck_uses_scalar_series_ac_startup(parsed::DeckParser.DeckParseResult)
     return _deck_has_started_sinusoidal_voltage_sources(parsed) &&
-           any(element -> element isa SeriesRLBranch, parsed.elements) &&
-           all(element -> element isa Union{SeriesRLBranch,ConductanceBranch,TheveninSource},
+           any(element -> element isa Union{SeriesRLBranch,SeriesRLCBranch}, parsed.elements) &&
+           all(element -> element isa Union{SeriesRLBranch,SeriesRLCBranch,ConductanceBranch,TheveninSource},
                parsed.elements) &&
            !_deck_has_nonlinear_runtime_owners(parsed) &&
            all(isempty, (
@@ -211,7 +211,7 @@ function _deck_bpa_initial_sample(
             )
             return merge(sample, (stage_distributed_line_tick_zero = true,))
         end
-        if _deck_uses_scalar_rl_ac_startup(parsed) || _deck_uses_coupled_ac_history_startup(parsed) ||
+        if _deck_uses_scalar_series_ac_startup(parsed) || _deck_uses_coupled_ac_history_startup(parsed) ||
            (!isempty(parsed.coupled_phase_pi_section_rows) &&
             any(DeckParser._active_steady_state_frequency_source, parsed.over5a_source_rows))
             return _deck_fixed_source_initial_voltage_sample(
@@ -476,7 +476,7 @@ function _run_deck_emt(
         control_system_feedback_runtime ||
         (runtime_t_end_s > 0.0 && !isempty(parsed.coupled_phase_pi_section_rows)) ||
         (time_horizon == :deck && initial_voltage_source == :none &&
-         (_deck_uses_scalar_rl_ac_startup(parsed) || _deck_uses_coupled_ac_history_startup(parsed))) ||
+         (_deck_uses_scalar_series_ac_startup(parsed) || _deck_uses_coupled_ac_history_startup(parsed))) ||
         (time_horizon == :deck && initial_voltage_source == :none &&
          _deck_uses_type11_zero_state_initialization(parsed) &&
          !isempty(parsed.coupled_line_rows) && _deck_has_branch_initial_history(parsed))
