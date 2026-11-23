@@ -121,6 +121,26 @@ function _deck_uses_piecewise_dc_startup(parsed::DeckParser.DeckParseResult)
                parsed.piecewise_nonlinear_inductor_rows)
 end
 
+function _deck_uses_scalar_rl_ac_startup(parsed::DeckParser.DeckParseResult)
+    sources = parsed.over5a_source_rows
+    return !isempty(sources) &&
+           all(source -> source.iform == 14 && source.node_value > 0 &&
+               DeckParser._active_steady_state_frequency_source(source), sources) &&
+           any(element -> element isa SeriesRLBranch, parsed.elements) &&
+           all(element -> element isa Union{SeriesRLBranch,ConductanceBranch,TheveninSource},
+               parsed.elements) &&
+           !_deck_has_nonlinear_runtime_owners(parsed) &&
+           all(isempty, (
+               parsed.bergeron_line_rows, parsed.coupled_line_rows,
+               parsed.coupled_phase_pi_section_rows, parsed.sampled_frequency_line_rows,
+               parsed.semlyen_line_groups, parsed.rational_frequency_line_groups,
+               parsed.generator_equivalent_rows, parsed.universal_machine_definition_rows,
+               parsed.control_system_source_rows, parsed.control_system_function_rows,
+               parsed.control_system_expression_rows, parsed.control_system_device_rows,
+               parsed.over5_switch_rows,
+           ))
+end
+
 function _deck_bpa_initial_sample(
     parsed::DeckParser.DeckParseResult,
     time_horizon::Symbol,
@@ -148,8 +168,9 @@ function _deck_bpa_initial_sample(
     has_voltage_observations = any(source -> source.source_type == 90,
         parsed.control_system_source_rows)
     if !starts_in_ac && !has_voltage_observations
-        if !isempty(parsed.coupled_phase_pi_section_rows) &&
-           any(DeckParser._active_steady_state_frequency_source, parsed.over5a_source_rows)
+        if _deck_uses_scalar_rl_ac_startup(parsed) ||
+           (!isempty(parsed.coupled_phase_pi_section_rows) &&
+            any(DeckParser._active_steady_state_frequency_source, parsed.over5a_source_rows))
             return _deck_fixed_source_initial_voltage_sample(
                 parsed, time_horizon, initial_voltage_source, saturated_transformer_intake,
             )
@@ -411,6 +432,8 @@ function _run_deck_emt(
         switched_nonlinear_dynamic_runtime ||
         control_system_feedback_runtime ||
         (runtime_t_end_s > 0.0 && !isempty(parsed.coupled_phase_pi_section_rows)) ||
+        (time_horizon == :deck && initial_voltage_source == :none &&
+         _deck_uses_scalar_rl_ac_startup(parsed)) ||
         (time_horizon == :deck && initial_voltage_source == :none &&
          _deck_uses_type11_zero_state_initialization(parsed) &&
          !isempty(parsed.coupled_line_rows) && _deck_has_branch_initial_history(parsed))
