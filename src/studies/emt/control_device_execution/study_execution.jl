@@ -123,9 +123,11 @@ end
 
 function _deck_has_started_sinusoidal_voltage_sources(parsed::DeckParser.DeckParseResult)
     sources = parsed.over5a_source_rows
-    return !isempty(sources) &&
-           all(source -> source.iform == 14 && source.node_value > 0 &&
-               DeckParser._active_steady_state_frequency_source(source), sources)
+    return any(DeckParser._active_steady_state_frequency_source, sources) &&
+           all(source -> source.node_value > 0 &&
+               (source.iform == 11 ||
+                (source.iform == 14 && DeckParser._active_steady_state_frequency_source(source))),
+               sources)
 end
 
 function _deck_uses_coupled_ac_history_startup(parsed::DeckParser.DeckParseResult)
