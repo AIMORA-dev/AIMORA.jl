@@ -99,6 +99,7 @@ function _distributed_transposed_line_initial_history(
     history_storage_start_index::Integer,
     index::Integer;
     prescribed = nothing,
+    stage_tick_zero::Bool = false,
 )
     phase_count = modal_state.phase_count
     if prescribed === nothing
@@ -192,7 +193,7 @@ function _distributed_transposed_line_initial_history(
             modal_state.modal_signed_characteristic_impedances,
         history_storage_start_index = history_storage_start_index,
         modal_indices = modal_indices,
-        exact_incident_phase = prescribed !== nothing && frequency_hz > 0.0,
+        exact_incident_phase = stage_tick_zero && frequency_hz > 0.0,
         name = Symbol("distributed_transposed_line_initial_history_seed_", index),
     )
     history = distributed_transposed_line_history_state(
@@ -338,7 +339,9 @@ function _deck_distributed_transposed_line_config(
             end
             result = _distributed_transposed_line_initial_history(
                 state, pi_equivalents[index], steady_state_initial_sample,
-                options.dt_s, storage_index, index; prescribed,
+                options.dt_s, storage_index, index;
+                prescribed,
+                stage_tick_zero = has_prescribed_history,
             )
             history = result.history
             push!(initial_history_results, result)
