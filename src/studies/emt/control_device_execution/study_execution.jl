@@ -121,11 +121,22 @@ function _deck_uses_piecewise_dc_startup(parsed::DeckParser.DeckParseResult)
                parsed.piecewise_nonlinear_inductor_rows)
 end
 
-function _deck_uses_scalar_rl_ac_startup(parsed::DeckParser.DeckParseResult)
+function _deck_has_started_sinusoidal_voltage_sources(parsed::DeckParser.DeckParseResult)
     sources = parsed.over5a_source_rows
     return !isempty(sources) &&
            all(source -> source.iform == 14 && source.node_value > 0 &&
-               DeckParser._active_steady_state_frequency_source(source), sources) &&
+               DeckParser._active_steady_state_frequency_source(source), sources)
+end
+
+function _deck_uses_coupled_ac_history_startup(parsed::DeckParser.DeckParseResult)
+    return _deck_has_started_sinusoidal_voltage_sources(parsed) &&
+           isempty(parsed.control_system_source_rows) &&
+           (!isempty(parsed.coupled_phase_pi_section_rows) || !isempty(parsed.coupled_line_rows)) &&
+           _deck_has_branch_initial_history(parsed)
+end
+
+function _deck_uses_scalar_rl_ac_startup(parsed::DeckParser.DeckParseResult)
+    return _deck_has_started_sinusoidal_voltage_sources(parsed) &&
            any(element -> element isa SeriesRLBranch, parsed.elements) &&
            all(element -> element isa Union{SeriesRLBranch,ConductanceBranch,TheveninSource},
                parsed.elements) &&
@@ -168,7 +179,7 @@ function _deck_bpa_initial_sample(
     has_voltage_observations = any(source -> source.source_type == 90,
         parsed.control_system_source_rows)
     if !starts_in_ac && !has_voltage_observations
-        if _deck_uses_scalar_rl_ac_startup(parsed) ||
+        if _deck_uses_scalar_rl_ac_startup(parsed) || _deck_uses_coupled_ac_history_startup(parsed) ||
            (!isempty(parsed.coupled_phase_pi_section_rows) &&
             any(DeckParser._active_steady_state_frequency_source, parsed.over5a_source_rows))
             return _deck_fixed_source_initial_voltage_sample(
@@ -433,7 +444,7 @@ function _run_deck_emt(
         control_system_feedback_runtime ||
         (runtime_t_end_s > 0.0 && !isempty(parsed.coupled_phase_pi_section_rows)) ||
         (time_horizon == :deck && initial_voltage_source == :none &&
-         _deck_uses_scalar_rl_ac_startup(parsed)) ||
+         (_deck_uses_scalar_rl_ac_startup(parsed) || _deck_uses_coupled_ac_history_startup(parsed))) ||
         (time_horizon == :deck && initial_voltage_source == :none &&
          _deck_uses_type11_zero_state_initialization(parsed) &&
          !isempty(parsed.coupled_line_rows) && _deck_has_branch_initial_history(parsed))

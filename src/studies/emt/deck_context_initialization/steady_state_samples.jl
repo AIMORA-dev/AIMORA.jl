@@ -76,10 +76,14 @@ function _stamp_coupled_lumped_sequence_steady_state_admittance!(
     frequency_partition::DeckParser.DeckSteadyStateFrequencyPartition=
         DeckParser.deck_steady_state_frequency_partition(parsed);
     formulation::AbstractEMTHarmonicFormulation=PhysicalFrequencyFormulation(),
+    bpa_fixed_source_startup::Bool=false,
 )
     default_frequency_hz = _deck_steady_state_frequency_hz(parsed)
     input_frequency_hz = DeckParser.deck_fixed_time_horizon_options(parsed).x_frequency_hz
-    input_frequency_hz > 0.0 || (input_frequency_hz = default_frequency_hz)
+    input_angular_frequency = 2.0 * pi *
+        (input_frequency_hz > 0.0 ? input_frequency_hz : default_frequency_hz)
+    # The BPA deck uses mH when its reactance frequency is blank.
+    card_inductance_scale = DeckParser.fixed_card_branch_timestep_inductance(1.0, input_frequency_hz)
     for impedance in DeckParser.deck_coupled_lumped_sequence_impedances(parsed)
         frequency_hz = _steady_state_terminal_frequency_hz(
             frequency_partition,
@@ -90,11 +94,12 @@ function _stamp_coupled_lumped_sequence_steady_state_admittance!(
             formulation,
             2.0 * pi * frequency_hz,
         )
-        input_angular_frequency = 2.0 * pi * input_frequency_hz
+        reactance_scale = bpa_fixed_source_startup ?
+            reactive_frequency * card_inductance_scale :
+            reactive_frequency / input_angular_frequency
         phase_impedance = ComplexF64.(
             impedance.phase_resistance_matrix,
-            (reactive_frequency / input_angular_frequency) .*
-            impedance.phase_inductance_matrix,
+            reactance_scale .* impedance.phase_inductance_matrix,
         )
         _stamp_complex_phase_admittance!(
             matrix,
@@ -497,6 +502,7 @@ function _deck_steady_state_nodal_equations(
         parsed,
         frequency_partition,
         formulation=formulation,
+        bpa_fixed_source_startup=bpa_fixed_source_startup,
     )
     _stamp_generator_equivalent_steady_state_admittance!(
         admittance,
@@ -977,8 +983,9 @@ function _deck_coupled_branch_initial_history!(
     start_index::Int,
     values::Vector{Float64},
 )
-    all(source -> source.iform == 11, parsed.over5a_source_rows) || throw(ArgumentError(
-        "line $(row.line_no): explicit coupled branch history requires Type 11 startup",
+    (all(source -> source.iform == 11, parsed.over5a_source_rows) ||
+     _deck_uses_coupled_ac_history_startup(parsed)) || throw(ArgumentError(
+        "line $(row.line_no): explicit coupled branch history requires Type 11 or started Type 14 startup",
     ))
     phase_pi = row isa DeckParser.DeckCoupledPhasePiSectionRow
     sections = phase_pi ? DeckParser.deck_coupled_lumped_phase_pi_sections(parsed) :
@@ -1040,9 +1047,10 @@ function _deck_distributed_line_initial_history(
     start_index::Int,
     values::Vector{Float64},
 )
-    all(source -> source.iform == 11, parsed.over5a_source_rows) &&
+    (all(source -> source.iform == 11, parsed.over5a_source_rows) ||
+     _deck_uses_coupled_ac_history_startup(parsed)) &&
     isempty(parsed.control_system_source_rows) || throw(ArgumentError(
-        "line $(row.line_no): explicit distributed-line history requires Type 11 DC startup",
+        "line $(row.line_no): explicit distributed-line history requires Type 11 or started Type 14 startup",
     ))
     states = DeckParser.deck_distributed_transposed_line_modal_branch_states(parsed)
     selected = findfirst(state -> first(state.line_numbers) == row.line_no, states)
