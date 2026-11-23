@@ -138,6 +138,29 @@ function _deck_uses_coupled_ac_history_startup(parsed::DeckParser.DeckParseResul
            _deck_has_branch_initial_history(parsed)
 end
 
+function _deck_uses_harmonic_transposed_line_startup(parsed::DeckParser.DeckParseResult)
+    return _deck_has_started_sinusoidal_voltage_sources(parsed) &&
+           isempty(parsed.node_initial_condition_rows) &&
+           !isempty(parsed.coupled_line_rows) &&
+           all(row -> row.line_kind == :distributed_transmission_line &&
+               !row.sampled_frequency_data_requested, parsed.coupled_line_rows) &&
+           all(
+               element -> element isa Union{
+                   ConductanceBranch,TheveninSource,DeckParser.DistributedTransposedLineCompanionAdmittance,
+               },
+               parsed.elements,
+           ) &&
+           !_deck_has_nonlinear_runtime_owners(parsed) &&
+           all(isempty, (
+               parsed.bergeron_line_rows, parsed.coupled_phase_pi_section_rows,
+               parsed.sampled_frequency_line_rows, parsed.semlyen_line_groups,
+               parsed.rational_frequency_line_groups, parsed.generator_equivalent_rows,
+               parsed.universal_machine_definition_rows, parsed.control_system_source_rows,
+               parsed.control_system_function_rows, parsed.control_system_expression_rows,
+               parsed.control_system_device_rows, parsed.over5_switch_rows,
+           ))
+end
+
 function _deck_uses_scalar_rl_ac_startup(parsed::DeckParser.DeckParseResult)
     return _deck_has_started_sinusoidal_voltage_sources(parsed) &&
            any(element -> element isa SeriesRLBranch, parsed.elements) &&
@@ -182,6 +205,12 @@ function _deck_bpa_initial_sample(
     has_voltage_observations = any(source -> source.source_type == 90,
         parsed.control_system_source_rows)
     if !starts_in_ac && !has_voltage_observations
+        if _deck_uses_harmonic_transposed_line_startup(parsed)
+            sample = _deck_fixed_source_initial_voltage_sample(
+                parsed, time_horizon, initial_voltage_source, saturated_transformer_intake,
+            )
+            return merge(sample, (stage_distributed_line_tick_zero = true,))
+        end
         if _deck_uses_scalar_rl_ac_startup(parsed) || _deck_uses_coupled_ac_history_startup(parsed) ||
            (!isempty(parsed.coupled_phase_pi_section_rows) &&
             any(DeckParser._active_steady_state_frequency_source, parsed.over5a_source_rows))

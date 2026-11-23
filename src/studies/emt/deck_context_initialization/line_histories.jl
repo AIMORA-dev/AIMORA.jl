@@ -318,6 +318,8 @@ function _deck_distributed_transposed_line_config(
     isempty(modal_states) && return nothing
     initial_history_results = Any[]
     has_prescribed_history = prescribed_histories !== nothing && !isempty(prescribed_histories)
+    stage_tick_zero = has_prescribed_history ||
+        hasproperty(steady_state_initial_sample, :stage_distributed_line_tick_zero)
     if steady_state_initial_sample === nothing && !has_prescribed_history
         history_states = DeckParser.deck_distributed_transposed_line_history_states(parsed)
     else
@@ -341,7 +343,7 @@ function _deck_distributed_transposed_line_config(
                 state, pi_equivalents[index], steady_state_initial_sample,
                 options.dt_s, storage_index, index;
                 prescribed,
-                stage_tick_zero = has_prescribed_history,
+                stage_tick_zero,
             )
             history = result.history
             push!(initial_history_results, result)
@@ -349,7 +351,7 @@ function _deck_distributed_transposed_line_config(
             storage_index = history.next_history_storage_index
         end
         history_states = _shared_distributed_transposed_line_history_states(histories)
-        if has_prescribed_history
+        if stage_tick_zero
             _stage_distributed_line_tick_zero!(
                 modal_states, history_states, prescribed_initial_voltage_values,
             )
