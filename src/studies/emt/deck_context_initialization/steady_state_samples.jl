@@ -765,10 +765,11 @@ struct DeckCoupledBranchInitialHistory
 end
 
 struct DeckDistributedLineInitialHistory
-    from_voltage_v::Vector{Float64}
-    to_voltage_v::Vector{Float64}
-    from_current_a::Vector{Float64}
-    to_current_a::Vector{Float64}
+    from_voltage_v::Vector{ComplexF64}
+    to_voltage_v::Vector{ComplexF64}
+    from_current_a::Vector{ComplexF64}
+    to_current_a::Vector{ComplexF64}
+    frequency_hz::Float64
 end
 
 function _bpa_supported_branch_table_owners(
@@ -1046,9 +1047,11 @@ function _deck_distributed_line_initial_history(
     conditions,
     start_index::Int,
     values::Vector{Float64},
+    imaginary_values::Union{Nothing,Vector{Float64}},
+    history_frequency_hz::Union{Nothing,Float64},
 )
-    (all(source -> source.iform == 11, parsed.over5a_source_rows) ||
-     _deck_uses_coupled_ac_history_startup(parsed)) &&
+    ac_history = imaginary_values !== nothing && _deck_uses_coupled_ac_history_startup(parsed)
+    (all(source -> source.iform == 11, parsed.over5a_source_rows) || ac_history) &&
     isempty(parsed.control_system_source_rows) || throw(ArgumentError(
         "line $(row.line_no): explicit distributed-line history requires Type 11 or started Type 14 startup",
     ))
@@ -1061,33 +1064,47 @@ function _deck_distributed_line_initial_history(
     from_current, from_imaginary, to_current = _deck_coupled_history_cards(
         state, conditions, start_index,
     )
-    all(iszero, from_imaginary) || throw(ArgumentError(
-        "line $(row.line_no): explicit distributed-line history requires real DC terminal currents",
-    ))
-    for index in start_index:(start_index + state.phase_count - 1)
-        card = conditions[index]
-        field = DeckParser.fixed_field(DeckParser.fixed_image(card.raw_text), 60, 74)
-        isempty(field) || DeckParser._tryparse_fixed_float(field, 8) == 0.0 ||
-            throw(ArgumentError(
-                "line $(card.line_no): explicit distributed-line history requires real DC terminal currents",
-            ))
-    end
-    for condition in conditions
-        condition.condition_kind == :node_voltage_initial_condition || continue
-        frequency = DeckParser.fixed_field(DeckParser.fixed_image(condition.raw_text), 39, 53)
-        iszero(condition.imaginary_value) &&
-        (isempty(frequency) || DeckParser._tryparse_fixed_float(frequency, 8) == 0.0) ||
-            throw(ArgumentError(
+    to_imaginary = Float64[
+        _deck_initial_condition_field(conditions[index], 60, 74)
+        for index in start_index:(start_index + state.phase_count - 1)
+    ]
+    if !ac_history
+        all(iszero, from_imaginary) && all(iszero, to_imaginary) || throw(ArgumentError(
+            "line $(row.line_no): explicit distributed-line history requires real DC terminal currents",
+        ))
+        for condition in conditions
+            condition.condition_kind == :node_voltage_initial_condition || continue
+            iszero(condition.imaginary_value) &&
+            iszero(_deck_initial_condition_field(condition, 39, 53)) || throw(ArgumentError(
                 "line $(condition.line_no): explicit distributed-line history requires real DC terminal voltages",
             ))
+        end
     end
+    frequency = ac_history ? history_frequency_hz : 0.0
+    frequency === nothing && throw(ArgumentError(
+        "line $(row.line_no): explicit distributed-line history requires an unambiguous startup frequency",
+    ))
+    endpoint_voltage(node) = complex(
+        _deck_node_voltage(values, node),
+        ac_history ? _deck_node_voltage(imaginary_values, node) : 0.0,
+    )
     history = DeckDistributedLineInitialHistory(
-        [_deck_node_voltage(values, node) for node in state.from_node_indices],
-        [_deck_node_voltage(values, node) for node in state.to_node_indices],
-        from_current,
-        to_current,
+        endpoint_voltage.(state.from_node_indices),
+        endpoint_voltage.(state.to_node_indices),
+        complex.(from_current, from_imaginary),
+        complex.(to_current, to_imaginary),
+        frequency,
     )
     return history, state.phase_count
+end
+
+function _deck_initial_condition_field(row, first_column::Int, last_column::Int)
+    field = DeckParser.fixed_field(DeckParser.fixed_image(row.raw_text), first_column, last_column)
+    value = isempty(field) ? 0.0 : DeckParser._tryparse_fixed_float(field, 8)
+    value !== nothing && isfinite(value) || throw(ArgumentError(
+        "line $(row.line_no): columns $first_column to $last_column require a finite initial condition",
+    ))
+    return value
 end
 
 struct DeckPiecewiseInductorInitialHistory
@@ -1098,8 +1115,19 @@ end
 
 function _deck_node_voltage_initial_sample(
     parsed::DeckParser.DeckParseResult,
-    values::Vector{Float64} = zeros(Float64, length(parsed.node_map)),
+    values::Vector{Float64} = zeros(Float64, length(parsed.node_map));
+    phasor_sample = nothing,
 )
+    retain_distributed_phasors = phasor_sample !== nothing &&
+        any(row -> row.line_kind == :distributed_transmission_line, parsed.coupled_line_rows) &&
+        _deck_has_branch_initial_history(parsed) && _deck_uses_coupled_ac_history_startup(parsed)
+    imaginary_values = retain_distributed_phasors ? imag.(phasor_sample.node_voltage_phasors) : nothing
+    history_frequency_hz = nothing
+    if retain_distributed_phasors
+        frequencies = unique(filter(>(0.0), phasor_sample.node_steady_state_frequencies_hz))
+        history_frequency_hz = length(frequencies) == 1 ? only(frequencies) : nothing
+    end
+    reads_history_frequency = true
     histories = Dict{Symbol,DeckScalarBranchInitialHistory}()
     coupled_histories = Dict{Symbol,DeckCoupledBranchInitialHistory}()
     distributed_histories = Dict{Int,DeckDistributedLineInitialHistory}()
@@ -1127,8 +1155,22 @@ function _deck_node_voltage_initial_sample(
             end
             reference = coalesce(row.reference_node_index, 0)
             values[row.node_index] = _deck_node_voltage(values, reference) + row.real_value
+            if imaginary_values !== nothing
+                imaginary_values[row.node_index] = _deck_node_voltage(imaginary_values, reference) +
+                    row.imaginary_value
+                # OVER13 reads STEADY from the first Type 2 card after a
+                # branch history. Consecutive Type 2 cards only change E/F.
+                if reads_history_frequency
+                    history_frequency_hz = _deck_initial_condition_field(row, 39, 53)
+                    history_frequency_hz >= 0.0 || throw(ArgumentError(
+                        "line $(row.line_no): distributed-line startup frequency must be nonnegative",
+                    ))
+                    reads_history_frequency = false
+                end
+            end
             voltage_count += 1
         elseif row.condition_kind == :nonlinear_branch_initial_condition
+            reads_history_frequency = true
             from = row.node_index
             to = coalesce(row.reference_node_index, 0)
             owner = findfirst(parsed.piecewise_nonlinear_inductor_rows) do inductor
@@ -1144,11 +1186,14 @@ function _deck_node_voltage_initial_sample(
                 row.real_value, row.imaginary_value, card_voltage,
             )
         elseif row.condition_kind == :node_current_initial_condition
+            reads_history_frequency = true
             branch = _deck_initial_history_branch(parsed, row)
             if branch isa DeckParser.DeckCoupledLineRow &&
                branch.line_kind == :distributed_transmission_line
                 history, phase_count =
-                    _deck_distributed_line_initial_history(parsed, branch, conditions, index, values)
+                    _deck_distributed_line_initial_history(
+                        parsed, branch, conditions, index, values, imaginary_values, history_frequency_hz,
+                    )
                 distributed_histories[branch.line_no] = history
                 next_condition_index = index + phase_count
             elseif branch isa Union{DeckParser.DeckCoupledPhasePiSectionRow,DeckParser.DeckCoupledLineRow}

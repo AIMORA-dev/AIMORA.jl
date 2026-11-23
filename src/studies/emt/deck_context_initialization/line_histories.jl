@@ -114,12 +114,11 @@ function _distributed_transposed_line_initial_history(
             series_admittance * (to_voltage - from_voltage) + shunt_admittance * to_voltage
         frequency_hz = sample.steady_state_frequency_hz
     else
-        from_voltage = ComplexF64.(prescribed.from_voltage_v)
-        to_voltage = ComplexF64.(prescribed.to_voltage_v)
-        terminal_current_from = ComplexF64.(prescribed.from_current_a)
-        terminal_current_to = ComplexF64.(prescribed.to_current_a)
-        # OVER13 fills every prehistory slot from the same DC endpoint state.
-        frequency_hz = 0.0
+        from_voltage = prescribed.from_voltage_v
+        to_voltage = prescribed.to_voltage_v
+        terminal_current_from = prescribed.from_current_a
+        terminal_current_to = prescribed.to_current_a
+        frequency_hz = prescribed.frequency_hz
     end
     phase_matrix = distributed_transposed_line_initial_history_phase_matrix(
         modal_state;
@@ -193,6 +192,7 @@ function _distributed_transposed_line_initial_history(
             modal_state.modal_signed_characteristic_impedances,
         history_storage_start_index = history_storage_start_index,
         modal_indices = modal_indices,
+        exact_incident_phase = prescribed !== nothing && frequency_hz > 0.0,
         name = Symbol("distributed_transposed_line_initial_history_seed_", index),
     )
     history = distributed_transposed_line_history_state(
@@ -331,9 +331,9 @@ function _deck_distributed_transposed_line_config(
             prescribed = prescribed_histories === nothing ? nothing :
                 get(prescribed_histories, first(state.line_numbers), nothing)
             if prescribed === nothing && steady_state_initial_sample === nothing
-                zero_phases = zeros(state.phase_count)
+                zero_phases = zeros(ComplexF64, state.phase_count)
                 prescribed = DeckDistributedLineInitialHistory(
-                    zero_phases, zero_phases, zero_phases, zero_phases,
+                    zero_phases, zero_phases, zero_phases, zero_phases, 0.0,
                 )
             end
             result = _distributed_transposed_line_initial_history(

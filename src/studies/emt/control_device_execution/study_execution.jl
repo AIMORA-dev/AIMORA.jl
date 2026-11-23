@@ -89,6 +89,7 @@ end
 function _apply_deck_node_voltage_conditions(parsed::DeckParser.DeckParseResult, phasor_sample)
     node_conditions = _deck_node_voltage_initial_sample(
         parsed, copy(phasor_sample.node_voltage_values),
+        phasor_sample=phasor_sample,
     )
     node_conditions === nothing && return phasor_sample
     return merge(phasor_sample, (

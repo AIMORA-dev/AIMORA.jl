@@ -1680,6 +1680,7 @@ function distributed_transposed_line_initial_history_seed(;
     history_storage_start_index::Integer = 1,
     history_start_indices::Union{Nothing,AbstractVector{<:Integer}} = nothing,
     modal_indices::AbstractVector{<:Integer} = collect(1:length(modal_delay_counts)),
+    exact_incident_phase::Bool = false,
     name::Symbol = :distributed_transposed_line_initial_history_seed,
 )
     mode_count = length(modal_delay_counts)
@@ -1790,12 +1791,18 @@ function distributed_transposed_line_initial_history_seed(;
         1 <= first_read_offset && second_read_offset <= length(from_history) ||
             throw(ArgumentError("initial distributed-line history seed requires two sinusoidal read samples"))
         factor = interpolation_factors[mode_index]
-        from_terminal =
-            from_history[first_read_offset] * factor +
-            from_history[second_read_offset] * (1.0 - factor)
-        to_terminal =
-            to_history[first_read_offset] * factor +
-            to_history[second_read_offset] * (1.0 - factor)
+        from_terminal, to_terminal = if exact_incident_phase
+            # OVER13 samples the initial incident waves at their physical
+            # propagation delay. SUBTS2 interpolates subsequent stored waves.
+            angle = -(delay_count + factor) * angular_step
+            (from_amplitudes[mode_index] * cos(angle + from_phases[mode_index]),
+             to_amplitudes[mode_index] * cos(angle + to_phases[mode_index]))
+        else
+            (from_history[first_read_offset] * factor +
+             from_history[second_read_offset] * (1.0 - factor),
+             to_history[first_read_offset] * factor +
+             to_history[second_read_offset] * (1.0 - factor))
+        end
         if characteristic_values[mode_index] >= 0.0
             total_incident = from_terminal + to_terminal
             reflected_difference = (from_terminal - to_terminal) * damping
