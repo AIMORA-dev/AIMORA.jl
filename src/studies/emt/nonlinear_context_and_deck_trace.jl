@@ -1867,9 +1867,15 @@ function _prepare_dynamic_deck_runtime(
                 network_initial_sample,
             )
     end
+    piecewise_dc_startup = hasproperty(steady_state_initial_sample, :piecewise_inductor_dc_startup)
+    if piecewise_dc_startup
+        deck_nonlinear_current_config = _piecewise_inductor_dc_initial_state(
+            deck_nonlinear_current_config, steady_state_initial_sample,
+        )
+    end
     if deck_nonlinear_current_config !== nothing &&
        saturated_transformer_current_config === nothing &&
-       _deck_uses_dynamic_nonlinear_runtime(parsed)
+       (_deck_uses_dynamic_nonlinear_runtime(parsed) || piecewise_dc_startup)
         deck_nonlinear_current_config = merge(
             deck_nonlinear_current_config,
             (dense_primary_nonlinear_compensation = true,),

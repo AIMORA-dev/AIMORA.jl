@@ -252,6 +252,58 @@ function deck_piecewise_nonlinear_inductor_current_config(
     )
 end
 
+function _piecewise_inductor_dc_initial_state(config, sample)
+    histories = get(sample, :piecewise_inductor_initial_histories, nothing)
+    delta2 = config.delta2
+    currents = copy(config.initial_current_segment_values)
+    fluxes = copy(config.initial_stored_voltage_values)
+    predictors = copy(config.initial_runtime_voltage_values)
+    characteristic = copy(config.initial_characteristic_current_values)
+    segments = copy(config.initial_table_index_values)
+    voltage = _deck_nonlinear_voltage_context(config, sample.node_voltage_values)
+    for index in eachindex(config.nonlinear_types)
+        config.nonlinear_types[index] == PIECEWISE_NONLINEAR_INDUCTOR_TYPE || continue
+        from = config.nonlinear_from_nodes[index]
+        to = abs(config.nonlinear_to_nodes[index])
+        branch_voltage = voltage[from] - voltage[to]
+        line = config.nonlinear_owner_line_numbers[index]
+        history = histories === nothing ? nothing : get(histories, line, nothing)
+        if history === nothing
+            predictors[index] = fluxes[index] + delta2 * branch_voltage
+            continue
+        end
+        first_point = config.nonlinear_admittance_nodes[index]
+        last_point = config.nonlinear_table_end_indices[index]
+        table = @view config.cchar[first_point:last_point]
+        current = history.current_a
+        first(table) <= current < last(table) || throw(ArgumentError(
+            "line $line: Type 4 current is outside the Type 93 startup characteristic",
+        ))
+        segment = first_point + searchsortedlast(table, current) - 1
+        fraction = (current - config.cchar[segment]) /
+            (config.cchar[segment + 1] - config.cchar[segment])
+        flux = iszero(history.flux_override_wb) ?
+            config.vchar[segment] + fraction * (config.vchar[segment + 1] - config.vchar[segment]) :
+            history.flux_override_wb
+        isfinite(flux) || throw(ArgumentError("line $line: Type 4 flux must be finite"))
+        currents[index] = current
+        segments[index] = segment
+        fluxes[index] = flux
+        characteristic[index] = flux
+        # OVER13 writes the lagged flux with the voltage seen by the card.
+        # OVER16 advances that lagged flux using the final tick-zero voltage.
+        predictors[index] = flux + delta2 * (2 * branch_voltage - history.card_voltage_v)
+    end
+    return merge(config, (
+        piecewise_inductor_dc_startup = true,
+        initial_current_segment_values = currents,
+        initial_stored_voltage_values = fluxes,
+        initial_runtime_voltage_values = predictors,
+        initial_characteristic_current_values = characteristic,
+        initial_table_index_values = segments,
+    ))
+end
+
 function _piecewise_nonlinear_inductor_report(run, config::NamedTuple)
     types = Int.(config.nonlinear_types)
     indices = findall(
@@ -269,11 +321,23 @@ function _piecewise_nonlinear_inductor_report(run, config::NamedTuple)
     to_nodes = abs.(Int.(config.nonlinear_to_nodes))
     node_mapping = Int.(config.deck_to_runtime_node_indices)
     times = Float64[]
-    currents = zeros(Float64, length(indices), length(run.over16_updates))
+    initial_columns = hasproperty(config, :piecewise_inductor_dc_startup) ? 1 : 0
+    currents = zeros(Float64, length(indices), length(run.over16_updates) + initial_columns)
     fluxes = similar(currents)
     voltages = similar(currents)
     segments = zeros(Int, size(currents))
-    for (step, update) in enumerate(run.over16_updates)
+    if initial_columns == 1
+        push!(times, 0.0)
+        voltage = _deck_nonlinear_voltage_context(config, run.steady_state_initial_voltage_values)
+        for (position, index) in enumerate(indices)
+            currents[position, 1] = config.initial_current_segment_values[index]
+            fluxes[position, 1] = config.initial_stored_voltage_values[index]
+            voltages[position, 1] = voltage[from_nodes[index]] - voltage[to_nodes[index]]
+            segments[position, 1] = config.initial_table_index_values[index]
+        end
+    end
+    for (update_index, update) in enumerate(run.over16_updates)
+        step = update_index + initial_columns
         push!(times, Float64(update.t_s))
         result = update.over16_update.nonlinear_current_result
         result === nothing && throw(ArgumentError(

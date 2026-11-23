@@ -1720,6 +1720,10 @@ function _dense_primary_nonlinear_steady_state_seed(
             continue
         branch_voltage = voltage_context[from_nodes[index]] - voltage_context[to_nodes[index]]
         if types[index] == PIECEWISE_NONLINEAR_INDUCTOR_TYPE
+            if hasproperty(nonlinear_current_config, :piecewise_inductor_dc_startup)
+                runtime_flux[index] = nonlinear_current_config.initial_runtime_voltage_values[index]
+                continue
+            end
             for response_index in eachindex(types)
                 types[response_index] == PIECEWISE_NONLINEAR_INDUCTOR_TYPE || continue
                 offset = (response_index - 1) * response_node_count

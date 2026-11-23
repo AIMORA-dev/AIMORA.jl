@@ -1082,6 +1082,12 @@ function _deck_distributed_line_initial_history(
     return history, state.phase_count
 end
 
+struct DeckPiecewiseInductorInitialHistory
+    current_a::Float64
+    flux_override_wb::Float64
+    card_voltage_v::Float64
+end
+
 function _deck_node_voltage_initial_sample(
     parsed::DeckParser.DeckParseResult,
     values::Vector{Float64} = zeros(Float64, length(parsed.node_map)),
@@ -1089,6 +1095,7 @@ function _deck_node_voltage_initial_sample(
     histories = Dict{Symbol,DeckScalarBranchInitialHistory}()
     coupled_histories = Dict{Symbol,DeckCoupledBranchInitialHistory}()
     distributed_histories = Dict{Int,DeckDistributedLineInitialHistory}()
+    inductor_histories = Dict{Int,DeckPiecewiseInductorInitialHistory}()
     conditions = DeckParser.deck_node_initial_condition_rows(parsed)
     next_condition_index = 1
     voltage_count = 0
@@ -1113,6 +1120,21 @@ function _deck_node_voltage_initial_sample(
             reference = coalesce(row.reference_node_index, 0)
             values[row.node_index] = _deck_node_voltage(values, reference) + row.real_value
             voltage_count += 1
+        elseif row.condition_kind == :nonlinear_branch_initial_condition
+            from = row.node_index
+            to = coalesce(row.reference_node_index, 0)
+            owner = findfirst(parsed.piecewise_nonlinear_inductor_rows) do inductor
+                inductor.nonlinear_type == PIECEWISE_NONLINEAR_INDUCTOR_TYPE &&
+                    inductor.from_node_index == from && abs(inductor.to_node_index) == to
+            end
+            owner === nothing && throw(ArgumentError(
+                "line $(row.line_no): Type 4 does not name a Type 93 branch in terminal order",
+            ))
+            line = parsed.piecewise_nonlinear_inductor_rows[owner].line_no
+            card_voltage = _deck_node_voltage(values, from) - _deck_node_voltage(values, to)
+            inductor_histories[line] = DeckPiecewiseInductorInitialHistory(
+                row.real_value, row.imaginary_value, card_voltage,
+            )
         elseif row.condition_kind == :node_current_initial_condition
             branch = _deck_initial_history_branch(parsed, row)
             if branch isa DeckParser.DeckCoupledLineRow &&
@@ -1140,7 +1162,7 @@ function _deck_node_voltage_initial_sample(
         end
     end
     voltage_count == 0 && isempty(histories) && isempty(coupled_histories) &&
-        isempty(distributed_histories) && return nothing
+        isempty(distributed_histories) && isempty(inductor_histories) && return nothing
     sample = _deck_transient_initial_voltage_sample(
         parsed, values, :deck_node_voltage_initial_conditions; condition_count = voltage_count,
     )
@@ -1148,6 +1170,7 @@ function _deck_node_voltage_initial_sample(
         scalar_branch_initial_histories = histories,
         coupled_branch_initial_histories = coupled_histories,
         distributed_line_initial_histories = distributed_histories,
+        piecewise_inductor_initial_histories = inductor_histories,
         stage_node_voltage_history = voltage_count > 0 && scalar_conditions,
     ))
 end

@@ -1606,7 +1606,7 @@ end
 function node_initial_condition_row(line::AbstractString)::Bool
     image = fixed_image(line)
     code = fixed_int_value(image, 1, 2)
-    code in (2, 3) || return false
+    code in (2, 3, 4) || return false
     return !isempty(fixed_field(image, 3, 8))
 end
 
@@ -1618,7 +1618,8 @@ function parse_node_initial_condition_row!(result::DeckParseResult,
     node = fixed_field(image, 3, 8)
     # BPA OVER13 reads Type 2 as I2,A6,3E15.8. Its first numeric
     # field starts immediately after the node name. Type 3 reads
-    # I2,2A6,4E15.8,I6. Both numeric layouts use eight implied decimals.
+    # I2,2A6,4E15.8,I6. Type 4 uses the first two numeric slots for
+    # current and flux. All three card types use eight implied decimals.
     reference_node = code == 2 ? "" : fixed_field(image, 9, 14)
     first_value_column = code == 2 ? 9 : 15
     real_value = fixed_float_or_default!(
@@ -1657,6 +1658,9 @@ function parse_node_initial_condition_row!(result::DeckParseResult,
     elseif code == 3
         record_card!(result, :node_current_initial_condition)
         condition_kind = :node_current_initial_condition
+    elseif code == 4
+        record_card!(result, :nonlinear_branch_initial_condition)
+        condition_kind = :nonlinear_branch_initial_condition
     end
     node_index = isempty(node) ? 0 : node_id!(result, node)
     reference_node_symbol = isempty(reference_node) ? missing : Symbol(reference_node)

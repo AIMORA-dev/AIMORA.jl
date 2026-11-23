@@ -98,6 +98,7 @@ function _apply_deck_node_voltage_conditions(parsed::DeckParser.DeckParseResult,
         scalar_branch_initial_histories = node_conditions.scalar_branch_initial_histories,
         coupled_branch_initial_histories = node_conditions.coupled_branch_initial_histories,
         distributed_line_initial_histories = node_conditions.distributed_line_initial_histories,
+        piecewise_inductor_initial_histories = node_conditions.piecewise_inductor_initial_histories,
         stage_node_voltage_history = node_conditions.stage_node_voltage_history,
     ))
 end
@@ -111,6 +112,15 @@ function _deck_has_branch_initial_history(parsed::DeckParser.DeckParseResult)
         parsed.node_initial_condition_rows)
 end
 
+function _deck_uses_piecewise_dc_startup(parsed::DeckParser.DeckParseResult)
+    return _deck_uses_type11_zero_state_initialization(parsed) &&
+           isempty(parsed.control_system_source_rows) &&
+           !_deck_has_other_nonlinear_runtime_owners(parsed) &&
+           !isempty(parsed.piecewise_nonlinear_inductor_rows) &&
+           all(row -> row.nonlinear_type == PIECEWISE_NONLINEAR_INDUCTOR_TYPE,
+               parsed.piecewise_nonlinear_inductor_rows)
+end
+
 function _deck_bpa_initial_sample(
     parsed::DeckParser.DeckParseResult,
     time_horizon::Symbol,
@@ -118,6 +128,15 @@ function _deck_bpa_initial_sample(
     saturated_transformer_intake = nothing,
 )
     time_horizon == :deck && initial_voltage_source == :none || return nothing
+    if _deck_uses_piecewise_dc_startup(parsed)
+        sample = _deck_node_voltage_initial_sample(parsed)
+        sample === nothing && (sample = _deck_zero_initial_voltage_sample(parsed))
+        return merge(sample, (piecewise_inductor_dc_startup = true,))
+    end
+    any(row -> row.condition_kind == :nonlinear_branch_initial_condition,
+        parsed.node_initial_condition_rows) && throw(ArgumentError(
+            "Type 4 nonlinear initial conditions require a Type 93 nonlinear network with Type 11 DC startup",
+        ))
     # With the deck selecting startup, started TACS AC rows require the
     # harmonic solution even on the impedance-source network route.
     starts_in_ac = any(parsed.control_system_source_rows) do source
@@ -157,11 +176,15 @@ end
 function _deck_has_nonlinear_runtime_owners(
     parsed::DeckParser.DeckParseResult,
 )
+    return !isempty(DeckParser.deck_piecewise_nonlinear_inductor_rows(parsed)) ||
+           _deck_has_other_nonlinear_runtime_owners(parsed)
+end
+
+function _deck_has_other_nonlinear_runtime_owners(parsed::DeckParser.DeckParseResult)
     return !isempty(DeckParser.deck_zinc_oxide_nonlinear_rows(parsed)) ||
            !isempty(DeckParser.deck_nonlinear_resistance_rows(parsed)) ||
            !isempty(DeckParser.deck_triggered_timed_resistance_rows(parsed)) ||
            !isempty(DeckParser.deck_switching_nonlinear_resistor_rows(parsed)) ||
-           !isempty(DeckParser.deck_piecewise_nonlinear_inductor_rows(parsed)) ||
            !isempty(DeckParser.deck_hysteretic_inductor_rows(parsed)) ||
            !isempty(DeckParser.deck_arrester_nonlinear_rows(parsed))
 end
@@ -371,7 +394,9 @@ function _run_deck_emt(
         end
     fixed_voltage_source_runtime = _deck_uses_fixed_voltage_source_runtime(parsed)
     switched_nonlinear_dynamic_runtime =
-        _deck_uses_dynamic_nonlinear_runtime(parsed)
+        _deck_uses_dynamic_nonlinear_runtime(parsed) ||
+        (time_horizon == :deck && initial_voltage_source == :none &&
+         _deck_uses_piecewise_dc_startup(parsed))
     control_system_feedback_runtime =
         _deck_uses_control_system_feedback_runtime(parsed)
     if (
@@ -743,7 +768,8 @@ function prepare_emt_study(
             _deck_uses_current_zero_switching(parsed),
         recorded_step_indices = runtime_recorded_step_indices,
         series_rlc_alterations = series_rlc_alterations,
-        store_step_updates = _deck_uses_dynamic_nonlinear_runtime(parsed),
+        store_step_updates = _deck_uses_dynamic_nonlinear_runtime(parsed) ||
+            hasproperty(initial_voltage_sample, :piecewise_inductor_dc_startup),
         source_signal_provider = source_signal_provider,
         over16_step_configs = external_current_injection_provider,
     )
@@ -1373,7 +1399,8 @@ function evaluate_emt_study!(workspace::EMTStudyWorkspace)
     boundary_run = _run_prepared_dynamic_deck!(workspace.runtime)
     requested_trace =
         _deck_requested_electrical_trace(workspace.parsed, boundary_run.trace)
-    if _deck_uses_dynamic_nonlinear_runtime(workspace.parsed)
+    if _deck_uses_dynamic_nonlinear_runtime(workspace.parsed) ||
+       hasproperty(workspace.runtime.steady_state_initial_sample, :piecewise_inductor_dc_startup)
         requested_trace = _append_deck_nonlinear_outputs(
             requested_trace,
             boundary_run,
