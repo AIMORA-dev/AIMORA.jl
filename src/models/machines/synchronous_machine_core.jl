@@ -791,8 +791,8 @@ function InductionMachineState(
     mechanical_angle_rad::Real,
 )
     coil_count = length(current_values)
-    coil_count in (4, 5, 6) ||
-        throw(ArgumentError("coupled d/q machine state requires four, five, or six currents"))
+    coil_count >= 4 ||
+        throw(ArgumentError("coupled d/q machine state requires at least four currents"))
     currents = _machine_real_vector("current_values", current_values, coil_count)
     histories = _machine_real_vector("history_currents", history_currents, coil_count)
     return InductionMachineState(
@@ -2418,5 +2418,19 @@ function _universal_machine_active_coil_solution(
     elseif count == 3
         return _universal_machine_three_phase_solution(matrix, right_hand_side)
     end
-    throw(ArgumentError("stator/excitation current solve supports one to three active coils"))
+    coupled_currents = _universal_machine_three_phase_solution(matrix[1:3, 1:3], right_hand_side[1:3])
+
+    # SOLVUM factors the leading three equations together and uses a scalar
+    # Thevenin impedance for each remaining excitation coil.
+    for index in 4:count
+        for other in 1:count
+            if index != other && (!iszero(matrix[index, other]) || !iszero(matrix[other, index]))
+                throw(ArgumentError("additional excitation coils require independent Thevenin impedances"))
+            end
+        end
+        pivot = matrix[index, index]
+        iszero(pivot) && throw(ArgumentError("additional excitation coil has a zero pivot"))
+        push!(coupled_currents, right_hand_side[index] / pivot)
+    end
+    return coupled_currents
 end

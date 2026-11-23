@@ -2114,7 +2114,7 @@ function _synchronous_field_current_for_d_axis_flux(
         "synchronous field initialization inputs must be finite",
     ))
     function flux_residual(field_current::Float64)
-        currents = vcat(power_currents, field_current, 0.0)
+        currents = vcat(power_currents, field_current, zeros(length(parameters.coil_conductances) - 4))
         d_axis_flux, _ = induction_machine_axis_fluxes(parameters, currents)
         return d_axis_flux - target_d_axis_flux
     end
@@ -2251,8 +2251,8 @@ function deck_coupled_dq_machine_initial_state(
                 d_axis_flux,
                 unsaturated_field_current,
             )
-            currents = vcat(power_currents, field_current, 0.0)
-            histories = vcat(power_currents, -field_current, -0.0)
+            currents = vcat(power_currents, field_current, zeros(coil_count - 4))
+            histories = vcat(power_currents, -field_current, zeros(coil_count - 4))
             state = InductionMachineState(
                 currents,
                 histories;
@@ -2326,9 +2326,8 @@ function deck_coupled_dq_machine_initial_state(
             target_d_axis_flux,
             unsaturated_field_current,
         )
-        q_axis_current = 0.0
-        currents = vcat(power_currents, field_current, q_axis_current)
-        histories = vcat(power_currents, -field_current, -q_axis_current)
+        currents = vcat(power_currents, field_current, zeros(coil_count - 4))
+        histories = vcat(power_currents, -field_current, zeros(coil_count - 4))
         state = InductionMachineState(
             currents,
             histories;

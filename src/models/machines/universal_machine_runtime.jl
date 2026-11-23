@@ -12,8 +12,8 @@ function universal_machine_stator_excitation_current_solution_preview(;
     three_phase_induction_terminal_coil::Bool = false,
 )
     coil_count = length(coil_conductances)
-    1 <= coil_count <= 3 ||
-        throw(ArgumentError("stator/excitation current solve requires one to three active coils"))
+    coil_count >= 1 ||
+        throw(ArgumentError("stator/excitation current solve requires at least one active coil"))
     conductances = _machine_real_vector("coil_conductances", coil_conductances, coil_count)
     predictor_factors = _machine_real_vector("coil_predictor_factors", coil_predictor_factors, coil_count)
     input_voltages = _machine_real_vector("coil_input_voltages", coil_input_voltages, coil_count)
@@ -306,8 +306,8 @@ function universal_machine_history_current_update_preview(;
     direct_machine_stator_history_coupling_enabled::Bool = true,
 )
     coil_count = length(current_values)
-    4 <= coil_count <= 6 ||
-        throw(ArgumentError("history-current update requires three rotor coils plus one to three stator/excitation coils"))
+    coil_count >= 4 ||
+        throw(ArgumentError("history-current update requires three rotor coils plus at least one stator/excitation coil"))
     stator_count = coil_count - 3
     currents = _machine_real_vector("current_values", current_values, coil_count)
     voltages = _machine_real_vector("input_voltages", input_voltages, coil_count)
@@ -908,7 +908,7 @@ function _universal_machine_current_solution_from_flux(;
         d_axis_flux = d_axis_flux,
         q_axis_flux = q_axis_flux,
         half_step_interval_s = half_step_interval_s,
-        three_phase_induction_terminal_coil = stator_count == 3,
+        three_phase_induction_terminal_coil = stator_count == 3 && last(axis_kinds) == :uncoupled,
     )
     currents = vcat(rotor.current_values, stator.current_values)
     if direct_machine_voltage_coupling_fraction != 0.0 ||
@@ -1173,8 +1173,8 @@ function universal_machine_flux_current_jacobian_preview(;
     direct_machine_transfer_current_enabled::Bool = true,
 )
     coil_count = length(coil_conductances)
-    4 <= coil_count <= 6 ||
-        throw(ArgumentError("flux/current Jacobian requires three rotor coils plus one to three stator coils"))
+    coil_count >= 4 ||
+        throw(ArgumentError("flux/current Jacobian requires three rotor coils plus at least one stator coil"))
     stator_count = coil_count - 3
     conductances = _machine_real_vector("coil_conductances", coil_conductances, coil_count)
     predictor_factors = _machine_real_vector("coil_predictor_factors", coil_predictor_factors, coil_count)

@@ -112,6 +112,15 @@ function run_deck_universal_machine_horizon(
     predicted_current_coupling =
         machine_section.terminal_coupling == :predicted_current
     card1 = _deck_universal_machine_definition(parsed, machine_index, 1)
+    if card1.machine_type in (1, 2) && _deck_coupled_dq_coil_count(card1) > 5
+        has_fixed_source = !isempty(DeckParser.deck_fixed_source_constraint_rows(parsed))
+        has_connected_damper = any(DeckParser.deck_universal_machine_terminal_rows(parsed)) do row
+            row.machine_index == machine_index && row.terminal_index > 4 &&
+                row.terminal_node_value != 0
+        end
+        card1.machine_type == 1 && has_fixed_source && !has_connected_damper ||
+            throw(ArgumentError("additional wound-field coils require a type-1 FIX SOURCE deck with shorted damper coils"))
+    end
     automatic_direct_machine_initialization =
         card1.machine_type in (8, 9, 10, 11, 12) &&
         _deck_universal_machine_initialization_mode(parsed) == :automatic ?
@@ -828,8 +837,10 @@ end
 
 function _universal_machine_output_headers(horizon::DeckUniversalMachineHorizon)
     excitation_count = size(horizon.output_values, 1) - 6
-    excitation_headers = horizon.machine_type in (1, 2) ?
+    excitation_headers = horizon.machine_type in (1, 2) && excitation_count == 2 ?
         ["field_current_A", "q_axis_damper_current_A"] :
+        horizon.machine_type in (1, 2) ?
+        vcat(["field_current_A"], ["damper_current_$(index)_A" for index in 1:(excitation_count - 1)]) :
         horizon.machine_type == 6 ? ["field_current_A"] :
         horizon.machine_type == 7 ?
         ["d_axis_rotor_current_A", "q_axis_rotor_current_A"] :
