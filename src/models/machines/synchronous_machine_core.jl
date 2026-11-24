@@ -116,6 +116,19 @@ Base.@kwdef mutable struct SynchronousMachineExciterPortState
     sensor_closed::Bool = true
     update_count::Int = 0
     voltage_update_count::Int = 0
+    held_mechanical_torque_mnm::Union{Nothing,Float64} = nothing
+end
+
+function SynchronousMachineExciterPortState(
+    field_winding_current_a, current_reduction_factor, terminal_current_a,
+    voltage_input_pu, previous_voltage_input_pu, sensor_closed,
+    update_count, voltage_update_count,
+)
+    return SynchronousMachineExciterPortState(
+        field_winding_current_a, current_reduction_factor, terminal_current_a,
+        voltage_input_pu, previous_voltage_input_pu, sensor_closed,
+        update_count, voltage_update_count, nothing,
+    )
 end
 
 struct UniversalMachineQAxisCurve

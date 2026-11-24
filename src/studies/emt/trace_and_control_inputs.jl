@@ -1508,6 +1508,7 @@ function run_deck_synchronous_machine_horizon(
             electrical_angle_increment = electrical_angle_increment,
             field_voltage_multiplier = field_voltage_multiplier,
             external_field_voltage_input_pu = external_field_voltage_input_pu,
+            hold_external_exciter_torque = universal_shaft_sources,
             mechanical_torque_multipliers =
                 mass_torque_control_active ? torque_multipliers : nothing,
             applied_torque_source_factor = universal_shaft_sources ?
@@ -2047,6 +2048,7 @@ function run_deck_synchronous_machine_fleet_horizon(
                 field_voltage_multiplier = field_multiplier,
                 external_field_voltage_input_pu =
                     external_field_voltage_input_pu,
+                hold_external_exciter_torque = universal_shaft_sources[machine_index],
                 mechanical_torque_multipliers =
                     mass_torque_control_active ?
                     step_torque_multipliers[machine_index] : nothing,

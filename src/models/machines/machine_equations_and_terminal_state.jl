@@ -504,6 +504,7 @@ function synchronous_machine_equation_step_preview(
     mechanical_torque_multipliers::Union{Nothing,AbstractVector{<:Real}}=nothing,
     total_applied_torque::Union{Nothing,Real}=nothing,
     applied_torque_source_factor::Union{Nothing,Real}=nothing,
+    held_exciter_torque_mnm::Union{Nothing,Float64}=nothing,
     applied_torque_distribution::Union{Nothing,AbstractVector{<:Real}}=nothing,
     universal_q_axis_curve::Union{Nothing,UniversalMachineQAxisCurve}=nothing,
     tenm6::Real = 1.0e-6,
@@ -638,7 +639,8 @@ function synchronous_machine_equation_step_preview(
         end
         histq[indices.ksg] -= cd
         if nloce != 0
-            cexc = (q3 * c1) / cexc
+            cexc = held_exciter_torque_mnm === nothing ?
+                (q3 * c1) / cexc : held_exciter_torque_mnm
             histq[indices.ksex] -= cexc
         end
 
@@ -1086,6 +1088,12 @@ function synchronous_machine_companion_update!(
     )
 end
 
+function _exciter_resisting_torque_mnm(voltage, current, speed)
+    isfinite(speed) && !iszero(speed) || throw(DomainError(speed,
+        "finite exciter torque requires nonzero mechanical speed"))
+    return 1.0e-6 * voltage * current / speed
+end
+
 function synchronous_machine_dynamic_step!(
     state::SynchronousMachineDynamicState;
     phase_voltages::AbstractVector{<:Real},
@@ -1102,6 +1110,8 @@ function synchronous_machine_dynamic_step!(
     external_field_voltage_input_pu::Union{Nothing,Real}=nothing,
     mechanical_torque_multipliers::Union{Nothing,AbstractVector{<:Real}}=nothing,
     total_applied_torque::Union{Nothing,Real}=nothing,
+    nloce::Int=0,
+    hold_external_exciter_torque::Bool=false,
     kwargs...,
 )
     field_voltage_multiplier !== nothing &&
@@ -1112,8 +1122,17 @@ function synchronous_machine_dynamic_step!(
     external_field_voltage_input_pu === nothing ||
         isfinite(Float64(external_field_voltage_input_pu)) ||
         throw(ArgumentError("external_field_voltage_input_pu must be finite"))
+    port = state.exciter_port_state
+    use_exciter_hold = hold_external_exciter_torque && nloce > 0 &&
+        external_field_voltage_input_pu !== nothing
+    held_torque = port.held_mechanical_torque_mnm
+    initializing_exciter = use_exciter_hold && held_torque === nothing
+    field_voltage_v = initializing_exciter ?
+        -state.equation_state.cu_values[11] : external_field_voltage_input_pu
     equation_result = synchronous_machine_equation_step!(
         state.equation_state;
+        nloce,
+        held_exciter_torque_mnm = use_exciter_hold ? held_torque : nothing,
         phase_voltages = phase_voltages,
         current_history = state.current_history,
         electrical_coefficients = state.electrical_coefficients,
@@ -1167,6 +1186,15 @@ function synchronous_machine_dynamic_step!(
         field_winding_current_a,
         external_field_voltage_input_pu = external_field_voltage_input_pu,
     )
+    if use_exciter_hold
+        # The mechanical RHS subtracts this resisting torque on the next step.
+        # The terminal current is already referred to the external port.
+        port.held_mechanical_torque_mnm = _exciter_resisting_torque_mnm(
+            field_voltage_v,
+            exciter_port_result.terminal_current_a,
+            state.equation_state.histq_values[numask + nloce],
+        )
+    end
     return merge(
         equation_result,
         (
