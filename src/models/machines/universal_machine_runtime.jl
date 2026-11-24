@@ -697,6 +697,9 @@ function universal_machine_mechanical_iteration!(
     )
 end
 
+_machine_saturation_intercept(unsaturated, saturated, knee, remanent) =
+    knee + saturated / unsaturated * (remanent - knee)
+
 function universal_machine_flux_saturation_preview(;
     current_values::AbstractVector{<:Real},
     d_axis_stator_current_indices::AbstractVector{<:Integer} = Int[],
@@ -712,6 +715,7 @@ function universal_machine_flux_saturation_preview(;
     q_axis_remanent_flux::Real = 0.0,
     d_axis_saturation_mode::Int = 0,
     q_axis_saturation_mode::Int = 0,
+    saturation_line_offsets::Bool = false,
 )
     length(current_values) >= 3 ||
         throw(ArgumentError("flux saturation requires at least d/q universal-machine currents"))
@@ -751,6 +755,14 @@ function universal_machine_flux_saturation_preview(;
 
     d_offset = 0.0
     q_offset = 0.0
+    if saturation_line_offsets && d_axis_saturation_mode != 5
+        if d_axis_saturation_mode != 0 && !iszero(d_unsaturated)
+            d_offset = _machine_saturation_intercept(d_unsaturated, d_saturated, d_saturation_flux, d_remanent)
+        end
+        if q_axis_saturation_mode != 0 && !iszero(q_unsaturated)
+            q_offset = _machine_saturation_intercept(q_unsaturated, q_saturated, q_saturation_flux, q_remanent)
+        end
+    end
     if d_axis_saturation_mode == 5
         current_magnitude = hypot(d_current, q_current)
         if current_magnitude != 0.0 && d_unsaturated != 0.0
@@ -945,6 +957,7 @@ function _universal_machine_flux_region_solution(;
     q_axis_remanent_flux::Float64,
     d_axis_saturation_mode::Int,
     q_axis_saturation_mode::Int,
+    saturation_line_offsets::Bool = false,
 )
     saturation_request = 1 + d_axis_saturation_mode + 2 * q_axis_saturation_mode
     d_region = 0.0
@@ -1083,6 +1096,16 @@ function _universal_machine_flux_region_solution(;
                 (q_axis_saturation_flux - q_axis_remanent_flux) / q_axis_unsaturated_inductance
             signed_remanent_scale = 1.0
             decision_code = 5
+            if saturation_line_offsets && d_axis_saturation_mode != 5
+                if d_axis_saturation_mode != 0
+                    d_offset = _machine_saturation_intercept(d_axis_unsaturated_inductance,
+                        d_axis_saturated_inductance, d_axis_saturation_flux, d_axis_remanent_flux)
+                end
+                if q_axis_saturation_mode != 0
+                    q_offset = _machine_saturation_intercept(q_axis_unsaturated_inductance,
+                        q_axis_saturated_inductance, q_axis_saturation_flux, q_axis_remanent_flux)
+                end
+            end
             if d_axis_saturation_mode == 5
                 current_magnitude = hypot(result.d_axis_current, result.q_axis_current)
                 if current_magnitude == 0.0
@@ -1171,6 +1194,7 @@ function universal_machine_flux_current_jacobian_preview(;
     quadrature_axis_feedback::Real = 0.0,
     direct_axis_feedback::Real = 0.0,
     direct_machine_transfer_current_enabled::Bool = true,
+    saturation_line_offsets::Bool = false,
 )
     coil_count = length(coil_conductances)
     coil_count >= 4 ||
@@ -1306,6 +1330,7 @@ function universal_machine_flux_current_jacobian_preview(;
         q_axis_remanent_flux = q_remanent,
         d_axis_saturation_mode = d_axis_saturation_mode,
         q_axis_saturation_mode = q_axis_saturation_mode,
+        saturation_line_offsets = saturation_line_offsets,
     )
     final_currents = current_solution(region.d_axis_flux, region.q_axis_flux)
     final_axes = _universal_machine_axis_current_totals(
@@ -1553,6 +1578,7 @@ function induction_machine_axis_fluxes(
         q_axis_remanent_flux = parameters.q_axis_remanent_flux,
         d_axis_saturation_mode = parameters.d_axis_saturation_mode,
         q_axis_saturation_mode = parameters.q_axis_saturation_mode,
+        saturation_line_offsets = parameters.machine_type in (1, 2),
         d_axis_subtract_current_index = parameters.machine_type == 12 ? 5 : 0,
     )
     return flux.d_axis_flux, flux.q_axis_flux
@@ -1806,6 +1832,7 @@ function induction_machine_step!(
                 q_axis_remanent_flux = parameters.q_axis_remanent_flux,
                 d_axis_saturation_mode = parameters.d_axis_saturation_mode,
                 q_axis_saturation_mode = parameters.q_axis_saturation_mode,
+                saturation_line_offsets = parameters.machine_type in (1, 2),
                 d_axis_stator_current_indices = parameters.machine_type in (11, 12) ?
                     [4, 5] : Int[],
                 d_axis_subtract_current_index = parameters.machine_type == 12 ? 5 : 0,

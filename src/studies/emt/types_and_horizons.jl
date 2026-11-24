@@ -1988,10 +1988,10 @@ function deck_coupled_dq_machine_parameters(
             Float64(card3.saturation_flux) * inductance_scale,
         d_axis_remanent_flux =
             card2.remanent_flux === missing ? 0.0 :
-            Float64(card2.remanent_flux) * remanent_flux_scale,
+            abs(Float64(card2.remanent_flux)) * remanent_flux_scale,
         q_axis_remanent_flux =
             card3.remanent_flux === missing ? 0.0 :
-            Float64(card3.remanent_flux) * remanent_flux_scale,
+            abs(Float64(card3.remanent_flux)) * remanent_flux_scale,
         d_axis_saturation_mode = card2.saturation_mode,
         q_axis_saturation_mode = card3.saturation_mode,
         pole_pair_count = card1.pole_pair_count,
@@ -2291,35 +2291,53 @@ function deck_coupled_dq_machine_initial_state(
             end
         power_resistance = iszero(parameters.coil_conductances[3]) ?
             0.0 : inv(parameters.coil_conductances[3])
-        quadrature_series_inductance =
-            parameters.q_axis_unsaturated_inductance +
-            parameters.coil_reactances[3]
-        quadrature_internal_voltage = sequence_voltage +
-            complex(power_resistance, electrical_speed * quadrature_series_inductance) *
+        q_axis_unsaturated = parameters.q_axis_unsaturated_inductance
+        q_axis_leakage = parameters.coil_reactances[3]
+        d_axis_leakage = parameters.coil_reactances[2]
+        quadrature_voltage(inductance) = sequence_voltage +
+            complex(power_resistance, electrical_speed * (inductance + q_axis_leakage)) *
             sequence_current
+        quadrature_internal_voltage = quadrature_voltage(q_axis_unsaturated)
         rotor_electrical_angle = angle(quadrature_internal_voltage)
-        mechanical_angle =
-            (rotor_electrical_angle + pi / 2.0) / card1.pole_pair_count
+        mechanical_angle = (rotor_electrical_angle + pi / 2.0) / card1.pole_pair_count
         power_transform = coupled_dq_power_transform(
-            card1.pole_pair_count * mechanical_angle,
+            card1.pole_pair_count * mechanical_angle;
             machine_type = card1.machine_type,
         )
-        power_currents = power_transform * real.(terminal_current_phasors)
-        direct_axis_leakage = parameters.coil_reactances[2]
-        quadrature_axis_leakage = parameters.coil_reactances[3]
-        saliency_current_flux = (
-            parameters.d_axis_unsaturated_inductance -
-            parameters.q_axis_unsaturated_inductance +
-            direct_axis_leakage - quadrature_axis_leakage
-        ) * power_currents[2]
-        internal_voltage_axis_magnitude =
-            axis_voltage_scale * abs(quadrature_internal_voltage)
-        unsaturated_field_current = (
-            internal_voltage_axis_magnitude / electrical_speed -
-            saliency_current_flux
-        ) / parameters.d_axis_unsaturated_inductance
-        target_d_axis_flux = parameters.d_axis_unsaturated_inductance *
-                             (power_currents[2] + unsaturated_field_current)
+        instantaneous_currents = real.(terminal_current_phasors)
+        power_currents = power_transform * instantaneous_currents
+        q_axis_inductance = q_axis_unsaturated
+        internal_voltage_axis_magnitude = axis_voltage_scale * abs(quadrature_internal_voltage)
+        if parameters.d_axis_saturation_mode != 5 &&
+           (parameters.q_axis_saturation_mode != 0 || !iszero(parameters.q_axis_remanent_flux))
+            q_current = power_currents[3]
+            q_offset = parameters.q_axis_remanent_flux
+            if parameters.q_axis_saturation_mode != 0 &&
+               abs(q_current) > parameters.q_axis_saturation_flux / q_axis_unsaturated
+                q_axis_inductance = parameters.q_axis_saturated_inductance
+                q_knee = parameters.q_axis_saturation_flux
+                q_offset = q_knee + q_axis_inductance / q_axis_unsaturated * (q_offset - q_knee)
+            end
+            quadrature_internal_voltage = quadrature_voltage(q_axis_inductance)
+            voltage_magnitude = axis_voltage_scale * abs(quadrature_internal_voltage)
+            offset_voltage = copysign(q_offset * electrical_speed, q_current)
+            abs(offset_voltage) < voltage_magnitude || throw(ArgumentError(
+                "synchronous q-axis flux offset exceeds the available internal voltage",
+            ))
+            rotation = asin(offset_voltage / voltage_magnitude)
+            rotor_electrical_angle = angle(quadrature_internal_voltage) + rotation
+            mechanical_angle = (rotor_electrical_angle + pi / 2.0) / card1.pole_pair_count
+            power_transform = coupled_dq_power_transform(
+                card1.pole_pair_count * mechanical_angle;
+                machine_type = card1.machine_type,
+            )
+            power_currents = power_transform * instantaneous_currents
+            internal_voltage_axis_magnitude = voltage_magnitude * cos(rotation)
+        end
+        target_d_axis_flux = internal_voltage_axis_magnitude / electrical_speed +
+                             (q_axis_inductance - d_axis_leakage + q_axis_leakage) * power_currents[2]
+        unsaturated_field_current = target_d_axis_flux / parameters.d_axis_unsaturated_inductance -
+                                    power_currents[2]
         field_current = _synchronous_field_current_for_d_axis_flux(
             parameters,
             power_currents,

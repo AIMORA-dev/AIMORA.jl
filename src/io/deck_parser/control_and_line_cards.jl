@@ -590,11 +590,11 @@ function parse_universal_machine_definition_card!(
             end
             saturation_mode = something(fixed_int_value(image, 29, 29), 0)
             saturated_inductance =
-                something(fixed_float_value(image, 30, 43), missing)
+                something(_tryparse_fixed_float(fixed_field(image, 30, 43), 5), missing)
             saturation_flux =
-                something(fixed_float_value(image, 44, 57), missing)
+                something(_tryparse_fixed_float(fixed_field(image, 44, 57), 5), missing)
             remanent_flux =
-                something(fixed_float_value(image, 58, 71), missing)
+                something(_tryparse_fixed_float(fixed_field(image, 58, 71), 5), missing)
         else
             values = universal_machine_numeric_tokens(tokens)
             if length(values) == 1
