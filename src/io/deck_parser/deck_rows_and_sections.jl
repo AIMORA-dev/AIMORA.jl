@@ -2922,6 +2922,7 @@ function deck_asset_tables(result::DeckParseResult)
             :mutual_damping => row.mutual_damping,
             :shaft_stiffness => row.shaft_stiffness,
             :absolute_speed_damping => row.absolute_speed_damping,
+            :node_name => row.node_name,
             :source => result.source,
         )
         for (index, row) in enumerate(result.synchronous_machine_mass_rows)

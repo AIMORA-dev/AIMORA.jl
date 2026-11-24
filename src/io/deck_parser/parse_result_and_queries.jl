@@ -1039,7 +1039,20 @@ struct DeckSynchronousMachineMassRow
     mutual_damping::Float64
     shaft_stiffness::Float64
     absolute_speed_damping::Float64
+    node_name::Union{Nothing,Symbol}
     raw_text::String
+end
+
+function DeckSynchronousMachineMassRow(
+    line_no, machine_index, mass_index, values, torque_fraction, inertia,
+    speed_deviation_damping, mutual_damping, shaft_stiffness, absolute_speed_damping,
+    raw_text,
+)
+    return DeckSynchronousMachineMassRow(
+        line_no, machine_index, mass_index, values, torque_fraction, inertia,
+        speed_deviation_damping, mutual_damping, shaft_stiffness, absolute_speed_damping,
+        nothing, raw_text,
+    )
 end
 
 struct DeckSynchronousMachineOutputRequestRow
@@ -2494,6 +2507,7 @@ function deck_synchronous_machine_mass_rows(result::DeckParseResult)
             row.mutual_damping,
             row.shaft_stiffness,
             row.absolute_speed_damping,
+            row.node_name,
             row.raw_text,
         )
         for row in result.synchronous_machine_mass_rows

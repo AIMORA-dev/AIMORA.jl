@@ -372,9 +372,11 @@ function _deck_synchronous_machine_channel_name(
     machine_index::Int,
     kind::Symbol,
     index::Int,
+    node_name::Union{Nothing,Symbol}=nothing,
 )
     suffix = index == 0 ? "" : string("_", index)
-    return Symbol("synchronous_machine_", machine_index, "_", kind, suffix)
+    node_suffix = node_name === nothing ? "" : string("_", node_name)
+    return Symbol("synchronous_machine_", machine_index, "_", kind, suffix, node_suffix)
 end
 
 function _deck_synchronous_machine_dynamic_output_spec(
@@ -391,6 +393,11 @@ function _deck_synchronous_machine_dynamic_output_spec(
         if machine_index === nothing || row.machine_count == machine_index
     ]
     mass_count = maximum((row.mass_count for row in summaries); init = 0)
+    mass_names = Dict(
+        (row.machine_index, row.mass_index) => row.node_name
+        for row in DeckParser.deck_synchronous_machine_mass_rows(parsed)
+        if row.node_name !== nothing
+    )
     output_names = Symbol[]
     electrical_codes = Int[]
     angle_indices = Int[]
@@ -415,6 +422,7 @@ function _deck_synchronous_machine_dynamic_output_spec(
                         row.machine_index,
                         :mechanical_angle,
                         index,
+                        get(mass_names, (row.machine_index, index), nothing),
                     ),
                 )
                 push!(angle_indices, index)
@@ -427,18 +435,24 @@ function _deck_synchronous_machine_dynamic_output_spec(
                         row.machine_index,
                         :mechanical_speed,
                         index,
+                        get(mass_names, (row.machine_index, index), nothing),
                     ),
                 )
                 push!(speed_indices, index)
             end
         elseif row.group_index == 4
             for index in row.output_codes
+                from_name = get(mass_names, (row.machine_index, index + 1), nothing)
+                to_name = get(mass_names, (row.machine_index, index), nothing)
+                shaft_name = from_name === nothing && to_name === nothing ? nothing :
+                    Symbol(something(from_name, index + 1), "_to_", something(to_name, index))
                 push!(
                     output_names,
                     _deck_synchronous_machine_channel_name(
                         row.machine_index,
                         :shaft_torque,
                         index,
+                        shaft_name,
                     ),
                 )
                 push!(shaft_indices, index)

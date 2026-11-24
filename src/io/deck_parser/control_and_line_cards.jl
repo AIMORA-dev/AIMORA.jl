@@ -1459,14 +1459,25 @@ function parse_synchronous_machine_mass!(
     tokens,
     line_no::Int,
 )::Bool
+    image = fixed_image(line)
+    universal_mass = state.input_family == :universal_machine_section
+    node_name = universal_mass ? universal_machine_fixed_node_symbol(image, 71, 76) : nothing
+    numeric_tokens = universal_mass ? deck_tokens(fixed_field(image, 1, 70)) : tokens
     values = synchronous_machine_numeric_values!(
         result,
-        tokens,
+        numeric_tokens,
         line_no,
         "synchronous_machine_mass",
     )
     values === nothing && return true
-    mass_index = round(Int, values[1])
+    primary_index = universal_mass ? fixed_int_value(image, 1, 2) : nothing
+    mass_index = if universal_mass && (primary_index === nothing || iszero(primary_index))
+        alternate_index = fixed_int_field!(result, image, line_no, 3, 8, "alternate rotor mass index")
+        alternate_index === nothing && return true
+        alternate_index
+    else
+        round(Int, first(values))
+    end
     if mass_index <= 0
         add_issue!(
             result.validation,
@@ -1474,7 +1485,6 @@ function parse_synchronous_machine_mass!(
         )
         return true
     end
-    image = fixed_image(line)
     mass_values = Float64[
         something(fixed_float_value(image, 10 * index + 1, 10 * index + 10), 0.0)
         for index in 1:6
@@ -1487,6 +1497,7 @@ function parse_synchronous_machine_mass!(
             mass_index,
             values,
             mass_values...,
+            node_name,
             String(line),
         ),
     )
