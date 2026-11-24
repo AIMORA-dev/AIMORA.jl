@@ -926,7 +926,8 @@ function _machine_initial_flux(
     offset::Vector{Float64},
 )
     current = zeros(size(inductance, 1))
-    angle = first(specification.shaft_masses).initial_angle_rad * specification.pole_pairs
+    mass_index = _machine_electromagnetic_mass_index(specification)
+    angle = specification.shaft_masses[mass_index].initial_angle_rad * specification.pole_pairs
     transform = machine_phase_transform(angle)
     current[[layout.zero_index, layout.stator_d_index, layout.stator_q_index]] .=
         transform * collect(specification.initial_phase_current_a)

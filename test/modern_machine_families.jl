@@ -509,3 +509,47 @@ end
     @test runtime.accepted_state.event_count == 2
     @test runtime.inputs.mechanical_torque_nm == 12.0
 end
+
+@testset "Machine initialization uses the electromagnetic shaft mass angle" begin
+    family = ModernMachineTest.WoundFieldSynchronousMachine
+    prescribed = (1.0, -0.5, -0.5)
+    pole_pairs = 2
+    initial_speed = 2pi * 60 / pole_pairs
+    for (angle_difference, selected_mass) in ((0.0, :rotor), (pi / 6, :rotor), (pi / 6, :drive))
+        # Shaft angles are mechanical. The rotor test cases differ by 30 electrical degrees.
+        rotor_angle = angle_difference / pole_pairs
+        masses = [
+            ModernMachineTest.MachineShaftMass(:drive; inertia_kg_m2=1.5,
+                initial_speed_rad_s=initial_speed),
+            ModernMachineTest.MachineShaftMass(:rotor; inertia_kg_m2=1.75,
+                initial_angle_rad=rotor_angle, initial_speed_rad_s=initial_speed),
+        ]
+        coupling = ModernMachineTest.MachineShaftCoupling(:shaft, :drive, :rotor;
+            stiffness_nm_per_rad=2e4, initial_twist_rad=-rotor_angle)
+        specification = ModernMachineTest.ModernMachineSpecification(
+            :linear_wound_field_with_shaft, family;
+            operating_mode=ModernMachineTest.MachineGeneratorMode,
+            pole_pairs,
+            electrical=modern_machine_test_electrical(family),
+            saturation=ModernMachineTest.MachineMagneticCoenergyLaw(
+                radial_coefficient_per_wb2_h=0.0, cross_coefficient_per_wb2_h=0.0,
+                maximum_flux_wb=20.0,
+            ),
+            shaft_masses=masses,
+            shaft_couplings=[coupling],
+            electromagnetic_mass=selected_mass,
+            controls=ModernMachineTest.MachineControlParameters(enabled=false),
+            settings=ModernMachineTest.MachineRuntimeSettings(timestep_s=10e-6),
+            initialization_mode=ModernMachineTest.SpecifiedMachineInitialization,
+            initial_phase_current_a=prescribed,
+            initial_field_voltage_v=5.0,
+        )
+        preparation = ModernMachineTest.prepare_modern_machine(specification)
+        runtime = ModernMachineTest.modern_machine_runtime(preparation, (1, 2, 3, 4))
+        report = ModernMachineTest.modern_machine_result(runtime)
+        currents = ModernMachineTest.modern_machine_result_quantity(report, :phase_terminal_current_a)
+        @test runtime.accepted_state.accepted_time_s == 0.0
+        @test runtime.shaft_state.elastic_energy_j == 0.0
+        @test currents ≈ [prescribed..., 0.0] atol=1e-12 rtol=0
+    end
+end
