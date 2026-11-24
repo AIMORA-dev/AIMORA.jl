@@ -470,13 +470,29 @@ end
 function _deck_fixed_source_synchronous_steady_state(
     parsed::DeckParser.DeckParseResult,
 )
-    result = deck_fixed_source_load_flow(parsed)
-    result.converged || throw(ArgumentError(
-        "synchronous-machine initialization requires a converged FIX SOURCE solution",
-    ))
     admittance = _fixed_source_network_admittance(parsed)
     frequency_partition = DeckParser.deck_steady_state_frequency_partition(parsed)
-    phasors = copy(result.node_voltage_phasors)
+    result = isempty(DeckParser.deck_fixed_source_constraint_rows(parsed)) ?
+        nothing : deck_fixed_source_load_flow(parsed)
+    phasors = if result === nothing
+        source_rows, _ = _fixed_source_rows(parsed)
+        machine_nodes, machine_phasors = _fixed_source_machine_voltage_boundaries(parsed)
+        source_nodes = Int[row.node_value for row in source_rows]
+        source_phasors = ComplexF64[_deck_source_voltage_phasor(row) for row in source_rows]
+        fixed_nodes = vcat(source_nodes, machine_nodes)
+        allunique(fixed_nodes) || throw(ArgumentError(
+            "wound-field startup requires distinct source and prescribed machine terminals",
+        ))
+        workspace = _fixed_source_voltage_workspace(
+            admittance, fixed_nodes, _fixed_source_node_representatives(parsed, size(admittance, 1)),
+        )
+        copy(_fixed_source_voltage_solution!(workspace, source_phasors, machine_phasors))
+    else
+        result.converged || throw(ArgumentError(
+            "synchronous-machine initialization requires a converged FIX SOURCE solution",
+        ))
+        copy(result.node_voltage_phasors)
+    end
     load_flow_currents = admittance * phasors
     for branch in DeckParser.deck_universal_machine_generated_branch_rows(parsed)
         card1 = _deck_universal_machine_definition(parsed, branch.machine_index, 1)

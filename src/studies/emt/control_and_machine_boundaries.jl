@@ -112,14 +112,17 @@ function run_deck_universal_machine_horizon(
     predicted_current_coupling =
         machine_section.terminal_coupling == :predicted_current
     card1 = _deck_universal_machine_definition(parsed, machine_index, 1)
-    if card1.machine_type in (1, 2) && _deck_coupled_dq_coil_count(card1) > 5
-        has_fixed_source = !isempty(DeckParser.deck_fixed_source_constraint_rows(parsed))
+    has_fixed_source = !isempty(DeckParser.deck_fixed_source_constraint_rows(parsed))
+    additional_wound_field_coils =
+        card1.machine_type in (1, 2) && _deck_coupled_dq_coil_count(card1) > 5
+    if additional_wound_field_coils
         has_connected_damper = any(DeckParser.deck_universal_machine_terminal_rows(parsed)) do row
             row.machine_index == machine_index && row.terminal_index > 4 &&
                 row.terminal_node_value != 0
         end
-        card1.machine_type == 1 && has_fixed_source && !has_connected_damper ||
-            throw(ArgumentError("additional wound-field coils require a type-1 FIX SOURCE deck with shorted damper coils"))
+        card1.machine_type == 1 && !has_connected_damper &&
+            (has_fixed_source || machine_section.initialization_mode == :automatic) ||
+            throw(ArgumentError("additional wound-field coils require type 1, shorted dampers, and automatic or FIX SOURCE initialization"))
     end
     automatic_direct_machine_initialization =
         card1.machine_type in (8, 9, 10, 11, 12) &&
@@ -134,7 +137,7 @@ function run_deck_universal_machine_horizon(
         _deck_single_phase_induction_initialization(parsed, machine_index) : nothing
     fixed_source_synchronous_steady_state =
         card1.machine_type in (1, 2) &&
-        !isempty(DeckParser.deck_fixed_source_constraint_rows(parsed)) ?
+        (additional_wound_field_coils || has_fixed_source) ?
         _deck_fixed_source_synchronous_steady_state(parsed) : nothing
     steady_state = automatic_direct_machine_initialization !== nothing ?
         automatic_direct_machine_initialization.steady_state :
