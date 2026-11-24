@@ -889,6 +889,16 @@ end
         (10.0, 10.0, 10.0),
     )
     @test all(==(BreakerPoleAwaitingCurrentZero), awaiting.pole_positions)
+    @test !request_breaker_trip!(failed_breaker, specification, 2)
+    @test_throws ArgumentError request_breaker_trip!(failed_breaker, specification, 1)
+    held_snapshot = emt_breaker_snapshot(failed_breaker, specification)
+    @test held_snapshot.last_command_tick == 2
+    @test held_snapshot.trip_initiation_tick == 0
+    @test held_snapshot.failure_deadline_tick == 3
+    @test getfield.(held_snapshot.poles, :opening_count) == [1, 1, 1]
+    @test breaker_pole_conductances(failed_breaker, specification) == (1.0e6, 1.0e6, 1.0e6)
+    held_restart = EMTBreakerRuntime(specification; tick_s=1.0e-3)
+    restore_emt_breaker_snapshot!(held_restart, specification, held_snapshot)
     failure = advance_emt_breaker!(
         failed_breaker,
         specification,
@@ -898,10 +908,27 @@ end
     )
     @test failure.failure_asserted
     @test failure.backup_trip_required
+    restored_failure = advance_emt_breaker!(
+        held_restart, specification, 3, (100.0, 100.0, 100.0), (10.0, 10.0, 10.0),
+    )
+    @test restored_failure == failure
+    for runtime in (failed_breaker, held_restart)
+        @test !request_breaker_trip!(runtime, specification, 3)
+        held_step = advance_emt_breaker!(
+            runtime, specification, 5, (100.0, 100.0, 100.0), (10.0, 10.0, 10.0),
+        )
+        @test held_step.failure_asserted && held_step.backup_trip_required
+        state = emt_breaker_snapshot(runtime, specification)
+        @test state.trip_initiation_tick == 0
+        @test state.failure_deadline_tick == -1
+        @test count(event -> event.kind === :trip_requested, state.events) == 3
+        @test only(filter(event -> event.kind === :breaker_failure, state.events)).tick == 3
+    end
+    @test held_restart.events == failed_breaker.events
     opened_after_failure = advance_emt_breaker!(
         failed_breaker,
         specification,
-        4,
+        6,
         (0.0, 0.0, 0.0),
         (0.0, 0.0, 0.0);
         current_zero_reached=(true, true, true),
@@ -911,7 +938,7 @@ end
     @test_throws ArgumentError request_breaker_reclose!(
         failed_breaker,
         specification,
-        4,
+        6,
     )
 
     successful_breaker = EMTBreakerRuntime(specification; tick_s=1.0e-3)
@@ -933,6 +960,21 @@ end
     )
     @test opened.reclose_available
     @test request_breaker_reclose!(successful_breaker, specification, 2) == 4
+
+    pending = emt_breaker_snapshot(successful_breaker, specification)
+    cancelled = EMTBreakerRuntime(specification; tick_s=1.0e-3)
+    restore_emt_breaker_snapshot!(cancelled, specification, pending)
+    @test !request_breaker_trip!(cancelled, specification, 2)
+    cancelled_snapshot = emt_breaker_snapshot(cancelled, specification)
+    @test cancelled_snapshot.reclose_due_tick == -1
+    @test cancelled_snapshot.trip_initiation_tick == 0
+    @test cancelled_snapshot.failure_deadline_tick == 3
+    @test cancelled_snapshot.lockout
+    cancelled_step = advance_emt_breaker!(
+        cancelled, specification, 4, (0.0, 0.0, 0.0), (0.0, 0.0, 0.0),
+    )
+    @test all(==(BreakerPoleOpen), cancelled_step.pole_positions)
+    @test !cancelled_step.reclose_available
     trip_success = advance_emt_breaker!(
         successful_breaker,
         specification,
@@ -949,6 +991,17 @@ end
         (0.0, 0.0, 0.0),
     )
     @test all(==(BreakerPoleClosing), closing.pole_positions)
+    retripped = EMTBreakerRuntime(specification; tick_s=1.0e-3)
+    restore_emt_breaker_snapshot!(
+        retripped, specification, emt_breaker_snapshot(successful_breaker, specification),
+    )
+    @test request_breaker_trip!(retripped, specification, 4)
+    closing_trip = emt_breaker_snapshot(retripped, specification)
+    @test all(pole -> pole.position === BreakerPoleOpening, closing_trip.poles)
+    @test getfield.(closing_trip.poles, :opening_count) == [2, 2, 2]
+    @test closing_trip.trip_initiation_tick == 4
+    @test closing_trip.failure_deadline_tick == 7
+    @test closing_trip.lockout
     closed = advance_emt_breaker!(
         successful_breaker,
         specification,

@@ -260,15 +260,6 @@ function request_breaker_trip!(
     command_tick::Integer,
 )
     tick = _validate_breaker_command_tick(runtime, command_tick)
-    runtime.trip_initiation_tick = tick
-    runtime.failure_deadline_tick = tick + specification.failure_delay_ticks
-    runtime.failure_asserted = false
-    runtime.backup_trip_required = false
-    runtime.reclose_due_tick = -1
-    runtime.reclaim_due_tick = -1
-    if runtime.shot_count >= specification.maximum_reclose_shots && runtime.shot_count > 0
-        runtime.lockout = true
-    end
     transitioned = false
     for (index, pole) in pairs(runtime.poles)
         if pole.position in (BreakerPoleClosed, BreakerPoleClosing)
@@ -284,7 +275,20 @@ function request_breaker_trip!(
             transitioned = true
         end
     end
-    return transitioned
+    # A held trip can inhibit a pending reclose, but starts a failure
+    # timer only when it actually orders at least one pole to open.
+    (transitioned || runtime.reclose_due_tick >= 0) || return false
+    runtime.reclose_due_tick = -1
+    runtime.reclaim_due_tick = -1
+    if runtime.shot_count >= specification.maximum_reclose_shots && runtime.shot_count > 0
+        runtime.lockout = true
+    end
+    transitioned || return false
+    runtime.trip_initiation_tick = tick
+    runtime.failure_deadline_tick = tick + specification.failure_delay_ticks
+    runtime.failure_asserted = false
+    runtime.backup_trip_required = false
+    return true
 end
 
 function request_breaker_reclose!(
