@@ -1460,23 +1460,40 @@ function parse_synchronous_machine_mass!(
     line_no::Int,
 )::Bool
     image = fixed_image(line)
-    universal_mass = state.input_family == :universal_machine_section
-    node_name = universal_mass ? universal_machine_fixed_node_symbol(image, 71, 76) : nothing
-    numeric_tokens = universal_mass ? deck_tokens(fixed_field(image, 1, 70)) : tokens
-    values = synchronous_machine_numeric_values!(
-        result,
-        numeric_tokens,
-        line_no,
-        "synchronous_machine_mass",
-    )
-    values === nothing && return true
-    primary_index = universal_mass ? fixed_int_value(image, 1, 2) : nothing
-    mass_index = if universal_mass && (primary_index === nothing || iszero(primary_index))
-        alternate_index = fixed_int_field!(result, image, line_no, 3, 8, "alternate rotor mass index")
-        alternate_index === nothing && return true
-        alternate_index
+    node_name = nothing
+    if state.input_family == :universal_machine_section
+        node_name = universal_machine_fixed_node_symbol(image, 71, 76)
+        primary_index = fixed_int_or_default!(result, image, line_no, 1, 2, "rotor mass index", 0)
+        alternate_index = fixed_int_or_default!(result, image, line_no, 3, 8, "alternate rotor mass index", 0)
+        (primary_index === nothing || alternate_index === nothing) && return true
+        mass_index = iszero(primary_index) ? alternate_index : primary_index
+        values = Float64[]
+        isempty(fixed_field(image, 1, 2)) || push!(values, primary_index)
+        isempty(fixed_field(image, 3, 8)) || push!(values, alternate_index)
+        mass_values = Float64[]
+        fields = (
+            "torque fraction", "inertia", "speed deviation damping",
+            "mutual damping", "shaft stiffness", "absolute speed damping",
+        )
+        for (index, field) in enumerate(fields)
+            first_col = 10 * index + 1
+            last_col = first_col + 9
+            value = fixed_float_or_default!(
+                result, image, line_no, first_col, last_col, field, 0.0;
+                implied_decimal_places = 6,
+            )
+            value === nothing && return true
+            push!(mass_values, value)
+            isempty(fixed_field(image, first_col, last_col)) || push!(values, value)
+        end
     else
-        round(Int, first(values))
+        values = synchronous_machine_numeric_values!(result, tokens, line_no, "synchronous_machine_mass")
+        values === nothing && return true
+        mass_index = round(Int, first(values))
+        mass_values = Float64[
+            something(fixed_float_value(image, 10 * index + 1, 10 * index + 10), 0.0)
+            for index in 1:6
+        ]
     end
     if mass_index <= 0
         add_issue!(
@@ -1485,10 +1502,6 @@ function parse_synchronous_machine_mass!(
         )
         return true
     end
-    mass_values = Float64[
-        something(fixed_float_value(image, 10 * index + 1, 10 * index + 10), 0.0)
-        for index in 1:6
-    ]
     push!(
         result.synchronous_machine_mass_rows,
         DeckSynchronousMachineMassRow(
