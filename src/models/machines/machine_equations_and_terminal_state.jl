@@ -507,6 +507,7 @@ function synchronous_machine_equation_step_preview(
     held_exciter_torque_mnm::Union{Nothing,Float64}=nothing,
     applied_torque_distribution::Union{Nothing,AbstractVector{<:Real}}=nothing,
     universal_q_axis_curve::Union{Nothing,UniversalMachineQAxisCurve}=nothing,
+    universal_d_axis_curve::Union{Nothing,UniversalMachineAxisCurve}=nothing,
     tenm6::Real = 1.0e-6,
     asqrt3::Real = inv(sqrt(3.0)),
     sqrt3::Real = sqrt(3.0),
@@ -625,7 +626,11 @@ function synchronous_machine_equation_step_preview(
             _universal_machine_q_axis_flux(
                 universal_q_axis_curve, ac1 / universal_q_axis_curve.unsaturated_inductance_h,
             )
-        cd = (ac2 * acde * a4 - q_flux * a3) * czt
+        d_flux = universal_d_axis_curve === nothing ? ac2 * acde :
+            _universal_machine_curve_flux(
+                universal_d_axis_curve, ac2 / universal_d_axis_curve.unsaturated_inductance_h,
+            )
+        cd = (d_flux * a4 - q_flux * a3) * czt
         cexc = nloce == 0 ? 0.0 : histq[indices.ksex]
 
         jt = indices.n27
@@ -839,6 +844,7 @@ function synchronous_machine_companion_update!(
     d_axis_saturation_region::Int=0,
     q_axis_saturation_region::Int=0,
     universal_q_axis_curve::Union{Nothing,UniversalMachineQAxisCurve}=nothing,
+    universal_d_axis_curve::Union{Nothing,UniversalMachineAxisCurve}=nothing,
 )
     length(current_history) == 3 ||
         throw(ArgumentError("current_history must contain three phase values"))
@@ -950,6 +956,7 @@ function synchronous_machine_companion_update!(
             q_axis_region = q_axis_saturation_region,
             damping_ratio = damping,
             universal_q_axis_curve,
+            universal_d_axis_curve,
         )
     else
         (
@@ -1145,6 +1152,7 @@ function synchronous_machine_dynamic_step!(
         total_applied_torque = total_applied_torque,
         applied_torque_distribution = state.applied_torque_distribution,
         universal_q_axis_curve = state.universal_q_axis_curve,
+        universal_d_axis_curve = state.universal_d_axis_curve,
         kwargs...,
     )
     previous_external_field_voltage_input_pu =
@@ -1166,6 +1174,7 @@ function synchronous_machine_dynamic_step!(
         d_axis_saturation_region = state.d_axis_saturation_region,
         q_axis_saturation_region = state.q_axis_saturation_region,
         universal_q_axis_curve = state.universal_q_axis_curve,
+        universal_d_axis_curve = state.universal_d_axis_curve,
         field_voltage_multiplier = field_voltage_multiplier,
         external_field_voltage_input_pu = external_field_voltage_input_pu,
         previous_external_field_voltage_input_pu =

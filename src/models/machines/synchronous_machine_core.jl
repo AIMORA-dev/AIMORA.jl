@@ -131,11 +131,13 @@ function SynchronousMachineExciterPortState(
     )
 end
 
-struct UniversalMachineQAxisCurve
+struct UniversalMachineAxisCurve
     unsaturated_inductance_h::Float64
     saturated_inductance_h::Float64
     knee_flux_vs::Float64
 end
+
+const UniversalMachineQAxisCurve = UniversalMachineAxisCurve
 
 Base.@kwdef mutable struct SynchronousMachineDynamicState
     equation_state::SynchronousMachineEquationState
@@ -151,6 +153,21 @@ Base.@kwdef mutable struct SynchronousMachineDynamicState
     q_axis_saturation_region::Int = 0
     saturation_refactor_count::Int = 0
     universal_q_axis_curve::Union{Nothing,UniversalMachineQAxisCurve} = nothing
+    universal_d_axis_curve::Union{Nothing,UniversalMachineAxisCurve} = nothing
+end
+
+function SynchronousMachineDynamicState(
+    equation_state, current_history, electrical_coefficients, applied_torque_distribution,
+    exciter_port_state, call_count, companion_history_mutated, saturation_enabled,
+    d_axis_saturation_region, q_axis_saturation_region, saturation_refactor_count,
+    universal_q_axis_curve,
+)
+    return SynchronousMachineDynamicState(
+        equation_state, current_history, electrical_coefficients, applied_torque_distribution,
+        exciter_port_state, call_count, companion_history_mutated, saturation_enabled,
+        d_axis_saturation_region, q_axis_saturation_region, saturation_refactor_count,
+        universal_q_axis_curve, nothing,
+    )
 end
 
 struct SynchronousMachineRotorMass
@@ -919,6 +936,7 @@ function SynchronousMachineDynamicState(
     q_axis_saturation_region::Union{Nothing,Int}=nothing,
     saturation_refactor_count::Int=0,
     universal_q_axis_curve::Union{Nothing,UniversalMachineQAxisCurve}=nothing,
+    universal_d_axis_curve::Union{Nothing,UniversalMachineAxisCurve}=nothing,
     applied_torque_distribution::AbstractVector{<:Real}=Float64[],
     exciter_port_state::SynchronousMachineExciterPortState=
         SynchronousMachineExciterPortState(),
@@ -932,8 +950,8 @@ function SynchronousMachineDynamicState(
     ))
     enabled = if saturation_enabled === nothing
         length(coefficients) >= 30 && coefficients[22] > 0.0 &&
-        coefficients[23] != 0.0 && (universal_q_axis_curve !== nothing ||
-        (coefficients[24] > 0.0 && coefficients[25] != 0.0))
+        coefficients[23] != 0.0 && (universal_d_axis_curve !== nothing ||
+        universal_q_axis_curve !== nothing || (coefficients[24] > 0.0 && coefficients[25] != 0.0))
     else
         saturation_enabled
     end
@@ -948,11 +966,15 @@ function SynchronousMachineDynamicState(
             ))
         end
     end
-    d_region = d_axis_saturation_region === nothing ?
-               (enabled ? _synchronous_machine_saturation_region(
-                   flux_magnitude,
-                   coefficients[22],
-               ) : 0) : d_axis_saturation_region
+    d_region = if d_axis_saturation_region !== nothing
+        d_axis_saturation_region
+    elseif universal_d_axis_curve !== nothing
+        Int(coefficients[29] < 1.0)
+    elseif enabled
+        _synchronous_machine_saturation_region(flux_magnitude, coefficients[22])
+    else
+        0
+    end
     q_region = if q_axis_saturation_region !== nothing
         q_axis_saturation_region
     elseif universal_q_axis_curve !== nothing
@@ -973,6 +995,7 @@ function SynchronousMachineDynamicState(
         q_axis_saturation_region = q_region,
         saturation_refactor_count = saturation_refactor_count,
         universal_q_axis_curve = universal_q_axis_curve,
+        universal_d_axis_curve = universal_d_axis_curve,
     )
 end
 
@@ -1144,7 +1167,7 @@ function _universal_machine_q_axis_curve(
     )
 end
 
-function _universal_machine_q_axis_flux(curve::UniversalMachineQAxisCurve, current_a::Float64)
+function _universal_machine_curve_flux(curve::UniversalMachineAxisCurve, current_a::Float64)
     unsaturated = curve.unsaturated_inductance_h
     saturated = curve.saturated_inductance_h
     knee = curve.knee_flux_vs
@@ -1152,9 +1175,15 @@ function _universal_machine_q_axis_flux(curve::UniversalMachineQAxisCurve, curre
     return _universal_machine_axis_flux(current_a, unsaturated, saturated, knee, 0.0, 1, offset)
 end
 
-function _universal_machine_q_axis_saturated(curve::UniversalMachineQAxisCurve, current_a::Float64)
+function _universal_machine_axis_saturated(curve::UniversalMachineAxisCurve, current_a::Float64)
     return abs(current_a) > curve.knee_flux_vs / curve.unsaturated_inductance_h
 end
+
+_universal_machine_q_axis_flux(curve::UniversalMachineQAxisCurve, current_a::Float64) =
+    _universal_machine_curve_flux(curve, current_a)
+
+_universal_machine_q_axis_saturated(curve::UniversalMachineQAxisCurve, current_a::Float64) =
+    _universal_machine_axis_saturated(curve, current_a)
 
 function _synchronous_machine_physical_storage(
     parameters::SynchronousMachineParameters,
@@ -1357,14 +1386,18 @@ function _synchronous_machine_refactor_electrical_companion!(
     q_axis_region::Int,
     damping_ratio::Float64;
     universal_q_axis_curve::Union{Nothing,UniversalMachineQAxisCurve}=nothing,
+    universal_d_axis_curve::Union{Nothing,UniversalMachineAxisCurve}=nothing,
 )
     length(elp) >= 101 ||
         throw(ArgumentError("electrical_coefficients must contain at least 101 values"))
-    d_increment = _synchronous_machine_incremental_saturation_factor(
-        elp[22],
-        elp[23],
-        d_axis_region,
-    )
+    d_increment = if universal_d_axis_curve === nothing
+        _synchronous_machine_incremental_saturation_factor(elp[22], elp[23], d_axis_region)
+    elseif iszero(d_axis_region)
+        1.0
+    else
+        universal_d_axis_curve.saturated_inductance_h /
+            universal_d_axis_curve.unsaturated_inductance_h
+    end
     q_increment = if universal_q_axis_curve === nothing
         _synchronous_machine_incremental_saturation_factor(elp[24], elp[25], q_axis_region)
     elseif iszero(q_axis_region)
@@ -1455,14 +1488,25 @@ function _synchronous_machine_saturation_update!(
     q_axis_region::Int,
     damping_ratio::Float64,
     universal_q_axis_curve::Union{Nothing,UniversalMachineQAxisCurve}=nothing,
+    universal_d_axis_curve::Union{Nothing,UniversalMachineAxisCurve}=nothing,
 )
     d_flux = d_axis_current * elp[21] +
              d_axis_rotor_current_1 + d_axis_rotor_current_2
     q_flux = (q_axis_current * elp[21] +
               q_axis_rotor_current_1 + q_axis_rotor_current_2) * elp[31]
     flux_magnitude = hypot(d_flux, q_flux)
-    next_d_region = _synchronous_machine_saturation_region(flux_magnitude, elp[22])
-    elp[29] = _synchronous_machine_saturation_factor(flux_magnitude, elp[22], elp[23])
+    next_d_region = if universal_d_axis_curve === nothing
+        elp[29] = _synchronous_machine_saturation_factor(flux_magnitude, elp[22], elp[23])
+        _synchronous_machine_saturation_region(flux_magnitude, elp[22])
+    else
+        linear_flux = elp[1] * d_axis_current +
+            elp[2] * d_axis_rotor_current_1 + elp[4] * d_axis_rotor_current_2
+        current = linear_flux / universal_d_axis_curve.unsaturated_inductance_h
+        active = _universal_machine_axis_saturated(universal_d_axis_curve, current)
+        elp[29] = active ? _universal_machine_curve_flux(universal_d_axis_curve, current) /
+                           linear_flux : 1.0
+        Int(active)
+    end
     next_q_region = if universal_q_axis_curve === nothing
         elp[30] = _synchronous_machine_saturation_factor(flux_magnitude, elp[24], elp[25])
         iszero(elp[25]) ? 0 : _synchronous_machine_saturation_region(flux_magnitude, elp[24])
@@ -1482,6 +1526,7 @@ function _synchronous_machine_saturation_update!(
         next_q_region,
         damping_ratio;
         universal_q_axis_curve,
+        universal_d_axis_curve,
     )
     return (;
         flux_magnitude,
@@ -1502,6 +1547,7 @@ function _synchronous_machine_electrical_companion!(
     saturation_enabled::Bool=false,
     universal_q_axis_curve::Union{Nothing,UniversalMachineQAxisCurve}=nothing;
     startup_d_axis_factor::Union{Nothing,Float64}=nothing,
+    universal_d_axis_curve::Union{Nothing,UniversalMachineAxisCurve}=nothing,
 )
     factor = inv(electrical_speed_rad_s * half_step_s)
     damping_base = damping_control < 2.0 ? 100.0 : damping_control
@@ -1625,6 +1671,7 @@ function _synchronous_machine_electrical_companion!(
             q_axis_region = 0,
             damping_ratio,
             universal_q_axis_curve,
+            universal_d_axis_curve,
         )
     else
         (
@@ -1744,23 +1791,38 @@ function _synchronous_machine_sequence_components(values::Vector{ComplexF64})
     return (; positive, negative, zero)
 end
 
-function _universal_machine_d_axis_startup_factor(
+function _universal_machine_d_axis_curve(
     parameters::SynchronousMachineParameters,
-    magnetizing_flux_vs::Float64,
     electrical_speed_rad_s::Float64,
 )
+    main_d_inductance_h = (parameters.d_axis_synchronous_reactance_pu -
+        parameters.leakage_reactance_pu) *
+        (parameters.rated_voltage_kv^2 / parameters.rated_power_mva) /
+        electrical_speed_rad_s
     air_gap_current = abs(parameters.saturation_base_current)
     current_1 = parameters.d_axis_saturation_current_1
     current_2 = parameters.d_axis_saturation_current_2
     increment = current_2 - current_1
     linear_increment = Float64(0.2f0) * air_gap_current
-    increment == linear_increment && return 1.0
+    increment == linear_increment && return nothing
 
     slope_ratio = linear_increment / increment
     knee_flux_vs = (current_2 - Float64(1.2f0) * current_1) /
         (increment - linear_increment) * (1.0e3 * parameters.rated_voltage_kv / electrical_speed_rad_s)
     0.0 < slope_ratio < 1.0 && isfinite(knee_flux_vs) && knee_flux_vs >= 0.0 ||
         throw(ArgumentError("invalid universal-machine d-axis startup saturation curve"))
+    return UniversalMachineAxisCurve(
+        main_d_inductance_h, slope_ratio * main_d_inductance_h, knee_flux_vs,
+    )
+end
+
+function _universal_machine_d_axis_startup_factor(
+    curve::Union{Nothing,UniversalMachineAxisCurve},
+    magnetizing_flux_vs::Float64,
+)
+    curve === nothing && return 1.0
+    knee_flux_vs = curve.knee_flux_vs
+    slope_ratio = curve.saturated_inductance_h / curve.unsaturated_inductance_h
     flux_magnitude = abs(magnetizing_flux_vs)
     flux_magnitude <= knee_flux_vs && return 1.0
 
@@ -1837,13 +1899,15 @@ function _synchronous_machine_steady_state_initialization(
     effective_d_mutual = ds
     use_affine_startup = parameters.saturation_base_current < 0.0 &&
         parameters.universal_q_axis_saturation !== nothing && universal_q_axis_curve === nothing
+    universal_d_axis_curve = use_affine_startup ?
+        _universal_machine_d_axis_curve(parameters, electrical_speed_rad_s) : nothing
     if use_affine_startup
         # Class-3 d-axis-only saturation has an affine flux branch and an
         # unsaturated q axis. The terminal balance gives required main flux.
         magnetizing_flux_vs =
             (q_voltage + resistance * q_current - leakage * d_current) / electrical_speed_rad_s
         d_saturation_factor = _universal_machine_d_axis_startup_factor(
-            parameters, magnetizing_flux_vs, electrical_speed_rad_s,
+            universal_d_axis_curve, magnetizing_flux_vs,
         )
         effective_d_synchronous = leakage + d_main * d_saturation_factor
         effective_d_mutual = ds * d_saturation_factor
@@ -2088,6 +2152,7 @@ function _synchronous_machine_steady_state_initialization(
             field_voltage, d_flux_voltage, q_flux_voltage, generator_torque,
             exciter_torque, dc_generator_torque, phase_currents,
             startup_d_axis_factor = use_affine_startup ? d_saturation_factor : nothing,
+            universal_d_axis_curve,
             phase_voltage_phasors = voltage_phasors)
 end
 
@@ -2136,6 +2201,7 @@ function synchronous_machine_initial_state(
     cu = copy(steady.cu)
     initial_mechanical_angle === nothing ||
         (histq[1:length(parameters.rotor_masses)] .= initial_mechanical_angle)
+    universal_d_axis_curve = steady.universal_d_axis_curve
     companion = _synchronous_machine_electrical_companion!(
         elp,
         cu,
@@ -2145,6 +2211,7 @@ function synchronous_machine_initial_state(
         physical.saturation_enabled,
         physical.universal_q_axis_curve;
         startup_d_axis_factor = steady.startup_d_axis_factor,
+        universal_d_axis_curve,
     )
     if terminal_network_admittance !== nothing
         size(terminal_network_admittance) == (3, 3) ||
@@ -2239,6 +2306,7 @@ function synchronous_machine_initial_state(
         d_axis_saturation_region = companion.d_axis_saturation_region,
         q_axis_saturation_region = companion.q_axis_saturation_region,
         universal_q_axis_curve = physical.universal_q_axis_curve,
+        universal_d_axis_curve = universal_d_axis_curve,
     )
     return SynchronousMachineInitialization(
         state,
