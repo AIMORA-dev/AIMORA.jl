@@ -653,10 +653,6 @@ function parse_bpa_fixed_switch_card!(result::DeckParseResult, line::AbstractStr
     initial_issues = length(result.validation.issues)
     from_node = fixed_field(image, 3, 8)
     to_node = fixed_field(image, 9, 14)
-    if !isempty(from_node) && isempty(to_node)
-        to_node = "0"
-        record_card!(result, :fixed_card_single_terminal_switch_reference)
-    end
     if uppercase(from_node) == "NAME"
         if isempty(to_node)
             add_issue!(result.validation,
@@ -668,6 +664,10 @@ function parse_bpa_fixed_switch_card!(result::DeckParseResult, line::AbstractStr
         record_card!(result, :fixed_field)
         record_card!(result, :bpa_fixed_switch_name)
         return true
+    end
+    if !isempty(from_node) && isempty(to_node)
+        to_node = "0"
+        record_card!(result, :fixed_card_single_terminal_switch_reference)
     end
 
     switch_type = fixed_card_switch_type!(result, image, line_no, from_node, to_node)
