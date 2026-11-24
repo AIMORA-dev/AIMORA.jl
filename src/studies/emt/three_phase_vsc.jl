@@ -36,7 +36,9 @@ struct ThreePhaseVSCBoundaryOccurrence
     topology_invalidating::Bool
 end
 
-"""One conduction-state transition resolved against the coupled converter network at an exact accepted scheduler tick."""
+"""A resolved conduction-state transition. The historical route records sampled
+transitions on scheduler ticks. On the causal route, `time_s` is the intrinsic
+event clock and `tick` is its nearest scheduler tick for reference."""
 struct ThreePhaseVSCCommutationOccurrence
     name::Symbol
     time_s::Float64
@@ -1531,7 +1533,36 @@ function _three_phase_vsc_harmonic_metadata(
     )
 end
 
-function _three_phase_vsc_metrics(integrator::ThreePhaseVSCIntegrator)
+function _three_phase_vsc_intrinsic_clock(occurrence, tick_s, first_s, last_s)
+    time_s = occurrence.time_s
+    return first_s <= time_s <= last_s &&
+        occurrence.tick == round(Int, time_s / tick_s) &&
+        isfinite(occurrence.residual) && occurrence.residual >= 0.0 &&
+        1 <= occurrence.phase <= 3 && occurrence.position in (:upper, :lower) &&
+        occurrence.transition in (:forward_turn_on, :forward_extinction,
+                                  :reverse_diode_turn_on, :reverse_diode_extinction)
+end
+
+function _three_phase_vsc_clock_alignment(integrator, causal_events::Bool)
+    runtime = integrator.runtime
+    scheduler = integrator.scheduler
+    origin_s, tick_s = scheduler.origin_s, scheduler.tick_s
+    scheduled_clock(occurrence) = occurrence.time_s == origin_s + occurrence.tick * tick_s
+    all(scheduled_clock, runtime.boundary_occurrences) || return false
+    all(scheduled_clock, scheduler.occurrences) || return false
+    commutations = runtime.commutation_occurrences
+    # Causal boundary stabilization deliberately emits no commutation record.
+    # All recorded causal commutations come from directed intrinsic guards.
+    causal_events || return all(scheduled_clock, commutations)
+    first_s = first(integrator.recorder.time_s)
+    last_s = last(integrator.recorder.time_s)
+    return issorted(commutations; by = occurrence -> occurrence.time_s) &&
+        all(commutations) do occurrence
+            _three_phase_vsc_intrinsic_clock(occurrence, tick_s, first_s, last_s)
+        end
+end
+
+function _three_phase_vsc_metrics(integrator::ThreePhaseVSCIntegrator, causal_events::Bool)
     integrator.completed || throw(ArgumentError(
         "converter metrics require a completed horizon",
     ))
@@ -1592,11 +1623,7 @@ function _three_phase_vsc_metrics(integrator::ThreePhaseVSCIntegrator)
         all(isfinite, recorder.dc_link_voltage_v) &&
         all(isfinite, recorder.active_power_w) &&
         all(isfinite, recorder.reactive_power_var)
-    exact_alignment = all(runtime.boundary_occurrences) do occurrence
-        occurrence.time_s == occurrence.tick * p.scheduler_tick_s
-    end && all(runtime.commutation_occurrences) do occurrence
-        occurrence.time_s == occurrence.tick * p.scheduler_tick_s
-    end
+    exact_alignment = _three_phase_vsc_clock_alignment(integrator, causal_events)
     return ThreePhaseVSCMetrics(
         sum(recorder.active_power_w[window_indices]) / length(window_indices),
         sum(recorder.reactive_power_var[window_indices]) / length(window_indices),
@@ -1639,9 +1666,12 @@ function _three_phase_vsc_metrics(integrator::ThreePhaseVSCIntegrator)
 end
 
 three_phase_vsc_trace(integrator::CausalThreePhaseVSCIntegrator) =
-    three_phase_vsc_trace(integrator.state)
+    _three_phase_vsc_trace(integrator.state, true)
 
-function three_phase_vsc_trace(integrator::ThreePhaseVSCIntegrator)
+three_phase_vsc_trace(integrator::ThreePhaseVSCIntegrator) =
+    _three_phase_vsc_trace(integrator, false)
+
+function _three_phase_vsc_trace(integrator::ThreePhaseVSCIntegrator, causal_events::Bool)
     integrator.completed || throw(ArgumentError(
         "converter trace requires a completed horizon",
     ))
@@ -1649,7 +1679,7 @@ function three_phase_vsc_trace(integrator::ThreePhaseVSCIntegrator)
     recorder.write_index == length(recorder.time_s) || throw(ArgumentError(
         "converter trace storage is incomplete",
     ))
-    metrics = _three_phase_vsc_metrics(integrator)
+    metrics = _three_phase_vsc_metrics(integrator, causal_events)
     return ThreePhaseVSCTrace(
         integrator.runtime.parameters,
         copy(recorder.time_s),
