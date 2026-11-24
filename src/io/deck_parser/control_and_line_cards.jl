@@ -1046,6 +1046,30 @@ function parse_universal_machine_data_card!(
         detailed = state.detailed_machine_state
         detailed === nothing &&
             error("detailed synchronous-machine parser state is missing")
+        if detailed.phase == :universal_q_axis_saturation
+            image = fixed_image(line)
+            explicit_curve = isempty(fixed_field(image, 1, 18))
+            values = zeros(3)
+            for (index, start) in enumerate((51, 61, 71))
+                explicit_curve || break
+                value = fixed_float_or_default!(
+                    result, image, line_no, start, start + 9, "q_axis_saturation", 0.0,
+                )
+                value === nothing || (values[index] = value)
+            end
+            push!(result.synchronous_machine_model_parameter_rows,
+                DeckSynchronousMachineModelParameterRow(
+                    line_no, detailed.machine_index, :universal_q_axis_saturation,
+                    values, Union{Missing,Float64}[values...], explicit_curve ? String(line) : "",
+                ),
+            )
+            detailed.phase = :electrical_reactance
+            if explicit_curve
+                record_card!(result, :fixed_field)
+                record_card!(result, :synchronous_machine_universal_q_axis_saturation)
+                return false
+            end
+        end
         previous_phase = detailed.phase
         finished = parse_synchronous_machine_data_card!(
             result,
@@ -1066,7 +1090,7 @@ function parse_universal_machine_data_card!(
                     "implicit zero model-option row for detailed machine in universal section",
                 ),
             )
-            detailed.phase = :electrical_reactance
+            detailed.phase = :universal_q_axis_saturation
             record_card!(result, :synchronous_machine_implicit_model_option)
         end
         if finished

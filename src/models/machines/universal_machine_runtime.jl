@@ -700,6 +700,26 @@ end
 _machine_saturation_intercept(unsaturated, saturated, knee, remanent) =
     knee + saturated / unsaturated * (remanent - knee)
 
+function _universal_machine_axis_flux(
+    current::Float64,
+    unsaturated::Float64,
+    saturated::Float64,
+    saturation_flux::Float64,
+    remanent::Float64,
+    saturation_mode::Int,
+    offset::Float64,
+)
+    if saturation_mode != 0 && unsaturated != 0.0
+        threshold = saturation_flux / unsaturated
+        if current > threshold || current < -threshold
+            return (current >= 0.0 ? offset : -offset) + saturated * current
+        end
+    end
+    flux = unsaturated * current + remanent
+    current < 0.0 && (flux -= 2.0 * remanent)
+    return flux
+end
+
 function universal_machine_flux_saturation_preview(;
     current_values::AbstractVector{<:Real},
     d_axis_stator_current_indices::AbstractVector{<:Integer} = Int[],
@@ -774,27 +794,8 @@ function universal_machine_flux_saturation_preview(;
         end
     end
 
-    function axis_flux(
-        current::Float64,
-        unsaturated::Float64,
-        saturated::Float64,
-        saturation_flux::Float64,
-        remanent::Float64,
-        saturation_mode::Int,
-        offset::Float64,
-    )
-        if saturation_mode != 0 && unsaturated != 0.0
-            threshold = saturation_flux / unsaturated
-            if current > threshold || current < -threshold
-                return (current >= 0.0 ? offset : -offset) + saturated * current
-            end
-        end
-        flux = unsaturated * current + remanent
-        current < 0.0 && (flux -= 2.0 * remanent)
-        return flux
-    end
 
-    d_flux = axis_flux(
+    d_flux = _universal_machine_axis_flux(
         d_current,
         d_unsaturated,
         d_saturated,
@@ -803,7 +804,7 @@ function universal_machine_flux_saturation_preview(;
         d_axis_saturation_mode,
         d_offset,
     )
-    q_flux = axis_flux(
+    q_flux = _universal_machine_axis_flux(
         q_current,
         q_unsaturated,
         q_saturated,

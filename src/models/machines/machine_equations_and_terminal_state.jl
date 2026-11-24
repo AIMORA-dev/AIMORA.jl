@@ -503,7 +503,9 @@ function synchronous_machine_equation_step_preview(
     active_execution_chain::Int = 0,
     mechanical_torque_multipliers::Union{Nothing,AbstractVector{<:Real}}=nothing,
     total_applied_torque::Union{Nothing,Real}=nothing,
+    applied_torque_source_factor::Union{Nothing,Real}=nothing,
     applied_torque_distribution::Union{Nothing,AbstractVector{<:Real}}=nothing,
+    universal_q_axis_curve::Union{Nothing,UniversalMachineQAxisCurve}=nothing,
     tenm6::Real = 1.0e-6,
     asqrt3::Real = inv(sqrt(3.0)),
     sqrt3::Real = sqrt(3.0),
@@ -541,6 +543,12 @@ function synchronous_machine_equation_step_preview(
     total_torque === nothing || isfinite(total_torque) || throw(ArgumentError(
         "total_applied_torque must be finite",
     ))
+    source_factor = applied_torque_source_factor === nothing ? nothing :
+        Float64(applied_torque_source_factor)
+    source_factor === nothing || isfinite(source_factor) ||
+        throw(ArgumentError("applied_torque_source_factor must be finite"))
+    source_factor !== nothing && total_torque !== nothing &&
+        throw(ArgumentError("choose either a shaft torque source or total applied torque"))
     torque_distribution_scale = 1.0
     if total_torque !== nothing
         applied_torque_range = (indices.n27 + 1):(indices.n27 + numask)
@@ -612,16 +620,21 @@ function synchronous_machine_equation_step_preview(
         c4 = elp[35] * a4 + elp[41] * cu[6] + elp[43] * cu[7]
         ac2 = elp[1] * a3 + elp[2] * c1 + elp[4] * c2
         ac1 = elp[9] * a4 + elp[10] * c3 + elp[12] * c4
-        cd = (ac2 * acde * a4 - ac1 * acdf * a3) * czt
+        q_flux = universal_q_axis_curve === nothing ? ac1 * acdf :
+            _universal_machine_q_axis_flux(
+                universal_q_axis_curve, ac1 / universal_q_axis_curve.unsaturated_inductance_h,
+            )
+        cd = (ac2 * acde * a4 - q_flux * a3) * czt
         cexc = nloce == 0 ? 0.0 : histq[indices.ksex]
 
         jt = indices.n27
         for ik in indices.ikw:indices.ikp
             jt += 1
             mass_index = ik - indices.ikw + 1
-            histq[ik] =
+            histq[ik] = source_factor === nothing ?
                 histq[jt] * torque_distribution_scale *
-                torque_multipliers[mass_index] / histq[ik]
+                torque_multipliers[mass_index] / histq[ik] :
+                histq[jt] * source_factor
         end
         histq[indices.ksg] -= cd
         if nloce != 0
@@ -823,6 +836,7 @@ function synchronous_machine_companion_update!(
     saturation_enabled::Bool=false,
     d_axis_saturation_region::Int=0,
     q_axis_saturation_region::Int=0,
+    universal_q_axis_curve::Union{Nothing,UniversalMachineQAxisCurve}=nothing,
 )
     length(current_history) == 3 ||
         throw(ArgumentError("current_history must contain three phase values"))
@@ -933,6 +947,7 @@ function synchronous_machine_companion_update!(
             d_axis_region = d_axis_saturation_region,
             q_axis_region = q_axis_saturation_region,
             damping_ratio = damping,
+            universal_q_axis_curve,
         )
     else
         (
@@ -1110,6 +1125,7 @@ function synchronous_machine_dynamic_step!(
         mechanical_torque_multipliers = mechanical_torque_multipliers,
         total_applied_torque = total_applied_torque,
         applied_torque_distribution = state.applied_torque_distribution,
+        universal_q_axis_curve = state.universal_q_axis_curve,
         kwargs...,
     )
     previous_external_field_voltage_input_pu =
@@ -1130,6 +1146,7 @@ function synchronous_machine_dynamic_step!(
         saturation_enabled = state.saturation_enabled,
         d_axis_saturation_region = state.d_axis_saturation_region,
         q_axis_saturation_region = state.q_axis_saturation_region,
+        universal_q_axis_curve = state.universal_q_axis_curve,
         field_voltage_multiplier = field_voltage_multiplier,
         external_field_voltage_input_pu = external_field_voltage_input_pu,
         previous_external_field_voltage_input_pu =

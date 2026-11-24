@@ -114,6 +114,12 @@ function deck_synchronous_machine_parameters(
         row -> row.machine_index == machine_index && row.parameter_kind == :delta_connection,
         DeckParser.deck_synchronous_machine_model_parameter_rows(parsed),
     )
+    q_axis_rows = [
+        row for row in DeckParser.deck_synchronous_machine_model_parameter_rows(parsed)
+        if row.machine_index == machine_index && row.parameter_kind == :universal_q_axis_saturation
+    ]
+    universal_q_axis_saturation = isempty(q_axis_rows) ? nothing :
+        Tuple(only(q_axis_rows).values)
     return SynchronousMachineParameters(
         round(Int, definition[2]),
         round(Int, definition[3]),
@@ -142,6 +148,7 @@ function deck_synchronous_machine_parameters(
         fitting_value,
         delta_connected,
         masses,
+        universal_q_axis_saturation,
     )
 end
 
@@ -974,6 +981,28 @@ function _synchronous_machine_control_transfer!(
     return request_values
 end
 
+function _deck_synchronous_machine_uses_universal_shaft_source(parsed, terminal_line::Int)
+    sections = DeckParser.deck_universal_machine_section_rows(parsed)
+    section_index = findlast(section -> section.line_no < terminal_line, sections)
+    section_index === nothing && return false
+    section = sections[section_index]
+    section.detailed_machine_input || return false
+    summaries = DeckParser.deck_universal_machine_output_summary_rows(parsed)
+    summary_index = findfirst(summary -> summary.line_no > section.line_no, summaries)
+    return summary_index !== nothing && terminal_line < summaries[summary_index].line_no
+end
+
+function _universal_shaft_torque_source_factor(
+    gain::Float64,
+    time_s::Float64,
+    synchronous_speed_rad_s::Float64,
+)
+    # The type-17 signal modulates the initialized type-14 source crest.
+    # The history stores power in MW, so the fixed synchronous speed converts
+    # it to torque in MN*m before applying the near-DC source waveform.
+    return gain * cospi(2.0 * Float64(1.0f-5) * time_s) / synchronous_speed_rad_s
+end
+
 function _advance_synchronous_machine_control!(runtime, step_index::Int, time_s::Float64)
     Base.@nospecialize runtime
     return _advance_control_system_owner!(
@@ -1373,6 +1402,9 @@ function run_deck_synchronous_machine_horizon(
     delta_reference_phase_admittance = delta_connected ?
         state.electrical_coefficients[27] - state.electrical_coefficients[28] : nothing
 
+    universal_shaft_sources = _deck_synchronous_machine_uses_universal_shaft_source(
+        parsed, first(terminal_rows).line_no,
+    )
     control_runtime = _deck_synchronous_machine_control_runtime(parsed, dt_s, numask)
     control_output_names = control_runtime === nothing ? Symbol[] :
         copy(control_runtime.state.output_names)
@@ -1478,7 +1510,12 @@ function run_deck_synchronous_machine_horizon(
             external_field_voltage_input_pu = external_field_voltage_input_pu,
             mechanical_torque_multipliers =
                 mass_torque_control_active ? torque_multipliers : nothing,
-            total_applied_torque = total_applied_torque,
+            applied_torque_source_factor = universal_shaft_sources ?
+                _universal_shaft_torque_source_factor(
+                    step_index == 0 ? 1.0 : something(total_applied_torque, 1.0),
+                    step_index * dt_s,
+                    electrical_speed_rad_s / state.electrical_coefficients[26],
+                ) : nothing,
         )
         if control_runtime !== nothing
             machine_control_input_count +=
@@ -1745,6 +1782,7 @@ function run_deck_synchronous_machine_fleet_horizon(
     terminal_source_node_values = zeros(Int, 3, machine_count)
     source_types = zeros(Int, machine_count)
     source_group_indices = zeros(Int, machine_count)
+    universal_shaft_sources = falses(machine_count)
     for machine_index in 1:machine_count
         rows = sort(
             [
@@ -1756,6 +1794,8 @@ function run_deck_synchronous_machine_fleet_horizon(
         length(rows) == 3 || throw(ArgumentError(
             "each synchronous machine requires three terminal phases",
         ))
+        universal_shaft_sources[machine_index] =
+            _deck_synchronous_machine_uses_universal_shaft_source(parsed, first(rows).line_no)
         machine_source_types = unique(row.source_type for row in rows)
         length(machine_source_types) == 1 || throw(ArgumentError(
             "all terminal phases of a synchronous machine must use one source type",
@@ -1983,6 +2023,7 @@ function run_deck_synchronous_machine_fleet_horizon(
                 phase_voltages[:, machine_index],
                 delta_connections[machine_index],
             )
+            shaft_torque_gain = step_total_applied_torques[machine_index]
             result = synchronous_machine_dynamic_step!(
                 states[machine_index];
                 phase_voltages = winding_voltages,
@@ -2009,9 +2050,13 @@ function run_deck_synchronous_machine_fleet_horizon(
                 mechanical_torque_multipliers =
                     mass_torque_control_active ?
                     step_torque_multipliers[machine_index] : nothing,
-                total_applied_torque =
-                    isnan(step_total_applied_torques[machine_index]) ? nothing :
-                    step_total_applied_torques[machine_index],
+                applied_torque_source_factor = universal_shaft_sources[machine_index] ?
+                    _universal_shaft_torque_source_factor(
+                        step_index == 0 || isnan(shaft_torque_gain) ? 1.0 : shaft_torque_gain,
+                        step_index * dt_s,
+                        initialization.electrical_speed_rad_s /
+                        states[machine_index].electrical_coefficients[26],
+                    ) : nothing,
             )
             push!(results, result)
             if interface !== nothing
