@@ -1500,7 +1500,8 @@ function _synchronous_machine_electrical_companion!(
     half_step_s::Float64,
     damping_control::Float64,
     saturation_enabled::Bool=false,
-    universal_q_axis_curve::Union{Nothing,UniversalMachineQAxisCurve}=nothing,
+    universal_q_axis_curve::Union{Nothing,UniversalMachineQAxisCurve}=nothing;
+    startup_d_axis_factor::Union{Nothing,Float64}=nothing,
 )
     factor = inv(electrical_speed_rad_s * half_step_s)
     damping_base = damping_control < 2.0 ? 100.0 : damping_control
@@ -1641,6 +1642,9 @@ function _synchronous_machine_electrical_companion!(
     zero_sequence = inv(elp[17])
     branch_mutual = (zero_sequence - d_axis_reduced) / 3.0
     branch_direct = (zero_sequence + 2.0 * d_axis_reduced) / 3.0
+    # The startup flux and mechanical backoff use the solved steady-state
+    # secant. The runtime update still owns incremental refactorization.
+    startup_d_axis_factor === nothing || (elp[29] = startup_d_axis_factor)
     d_flux = (elp[1] * cu[1] + elp[2] * cu[4] + elp[4] * cu[5]) * elp[29] +
              elp[19] * cu[1]
     q_flux = (elp[9] * cu[2] + elp[10] * cu[6] + elp[12] * cu[7]) * elp[30] +
@@ -1740,6 +1744,32 @@ function _synchronous_machine_sequence_components(values::Vector{ComplexF64})
     return (; positive, negative, zero)
 end
 
+function _universal_machine_d_axis_startup_factor(
+    parameters::SynchronousMachineParameters,
+    magnetizing_flux_vs::Float64,
+    electrical_speed_rad_s::Float64,
+)
+    air_gap_current = abs(parameters.saturation_base_current)
+    current_1 = parameters.d_axis_saturation_current_1
+    current_2 = parameters.d_axis_saturation_current_2
+    increment = current_2 - current_1
+    linear_increment = Float64(0.2f0) * air_gap_current
+    increment == linear_increment && return 1.0
+
+    slope_ratio = linear_increment / increment
+    knee_flux_vs = (current_2 - Float64(1.2f0) * current_1) /
+        (increment - linear_increment) * (1.0e3 * parameters.rated_voltage_kv / electrical_speed_rad_s)
+    0.0 < slope_ratio < 1.0 && isfinite(knee_flux_vs) && knee_flux_vs >= 0.0 ||
+        throw(ArgumentError("invalid universal-machine d-axis startup saturation curve"))
+    flux_magnitude = abs(magnetizing_flux_vs)
+    flux_magnitude <= knee_flux_vs && return 1.0
+
+    # Above the knee the main flux is affine in magnetizing current. Return
+    # the secant factor so the existing steady-state torque uses actual flux.
+    intercept_vs = _machine_saturation_intercept(1.0, slope_ratio, knee_flux_vs, 0.0)
+    return slope_ratio * flux_magnitude / (flux_magnitude - intercept_vs)
+end
+
 function _synchronous_machine_steady_state_initialization(
     parameters::SynchronousMachineParameters,
     physical_elp::Vector{Float64},
@@ -1805,7 +1835,21 @@ function _synchronous_machine_steady_state_initialization(
     effective_d_synchronous = es
     effective_q_synchronous = cs
     effective_d_mutual = ds
-    if parameters.saturation_base_current < 0.0
+    use_affine_startup = parameters.saturation_base_current < 0.0 &&
+        parameters.universal_q_axis_saturation !== nothing && universal_q_axis_curve === nothing
+    if use_affine_startup
+        # Class-3 d-axis-only saturation has an affine flux branch and an
+        # unsaturated q axis. The terminal balance gives required main flux.
+        magnetizing_flux_vs =
+            (q_voltage + resistance * q_current - leakage * d_current) / electrical_speed_rad_s
+        d_saturation_factor = _universal_machine_d_axis_startup_factor(
+            parameters, magnetizing_flux_vs, electrical_speed_rad_s,
+        )
+        effective_d_synchronous = leakage + d_main * d_saturation_factor
+        effective_d_mutual = ds * d_saturation_factor
+        field_current = (q_voltage + resistance * q_current -
+                         effective_d_synchronous * d_current) / effective_d_mutual
+    elseif parameters.saturation_base_current < 0.0
         d_threshold = physical_elp[22]
         d_slope = physical_elp[23]
         q_threshold = physical_elp[24]
@@ -2043,6 +2087,7 @@ function _synchronous_machine_steady_state_initialization(
     return (; cu, histq, d_current, q_current, zero_current, field_current,
             field_voltage, d_flux_voltage, q_flux_voltage, generator_torque,
             exciter_torque, dc_generator_torque, phase_currents,
+            startup_d_axis_factor = use_affine_startup ? d_saturation_factor : nothing,
             phase_voltage_phasors = voltage_phasors)
 end
 
@@ -2098,7 +2143,8 @@ function synchronous_machine_initial_state(
         half_step,
         Float64(damping_control),
         physical.saturation_enabled,
-        physical.universal_q_axis_curve,
+        physical.universal_q_axis_curve;
+        startup_d_axis_factor = steady.startup_d_axis_factor,
     )
     if terminal_network_admittance !== nothing
         size(terminal_network_admittance) == (3, 3) ||
