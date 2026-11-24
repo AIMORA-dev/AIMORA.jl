@@ -151,18 +151,37 @@ function _switching_chopper_topology_nodes(study::SwitchingChopperConverterStudy
     throw(ArgumentError("switching chopper topology nodes are unavailable for family $family"))
 end
 
-function _switching_chopper_gate_state(study, time_s)
-    pwm = ConverterSystems.converter_pwm_gate_state(
-        [study.specification.modulation.duty],
-        time_s,
-        study.specification.timing.carrier_frequency_hz,
-        study.specification.modulation.kind,
-    )
+function _switching_chopper_carrier_gate(study, step_index)
+    duty = study.specification.modulation.duty
+    duty == 0.0 && return false
+    duty == 1.0 && return true
+    timing = study.specification.timing
+    frequency = timing.carrier_frequency_hz
+    half_duty = duty / 2.0
+    cycles_per_step = frequency * timing.fixed_step_s
+    start_cycle = frequency * study.start_time_s
+    cycle = floor(fma(step_index, cycles_per_step, start_cycle))
+    period_steps = inv(cycles_per_step)
+    start_step = study.start_time_s / timing.fixed_step_s
+    if !isfinite(period_steps) || iszero(period_steps) || !isfinite(start_step)
+        phase = mod(fma(step_index, cycles_per_step, start_cycle), 1.0)
+        return phase <= half_duty || phase > 1.0 - half_duty
+    end
+
+    # Compare the carrier edges against the integer integration clock. The
+    # endpoint belongs to the interval approached from earlier times.
+    cycle_start_step = fma(cycle, period_steps, -start_step)
+    off_edge_step = fma(half_duty, period_steps, cycle_start_step)
+    on_edge_step = fma(1.0 - half_duty, period_steps, cycle_start_step)
+    return step_index <= off_edge_step || step_index > on_edge_step
+end
+
+function _switching_chopper_gate_state(study, step_index, time_s)
     return !ConverterSystems.converter_system_is_blocked(
         study.specification,
         time_s,
         1,
-    ) && pwm.requested_valve_state[1]
+    ) && _switching_chopper_carrier_gate(study, step_index)
 end
 
 function _detailed_chopper_switching_energy_table(parameters; controlled::Bool)
@@ -261,7 +280,7 @@ end
 function _seed_switching_chopper_network(study::SwitchingChopperConverterStudy)
     nodes = _switching_chopper_topology_nodes(study)
     initial = study.initial_state
-    controlled_on = _switching_chopper_gate_state(study, study.start_time_s)
+    controlled_on = _switching_chopper_gate_state(study, 0, study.start_time_s)
     detailed = _switching_chopper_is_detailed(study)
     semiconductor = study.detailed_semiconductor
     family = study.specification.selection.family
@@ -606,8 +625,8 @@ function _apply_switching_chopper_event_commands!(runtime, time_s)
     return !isempty(commands), gate_changed
 end
 
-function _request_switching_chopper_gate!(runtime, time_s)
-    requested_on = _switching_chopper_gate_state(runtime.study, time_s)
+function _request_switching_chopper_gate!(runtime, step_index, time_s)
+    requested_on = _switching_chopper_gate_state(runtime.study, step_index, time_s)
     previous = runtime.bridge.valves[1].gate_driver.commanded_on
     Nonlinear.request_power_semiconductor_topology_gates!(
         runtime.bridge,
@@ -780,7 +799,7 @@ function _advance_switching_chopper_converter!(integrator)
     begin_timestep_transaction!(integrator.transaction)
     try
         _, command_gate_changed = _apply_switching_chopper_event_commands!(runtime, endpoint)
-        _, pwm_gate_changed = _request_switching_chopper_gate!(runtime, endpoint)
+        _, pwm_gate_changed = _request_switching_chopper_gate!(runtime, next_step, endpoint)
         gate_changed = command_gate_changed || pwm_gate_changed
         detailed = _switching_chopper_is_detailed(study)
         if detailed
