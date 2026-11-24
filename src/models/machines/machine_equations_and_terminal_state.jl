@@ -505,6 +505,7 @@ function synchronous_machine_equation_step_preview(
     total_applied_torque::Union{Nothing,Real}=nothing,
     applied_torque_source_factor::Union{Nothing,Real}=nothing,
     held_exciter_torque_mnm::Union{Nothing,Float64}=nothing,
+    present_field_rhs_v::Float64=0.0,
     applied_torque_distribution::Union{Nothing,AbstractVector{<:Real}}=nothing,
     universal_q_axis_curve::Union{Nothing,UniversalMachineQAxisCurve}=nothing,
     universal_d_axis_curve::Union{Nothing,UniversalMachineAxisCurve}=nothing,
@@ -616,8 +617,9 @@ function synchronous_machine_equation_step_preview(
         tsc = -av - au
         a4 = d6 * sum_value + d7 * tsc + d8 * tsd
         cv2 = v1 * sum_value + v2 * tsc + v3 * tsd
-        c1 = elp[32] * a3 + elp[36] * cu[4] + elp[37] * cu[5]
-        c2 = elp[33] * a3 + elp[37] * cu[4] + elp[39] * cu[5]
+        field_rhs = cu[4] + present_field_rhs_v
+        c1 = elp[32] * a3 + elp[36] * field_rhs + elp[37] * cu[5]
+        c2 = elp[33] * a3 + elp[37] * field_rhs + elp[39] * cu[5]
         c3 = elp[34] * a4 + elp[40] * cu[6] + elp[41] * cu[7]
         c4 = elp[35] * a4 + elp[41] * cu[6] + elp[43] * cu[7]
         ac2 = elp[1] * a3 + elp[2] * c1 + elp[4] * c2
@@ -840,6 +842,8 @@ function synchronous_machine_companion_update!(
     field_voltage_multiplier::Union{Nothing,Real}=nothing,
     external_field_voltage_input_pu::Union{Nothing,Real}=nothing,
     previous_external_field_voltage_input_pu::Union{Nothing,Real}=nothing,
+    present_field_companion::Bool=false,
+    initializing_field_companion::Bool=false,
     saturation_enabled::Bool=false,
     d_axis_saturation_region::Int=0,
     q_axis_saturation_region::Int=0,
@@ -980,7 +984,13 @@ function synchronous_machine_companion_update!(
     cu[9] = q_axis_current
 
     field_voltage = cu[11]
-    if external_field_voltage_input_pu !== nothing
+    if present_field_companion
+        # The assembled rotor impedance already contains the total winding
+        # resistance. After phasor startup, each voltage endpoint contributes
+        # once: the present RHS in the solve, then the accepted history here.
+        field_voltage = initializing_field_companion ? 0.0 :
+            -0.5 * (1.0 + damping) * Float64(external_field_voltage_input_pu)
+    elseif external_field_voltage_input_pu !== nothing
         current_external_voltage = Float64(external_field_voltage_input_pu)
         previous_external_voltage =
             Float64(previous_external_field_voltage_input_pu)
@@ -1018,7 +1028,9 @@ function synchronous_machine_companion_update!(
         elp[59] * q_axis_current + elp[60] * q_axis_rotor_current_1 +
         elp[61] * q_axis_rotor_current_2,
     ]
-    rotor_history[1] -= equation_result.mechanical_power * damping + field_voltage
+    startup_voltage = present_field_companion && !initializing_field_companion ? 0.0 :
+        equation_result.mechanical_power * damping
+    rotor_history[1] -= startup_voltage + field_voltage
     d_axis_rotor_correction = -(elp[70] * rotor_history[1] + elp[71] * rotor_history[2])
     q_axis_rotor_correction = -(elp[72] * rotor_history[3] + elp[73] * rotor_history[4])
     cu[1] = d_axis_history + d_axis_rotor_correction
@@ -1134,12 +1146,16 @@ function synchronous_machine_dynamic_step!(
         external_field_voltage_input_pu !== nothing
     held_torque = port.held_mechanical_torque_mnm
     initializing_exciter = use_exciter_hold && held_torque === nothing
+    present_field_companion = use_exciter_hold && state.universal_q_axis_curve === nothing
+    present_field_rhs_v = present_field_companion && !initializing_exciter ?
+        0.5 * (1.0 + Float64(damping_ratio)) * Float64(external_field_voltage_input_pu) : 0.0
     field_voltage_v = initializing_exciter ?
         -state.equation_state.cu_values[11] : external_field_voltage_input_pu
     equation_result = synchronous_machine_equation_step!(
         state.equation_state;
         nloce,
         held_exciter_torque_mnm = use_exciter_hold ? held_torque : nothing,
+        present_field_rhs_v,
         phase_voltages = phase_voltages,
         current_history = state.current_history,
         electrical_coefficients = state.electrical_coefficients,
@@ -1179,6 +1195,8 @@ function synchronous_machine_dynamic_step!(
         external_field_voltage_input_pu = external_field_voltage_input_pu,
         previous_external_field_voltage_input_pu =
             previous_external_field_voltage_input_pu,
+        present_field_companion,
+        initializing_field_companion = present_field_companion && initializing_exciter,
     )
     state.call_count += 1
     state.companion_history_mutated = companion_result.companion_history_mutated
