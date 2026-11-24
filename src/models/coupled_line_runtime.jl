@@ -356,6 +356,12 @@ function _coupled_line_runtime_preparation(
         throw(DimensionMismatch("coupled line runtime state input/output dimensions disagree"))
     all(matrix -> all(isfinite, matrix), (state, input, output, direct)) ||
         throw(ArgumentError("coupled line runtime matrices must be finite"))
+    actual_model_signature = CoupledLineFitting._rational_model_signature(
+        state, input, output, direct, model.port_order, model.reference_impedance_ohm,
+    )
+    actual_model_signature == model_signature || throw(ArgumentError(
+        "coupled line runtime realization does not match the certified model signature",
+    ))
 
     alpha = _runtime_bilinear_alpha(settings)
     identity_state = Matrix{Float64}(I, state_count, state_count)
