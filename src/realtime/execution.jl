@@ -20,6 +20,20 @@ struct RealtimeExecutionResult
     final_output_values::Vector{Float64}
 end
 
+_realtime_shutdown_values(
+    ::AbstractRealtimeInterface,
+    safety::RealtimeSafetyState,
+) = safety.safe_output_values
+
+_realtime_shutdown_values(
+    interface::Union{
+        InProcessControllerInterface,
+        LocalUDPControllerInterface,
+        SharedLibraryControllerInterface,
+    },
+    ::RealtimeSafetyState,
+) = interface.output_values
+
 function _realtime_execution_failure(
     preparation::RealtimePreparation,
     metadata::RealtimeExecutionMetadata,
@@ -27,12 +41,17 @@ function _realtime_execution_failure(
     samples::Vector{RealtimeTimingSample},
     populated_samples::Int,
     safety::RealtimeSafetyState,
+    interface::AbstractRealtimeInterface,
     input_values::Vector{Float64},
     output_values::Vector{Float64},
     code::Symbol,
     logical_step::Int,
     message::AbstractString,
 )
+    latch_realtime_safe_shutdown!(safety, code)
+    safe_shutdown_realtime_interface!(interface)
+    copyto!(safety.safe_output_values, _realtime_shutdown_values(interface, safety))
+    copyto!(output_values, safety.safe_output_values)
     populated = samples[1:populated_samples]
     summary = isempty(populated) ? nothing : summarize_realtime_timing(populated)
     return RealtimeExecutionResult(
@@ -141,8 +160,6 @@ function run_paced_realtime!(
             catch error
                 restore_state!(model_state, checkpoint)
                 restore_realtime_interface_state!(interface, interface_checkpoint)
-                latch_realtime_safe_shutdown!(safety, :execution_failure)
-                safe_shutdown_realtime_interface!(interface)
                 return _realtime_execution_failure(
                     preparation,
                     metadata,
@@ -150,6 +167,7 @@ function run_paced_realtime!(
                     samples,
                     populated_samples,
                     safety,
+                    interface,
                     input_values,
                     output_values,
                     :execution_failure,
@@ -170,8 +188,6 @@ function run_paced_realtime!(
             if sample.overrun && target.overrun_policy == FailSafeOnOverrun
                 restore_state!(model_state, checkpoint)
                 restore_realtime_interface_state!(interface, interface_checkpoint)
-                latch_realtime_safe_shutdown!(safety, :deadline_overrun)
-                safe_shutdown_realtime_interface!(interface)
                 return _realtime_execution_failure(
                     preparation,
                     metadata,
@@ -179,6 +195,7 @@ function run_paced_realtime!(
                     samples,
                     populated_samples,
                     safety,
+                    interface,
                     input_values,
                     output_values,
                     :deadline_overrun,

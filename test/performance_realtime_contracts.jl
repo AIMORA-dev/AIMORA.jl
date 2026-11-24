@@ -356,6 +356,7 @@ end
         overrun_preparation.channels,
     )
     overrun_state = [0.0]
+    overrun_output = [0.0]
     overrun_result = realtime.run_paced_realtime!(
         slow_model_step!,
         overrun_state,
@@ -365,11 +366,46 @@ end
         capture_state!,
         restore_state!,
         input_values=[1.0],
-        output_values=[0.0],
+        output_values=overrun_output,
     )
     @test overrun_result.failure.code == :deadline_overrun
     @test overrun_result.accepted_steps == 0
     @test overrun_state == [0.0]
     @test overrun_result.safety.latched
     @test overrun_interface.output_values == [0.0]
+    @test overrun_result.final_output_values == overrun_output == overrun_interface.output_values
+
+    multi_channels = [input_channel,
+        realtime.RealtimeChannel(:first_output, :output, "1", 1.0, 0.0, -10.0, 10.0, -2.0),
+        realtime.RealtimeChannel(:second_output, :output, "1", 1.0, 0.0, -10.0, 10.0, 1.25),
+    ]
+    failure_target = realtime.RealtimeTarget(
+        :multichannel_rejected_step, realtime.NativeLinuxSoftwareTarget;
+        period_ns=10_000_000, step_count=3, overrun_policy=realtime.MeasureOnlyOverrun,
+    )
+    failure_preparation = realtime.prepare_realtime_target(failure_target, multi_channels)
+    failure_interface = realtime.InProcessControllerInterface(
+        controller!, nothing, failure_preparation.channels,
+    )
+    function multichannel_step!(state, inputs, outputs, step, time_s, step_s)
+        model_step!(state, inputs, outputs, step, time_s, step_s)
+        outputs[2] = step == 1 ? NaN : -state[1]
+        return nothing
+    end
+    failure_state = [0.0]
+    failure_output = [0.0, 0.0]
+    failure_result = realtime.run_paced_realtime!(
+        multichannel_step!, failure_state, failure_interface, failure_preparation;
+        checkpoint=[0.0], capture_state!, restore_state!,
+        input_values=[1.0], output_values=failure_output,
+    )
+    @test failure_result.failure.code == :execution_failure
+    @test failure_result.failure.logical_step == 1
+    @test failure_result.accepted_steps == failure_interface.sequence == 1
+    @test failure_state == [0.01]
+    @test failure_result.safety.latched
+    @test !failure_interface.prepared
+    @test failure_result.safety.safe_output_values == [-2.0, 1.25]
+    @test failure_result.final_output_values == failure_output == failure_interface.output_values ==
+        [-2.0, 1.25]
 end
