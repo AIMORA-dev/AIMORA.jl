@@ -1243,6 +1243,10 @@ function _synchronous_machine_physical_storage(
     num2 = 2 * numask
     inertia_scale = 0.0421409745
     mechanical_scale = 1.356306e6
+    # Universal-section intake retains a Q card record even when omitted,
+    # distinguishing that source family from the direct SMDAT route.
+    mutual_damping_scale = parameters.universal_q_axis_saturation === nothing ?
+        1.356306e-6 : 1.0e-6 / Float64(0.73756f0)
     total_fraction = sum(mass.torque_fraction for mass in parameters.rotor_masses)
     numask == 1 && (total_fraction = 1.0)
     abs(total_fraction) > eps(Float64) ||
@@ -1250,7 +1254,7 @@ function _synchronous_machine_physical_storage(
     for (index, mass) in enumerate(parameters.rotor_masses)
         shp[num2 + index] = mass.torque_fraction / total_fraction
         shp[num2 + numask + index] = mass.inertia * inertia_scale
-        shp[num2 + 2 * numask + index] = mass.mutual_damping * mechanical_scale
+        shp[num2 + 2 * numask + index] = mass.mutual_damping * mutual_damping_scale
         shp[num2 + 3 * numask + index] = mass.shaft_stiffness * mechanical_scale / 1.0e6
         shp[num2 + 4 * numask + index] = mass.absolute_speed_damping * mechanical_scale
         shp[num2 + 5 * numask + index] = mass.speed_deviation_damping * mechanical_scale

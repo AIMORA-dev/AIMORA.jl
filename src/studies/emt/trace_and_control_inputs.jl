@@ -955,13 +955,13 @@ function _synchronous_machine_control_transfer!(
                 request_values[index] = accepted_mechanical_history[request]
             else
                 segment = request - 2 * numask
-                iszero(result.shp_values[4 * numask + segment]) || throw(ArgumentError(
-                    "universal-section shaft-torque transfer requires an undamped shaft",
-                ))
                 twist = accepted_mechanical_history[segment] -
                         accepted_mechanical_history[segment + 1]
+                relative_speed = accepted_mechanical_history[numask + segment] -
+                                 accepted_mechanical_history[numask + segment + 1]
                 request_values[index] =
-                    1.0e6 * result.shp_values[5 * numask + segment] * twist
+                    1.0e6 * result.shp_values[5 * numask + segment] * twist +
+                    1.0e6 * result.shp_values[4 * numask + segment] * relative_speed
             end
         elseif !(row.coupling_kind in (:machine_state_output, :rotor_mass_output))
             throw(ArgumentError(
