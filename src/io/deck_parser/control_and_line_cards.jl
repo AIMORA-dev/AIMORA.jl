@@ -1587,6 +1587,43 @@ function parse_synchronous_machine_control_interface!(
     return true
 end
 
+function parse_universal_section_rotor_mass_transfer!(
+    result::DeckParseResult,
+    state::SynchronousMachineDataParseState,
+    line::AbstractString,
+    line_no::Int,
+)
+    state.input_family == :universal_machine_section && state.phase == :output ||
+        return false
+    image = fixed_image(line)
+    code = fixed_int_value(image, 1, 2)
+    signal = fixed_field(image, 3, 8)
+    (code === nothing || code <= 0 || isempty(signal)) && return false
+    limit = last(result.universal_machine_section_rows).maximum_shaft_mass_count
+    code <= 3 * limit || return false
+    # Card groups use the class-1 limit; packed runtime requests use actual masses.
+    group, index_offset = divrem(code - 1, limit)
+    index = index_offset + 1
+    count = state.mass_count
+    if index > count - (group == 2)
+        add_issue!(
+            result.validation,
+            invalid_value("line $line_no", "rotor-mass TACS request $code is outside the declared shaft"),
+        )
+        return true
+    end
+    push!(
+        result.synchronous_machine_control_interface_rows,
+        DeckSynchronousMachineControlInterfaceRow(
+            line_no, state.machine_index, code, :machine_to_control,
+            :universal_rotor_mass_output, Symbol(signal), group * count + index, String(line),
+        ),
+    )
+    record_card!(result, :fixed_field)
+    record_card!(result, :synchronous_machine_control_interface)
+    return true
+end
+
 function synchronous_machine_blank_card(tokens)::Bool
     length(tokens) >= 3 || return false
     compact_deck_keyword(tokens[1]) == "blank" || return false
@@ -1690,6 +1727,8 @@ function parse_synchronous_machine_data_card!(
             line_no,
             interface_code,
         )
+        return false
+    elseif parse_universal_section_rotor_mass_transfer!(result, state, line, line_no)
         return false
     elseif first_token == "tolerances"
         parse_synchronous_machine_tolerances!(result, state, tokens, line_no)

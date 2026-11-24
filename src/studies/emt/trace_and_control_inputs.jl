@@ -872,6 +872,7 @@ function _synchronous_machine_control_transfer!(
     numask::Int,
     nloce::Int,
     ;
+    accepted_mechanical_history::AbstractVector{<:Real},
     publish::Bool=true,
 )
     Base.@nospecialize runtime result
@@ -936,6 +937,25 @@ function _synchronous_machine_control_transfer!(
                 "synchronous-machine exciter-current transfer requires a closed sensor",
             ))
             request_values[index] = Float64(result.exciter_port_current_a)
+        elseif row.coupling_kind == :universal_rotor_mass_output
+            request = row.variable_index
+            if request <= numask
+                # The universal-section angle frame leads the shaft frame by a
+                # quarter electrical cycle.
+                request_values[index] =
+                    accepted_mechanical_history[request] + pi / (2 * electrical_coefficients[26])
+            elseif request <= 2 * numask
+                request_values[index] = accepted_mechanical_history[request]
+            else
+                segment = request - 2 * numask
+                iszero(result.shp_values[4 * numask + segment]) || throw(ArgumentError(
+                    "universal-section shaft-torque transfer requires an undamped shaft",
+                ))
+                twist = accepted_mechanical_history[segment] -
+                        accepted_mechanical_history[segment + 1]
+                request_values[index] =
+                    1.0e6 * result.shp_values[5 * numask + segment] * twist
+            end
         elseif !(row.coupling_kind in (:machine_state_output, :rotor_mass_output))
             throw(ArgumentError(
                 "unsupported synchronous-machine control transfer $(row.coupling_kind)",
@@ -1474,6 +1494,7 @@ function run_deck_synchronous_machine_horizon(
                 state.electrical_coefficients,
                 numask,
                 nloce;
+                accepted_mechanical_history = state.equation_state.histq_values,
                 publish = step_index > 0,
             )
         if control_runtime !== nothing && step_index > 0
@@ -2000,6 +2021,8 @@ function run_deck_synchronous_machine_fleet_horizon(
                     states[machine_index].electrical_coefficients,
                     initialization.numask,
                     initialization.nloce;
+                    accepted_mechanical_history =
+                        states[machine_index].equation_state.histq_values,
                     publish = step_index > 0,
                 )
                 local_range =
