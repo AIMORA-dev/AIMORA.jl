@@ -888,11 +888,17 @@ function line_parameter_set(
     1 <= length(rows) <= LINE_PARAMETER_MAXIMUM_ROUTE_SEGMENTS || throw(ArgumentError(
         "line parameter route requires one through 32 segments",
     ))
+    allunique(segment.id for segment in rows) || throw(ArgumentError(
+        "line parameter route segment identities must be unique",
+    ))
     origin in (:native, :imported) || throw(ArgumentError(
         "line parameter set origin must be :native or :imported",
     ))
     phases = collect(phase_order)
     isempty(phases) && throw(ArgumentError("line parameter route requires phase order"))
+    allunique(phases) || throw(ArgumentError(
+        "line parameter route phase identities must be unique",
+    ))
     frequencies = copy(first(rows).frequencies_hz)
     total_length = sum(segment.length_m for segment in rows)
     total_length <= LINE_PARAMETER_MAXIMUM_ROUTE_LENGTH_M || throw(ArgumentError(
@@ -958,6 +964,20 @@ function CoupledLineFitting.coupled_line_terminal_response(
 )
     segment.kind == :mixed && throw(ArgumentError(
         "a mixed-route line parameter segment cannot be fitted as one uniform propagation medium",
+    ))
+    signature = _line_parameter_segment_signature(
+        segment.id,
+        segment.kind,
+        segment.length_m,
+        segment.phase_order,
+        segment.frequencies_hz,
+        segment.series_impedance_matrices_ohm_per_m,
+        segment.shunt_admittance_matrices_s_per_m,
+        segment.source,
+        segment.soil_signature_sha256,
+    )
+    signature == segment.input_signature_sha256 || throw(ArgumentError(
+        "line parameter segment $(segment.id) content does not match its source signature",
     ))
     fit_kind = segment.kind == :imported ? :imported_uniform : segment.kind
     return CoupledLineFitting.coupled_line_terminal_response(
@@ -1167,6 +1187,8 @@ function read_line_parameter_set(path::AbstractString)
             soil_signature_sha256=record["soil_signature_sha256"],
             quadrature_error_ohm_per_m=record["quadrature_error_ohm_per_m"],
         )
+        segment.input_signature_sha256 == get(record, "input_signature_sha256", nothing) ||
+            throw(ArgumentError("imported line parameter segment $(segment.id) signature mismatch"))
         push!(segments, segment)
     end
     parameters = line_parameter_set(
@@ -1175,6 +1197,10 @@ function read_line_parameter_set(path::AbstractString)
         phase_order=Symbol.(data["phase_order"]),
         origin=:imported,
     )
+    parameters.frequencies_hz == get(data, "frequencies_hz", nothing) ||
+        throw(ArgumentError("imported line parameter route frequency grid differs from its segments"))
+    parameters.total_length_m == get(data, "total_length_m", nothing) ||
+        throw(ArgumentError("imported line parameter route length differs from its segments"))
     parameters.deterministic_signature_sha256 ==
         data["deterministic_signature_sha256"] || throw(ArgumentError(
         "imported line parameter deterministic signature mismatch",
