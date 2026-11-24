@@ -1271,3 +1271,62 @@ end
     )
     @test length(MeasurementChainTest.instrument_transformer_measurement_signature(runtime)) == 64
 end
+
+@testset "Frequency requires observable positive-sequence phase" begin
+    function run_measurement_frequency(input, final_tick; acquisition_keywords...)
+        acquisition = MeasurementChainTest.MeasurementAcquisitionSettings(
+            tick_s=1e-3,
+            sample_period_ticks=1,
+            window_weights_newest_first=ones(20),
+            nominal_frequency_hz=50.0;
+            acquisition_keywords...,
+        )
+        specification = measurement_test_specification(
+            family=MeasurementChainTest.ThreePhaseSampledMeasurement,
+            channel_names=[:voltage_a, :voltage_b, :voltage_c],
+            phase_order=[:a, :b, :c],
+            acquisition=acquisition,
+        )
+        runtime = MeasurementChainTest.MeasurementChainRuntime(specification)
+        return [only(accept_measurement_test_value!(runtime, input(tick), tick))
+            for tick in 0:final_tick]
+    end
+
+    zero_signal(_tick) = zeros(3)
+    balanced_voltage(tick) = sqrt(2.0) .* cos.(
+        2.0 * pi * 50.0 * tick * 1e-3 .+ [0.0, -2.0 * pi / 3.0, 2.0 * pi / 3.0],
+    )
+
+    zeros_only = run_measurement_frequency(zero_signal, 20)
+    @test last(zeros_only).source_tick == last(zeros_only).release_tick == 20
+    @test last(zeros_only).sliding_rms == zeros(3)
+    @test iszero(last(zeros_only).sequence_phasors.positive)
+    @test last(zeros_only).frequency_hz === nothing
+    @test last(zeros_only).quality === :frequency_unavailable
+
+    energized = run_measurement_frequency(balanced_voltage, 20)
+    @test energized[20].quality === :frequency_unavailable
+    @test last(energized).sliding_rms ≈ ones(3) atol=1e-14 rtol=0
+    @test abs(last(energized).sequence_phasors.positive) ≈ 1.0 atol=1e-14 rtol=0
+    @test last(energized).frequency_hz ≈ 50.0 atol=1e-12 rtol=0
+    @test last(energized).quality === :valid
+
+    threshold = min(abs(energized[20].sequence_phasors.positive),
+        abs(last(energized).sequence_phasors.positive))
+    at_threshold = run_measurement_frequency(balanced_voltage, 20;
+        positive_sequence_threshold=threshold)
+    @test last(at_threshold).frequency_hz ≈ 50.0 atol=1e-12 rtol=0
+    @test last(at_threshold).quality === :valid
+
+    interrupted(tick) = 21 <= tick <= 40 ? zero_signal(tick) : balanced_voltage(tick)
+    resumed = run_measurement_frequency(interrupted, 60)
+    @test resumed[21].quality === :valid
+    @test iszero(resumed[41].sequence_phasors.positive)
+    @test resumed[41].frequency_hz === nothing
+    @test resumed[41].quality === :frequency_unavailable
+    @test !iszero(resumed[42].sequence_phasors.positive)
+    @test resumed[42].frequency_hz === nothing
+    @test resumed[42].quality === :frequency_unavailable
+    @test resumed[43].quality === :valid
+    @test last(resumed).frequency_hz ≈ 50.0 atol=1e-12 rtol=0
+end

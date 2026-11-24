@@ -442,7 +442,7 @@ function _measurement_window_estimates!(
         positive = (phase_a + rotation * phase_b + rotation^2 * phase_c) / 3.0
         negative = (phase_a + rotation^2 * phase_b + rotation * phase_c) / 3.0
         sequence = (zero=zero, positive=positive, negative=negative)
-        if abs(positive) >= settings.positive_sequence_threshold
+        if !iszero(positive) && abs(positive) >= settings.positive_sequence_threshold
             push!(runtime.positive_sequence_history, positive)
             push!(runtime.positive_sequence_time_history_s, delayed.source_tick * settings.tick_s)
             required_count = settings.frequency_update_separation + 1
