@@ -262,26 +262,42 @@ function _ensemble_rule_time(
 end
 
 function _deck_systematic_switch_schedules(parsed::DeckParser.DeckParseResult, run_count::Int)
-    rows = filter(row -> row.systematic_close_count > 0, DeckParser.deck_over5_switch_rows(parsed))
-    1 <= length(rows) <= 10 ||
+    rows = filter(
+        row -> row.systematic_close_count > 0 || row.systematic_reference_switch !== nothing,
+        DeckParser.deck_over5_switch_rows(parsed),
+    )
+    independent = findall(row -> row.systematic_reference_switch === nothing, rows)
+    1 <= length(independent) <= 10 ||
         throw(ArgumentError("SYSTEMATIC switching requires one to ten independent switches"))
-    count_product = foldl(Base.Checked.checked_mul, (row.systematic_close_count for row in rows); init=1)
+    count_product = foldl(Base.Checked.checked_mul,
+        (rows[axis].systematic_close_count for axis in independent); init=1)
     run_count == count_product || throw(ArgumentError(
         "SYSTEMATIC energization count $run_count differs from independent switch count product $count_product",
     ))
     options = filter(card -> card.kind == :systematic_switch_options, parsed.control_cards)
     length(options) == 1 || throw(ArgumentError("SYSTEMATIC switching requires its statistics controls"))
     starts_at_center = only(only(options).tokens) == "1"
-    origins = [row.close_time_s - (starts_at_center ? 0.0 :
-        0.5 * (row.systematic_close_count - 1) * row.systematic_close_spacing_s) for row in rows]
-    all(x -> x >= 0.0, origins) ||
-        throw(ArgumentError("SYSTEMATIC switch sweep contains a negative close time"))
+    names = [row.name for row in rows]
+    positions = Dict(name => index for (index, name) in enumerate(names))
+    references = [row.systematic_reference_switch === nothing ?
+        0 : positions[row.systematic_reference_switch] for row in rows]
+    dependent = findall(!iszero, references)
+    origins = zeros(length(rows))
+    for axis in independent
+        row = rows[axis]
+        origins[axis] = row.close_time_s - (starts_at_center ? 0.0 :
+            0.5 * (row.systematic_close_count - 1) * row.systematic_close_spacing_s)
+    end
+    for axis in dependent
+        origins[axis] = origins[references[axis]] + rows[axis].raw_close_time_s
+    end
+    all(x -> isfinite(x) && x >= 0.0, origins) ||
+        throw(ArgumentError("SYSTEMATIC switch sweep contains an invalid close time"))
 
     # The first independent switch carries after all other counters. The
     # remaining counters advance in card order, starting with switch two.
-    names = [row.name for row in rows]
     events = fill(:close, length(rows))
-    axis_order = [collect(2:length(rows)); 1]
+    axis_order = [independent[2:end]; first(independent)]
     schedules = EMTSwitchEventSchedule[]
     for run in 1:run_count
         index = run - 1
@@ -291,6 +307,10 @@ function _deck_systematic_switch_schedules(parsed::DeckParser.DeckParseResult, r
             index, offset = divrem(index, count)
             times[axis] += offset * rows[axis].systematic_close_spacing_s
         end
+        for axis in dependent
+            times[axis] = times[references[axis]] + rows[axis].raw_close_time_s
+        end
+        all(isfinite, times) || throw(ArgumentError("SYSTEMATIC switch sweep overflow"))
         push!(schedules, EMTSwitchEventSchedule(run, copy(names), copy(events), times, true))
     end
     return schedules
