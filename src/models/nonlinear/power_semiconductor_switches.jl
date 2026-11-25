@@ -1294,7 +1294,8 @@ end
 function _update_series_rc_snubber_backward_euler!(
     snubber::SeriesRCSnubber,
     terminal_voltage_v::Float64,
-    dt_s::Float64,
+    dt_s::Float64;
+    right_end_loss::Bool=false,
 )
     previous_loss = snubber.last_resistor_loss_w
     conductance, history_current =
@@ -1303,7 +1304,8 @@ function _update_series_rc_snubber_backward_euler!(
     capacitor_voltage = snubber.capacitor_voltage_v +
         dt_s * current / snubber.capacitance_f
     resistor_loss = snubber.resistance_ohm * current^2
-    snubber.dissipated_energy_j += 0.5 * dt_s * (previous_loss + resistor_loss)
+    snubber.dissipated_energy_j += right_end_loss ?
+        dt_s * resistor_loss : 0.5 * dt_s * (previous_loss + resistor_loss)
     snubber.previous_current_a = current
     snubber.capacitor_voltage_v = capacitor_voltage
     snubber.last_branch_voltage_v = terminal_voltage_v
@@ -1866,7 +1868,9 @@ function _accept_power_semiconductor_state!(
         if fidelity.candidate_method === :trapezoidal
             _update_series_rc_snubber!(device.snubber, voltage_v, step_s)
         else
-            _update_series_rc_snubber_backward_euler!(device.snubber, voltage_v, step_s)
+            _update_series_rc_snubber_backward_euler!(
+                device.snubber, voltage_v, step_s; right_end_loss=true,
+            )
         end
         device.last_snubber_current_a = device.snubber.last_current_a
     end
@@ -1918,10 +1922,14 @@ function _accept_power_semiconductor_state!(
         channel_work_j - semiconductor_energy_increment_j
     if device.snubber !== nothing
         snubber = device.snubber
-        snubber_work_j = 0.5 * step_s * (
-            previous_terminal_voltage_v * previous_snubber_current_a +
-            voltage_v * snubber.last_current_a
-        )
+        snubber_right_power_w = voltage_v * snubber.last_current_a
+        snubber_work_j = if fidelity.candidate_method === :backward_euler
+            step_s * snubber_right_power_w
+        else
+            0.5 * step_s * (
+                previous_terminal_voltage_v * previous_snubber_current_a + snubber_right_power_w
+            )
+        end
         snubber_stored_energy_j =
             0.5 * snubber.capacitance_f * snubber.capacitor_voltage_v^2
         fidelity.companion_energy_residual_j += snubber_work_j -

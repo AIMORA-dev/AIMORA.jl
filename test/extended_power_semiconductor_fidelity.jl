@@ -781,9 +781,116 @@ end
     @test device.semiconductor_dissipated_energy_j ≈ 0.4 atol=1e-15
     @test fidelity.thermal.cumulative_input_energy_j ≈ 0.4 atol=1e-15
     @test snubber.capacitor_voltage_v ≈ 0.1 * snubber_current atol=1e-15
-    @test snubber.dissipated_energy_j ≈ 0.05 * snubber_current^2 atol=1e-15
-    expected_snubber_residual = 0.05 * 2.0 * snubber_current -
-        0.05 * snubber_current^2 - 0.5 * (0.1 * snubber_current)^2
+    @test snubber.dissipated_energy_j ≈ 0.1 * snubber_current^2 atol=1e-15
+    expected_snubber_residual = 0.5 * (0.1 * snubber_current)^2
     @test fidelity.companion_energy_residual_j ≈ expected_snubber_residual atol=1e-15
     finish_nonlinear_device_step!(device)
+end
+
+function driven_snubber(initial_voltage; limit=nothing, injection=3.0)
+    models, branches = AIMORA.Nonlinear, AIMORA.Branches
+    rc = models.SeriesRCSnubber(1.0, 10e-6; initial_capacitor_voltage_v=initial_voltage)
+    thermal = models.CauerThermalFidelity([1.0], [1.0])
+    device = models.IGBTSwitch(1, 0; off_conductance=0.2, snubber=rc,
+        extended_fidelity=models.PowerSemiconductorExtendedFidelity(
+            thermal=thermal, terminal_current_domain=limit),
+    )
+    circuit = AIMORA.Nodal.NodalSystem(1, [
+        branches.ConductanceBranch(1, 0, 1.0),
+        branches.CurrentInjection(1, _ -> injection),
+    ])
+    network = AIMORA.NonlinearNodal.NonlinearNodalSystem(circuit, [device];
+        scales=NonlinearNetworkScales([10.0], [10.0], Float64[], Float64[]))
+    return network, device
+end
+
+function snubber_row(device, time, step, method, index)
+    rc, fd = device.snubber, device.extended_fidelity
+    return (; time, step, method, index, voltage=device.last_voltage,
+        terminal=device.last_current, current=rc.last_current_a,
+        capacitor=rc.capacitor_voltage_v, loss=rc.dissipated_energy_j,
+        channel=device.semiconductor_dissipated_energy_j,
+        thermal=fd.thermal.cumulative_input_energy_j,
+        residual=fd.companion_energy_residual_j,
+        events=device.topology_transition_count)
+end
+
+function snubber_step!(network, device, time; split=true)
+    rows = NamedTuple[]
+    result = AIMORA.NonlinearNodal.advance_nonlinear_step!(network, time, 2e-6;
+        discontinuity_treatment=split ? :two_backward_euler_half_steps : :none,
+        discontinuity_reason=split ? :topology_change : :none,
+        accepted_substep_observer=(_, t, h, method, index) ->
+            push!(rows, snubber_row(device, t, h, method, index)))
+    return result, rows
+end
+
+@testset "Owned RC work and heat in the ordinary nonlinear network" begin
+    models, solver = AIMORA.Nonlinear, AIMORA.NonlinearNodal
+    tolerance = 1e-12
+    for initial_u in (0.0, 5.0)
+        network, device = driven_snubber(initial_u)
+        result, rows = snubber_step!(network, device, 2e-6)
+        @test result.accepted
+        @test length(rows) == 2
+        old_u, old_loss, old_residual, old_channel = initial_u, 0.0, 0.0, 0.0
+        for (index, row) in enumerate(rows)
+            h = 1e-6
+            @test row.index == index && row.step == h
+            @test row.method === AIMORA.Branches.BackwardEulerCompanion
+            voltage = (3.0 + old_u / 1.1) / (1.2 + 1 / 1.1)
+            current = (voltage - old_u) / 1.1
+            new_u = old_u + h * current / 10e-6
+            @test row.voltage ≈ voltage atol=1e-9
+            @test row.current ≈ current atol=1e-10
+            @test row.capacitor ≈ new_u atol=1e-9
+            @test row.terminal ≈ 3.0 - voltage atol=1e-10
+            heat = h * current^2
+            damping = 0.5 * 10e-6 * (new_u - old_u)^2
+            stored = 0.5 * 10e-6 * (new_u^2 - old_u^2)
+            port_work = h * voltage * current
+            @test (initial_u == 0) == (port_work > 0)
+            @test heat > 0
+            @test row.loss - old_loss ≈ heat atol=tolerance rtol=1e-7
+            @test row.residual - old_residual ≈ damping atol=tolerance rtol=1e-7
+            @test port_work ≈ heat + damping + stored atol=tolerance
+            channel_increment = row.channel - old_channel
+            @test channel_increment ≈ h * 0.2 * voltage^2 atol=tolerance
+            @test row.thermal == row.channel
+            @test row.events == 0
+            @test h * (3.0 * voltage - voltage^2) ≈
+                channel_increment + (row.loss - old_loss) + stored +
+                (row.residual - old_residual) atol=tolerance
+            @info "Accepted RC substep" initial_u index port_work heat stored damping
+            old_u, old_loss, old_residual, old_channel = new_u, row.loss, row.residual, row.channel
+        end
+        checkpoint = solver.nonlinear_nodal_checkpoint(network)
+        direct, rows = snubber_step!(network, device, 4e-6)
+        @test direct.accepted
+        solver.restore_nonlinear_nodal_checkpoint!(network, checkpoint)
+        replay, replay_rows = snubber_step!(network, device, 4e-6)
+        @test replay.accepted && isequal(rows, replay_rows)
+    end
+
+    limit = models.SemiconductorTerminalCurrentDomain(1.55, 2.0)
+    network, device = driven_snubber(0.0; limit)
+    initial = snubber_row(device, 0.0, 0.0, nothing, 0)
+    rejected, rows = snubber_step!(network, device, 2e-6)
+    @test !rejected.accepted && isempty(rows)
+    @test occursin("1.521", sprint(showerror, rejected.failure))
+    @test isequal(snubber_row(device, 0.0, 0.0, nothing, 0), initial)
+    device.extended_fidelity.terminal_current_domain = nothing
+    retry, retry_rows = snubber_step!(network, device, 2e-6)
+    direct_network, direct_device = driven_snubber(0.0)
+    direct, direct_rows = snubber_step!(direct_network, direct_device, 2e-6)
+    @test retry.accepted && direct.accepted && isequal(retry_rows, direct_rows)
+
+    rc = models.SeriesRCSnubber(1.0, 10e-6)
+    baseline = models.IGBTSwitch(1, 0; off_conductance=0.2, snubber=rc)
+    AIMORA.Branches.update!(baseline, [2.0], 1e-6, Val(AIMORA.Branches.BackwardEulerCompanion))
+    @test rc.dissipated_energy_j ≈ 0.5e-6 * (2.0 / 1.1)^2 atol=tolerance
+    smooth, smooth_device = driven_snubber(0.0)
+    result, rows = snubber_step!(smooth, smooth_device, 2e-6; split=false)
+    @test result.accepted && only(rows).method === AIMORA.Branches.TrapezoidalCompanion
+    @test only(rows).loss ≈ 1e-6 * only(rows).current^2 atol=tolerance
 end
