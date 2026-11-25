@@ -330,7 +330,7 @@ function _control_system_supplemental_step!(
 )
     time = Float64(time_s)
     advance_control_system_state!(state, step, time; execute_devices = false)
-    _advance_control_system_expressions!(control_expressions, state)
+    _advance_control_system_expressions!(control_expressions, state, step)
     update = _advance_control_system_supplemental_devices!(runtime, state, step, time)
     assignment_outputs = Symbol[assignment.output_name for assignment in state.assignments]
     function_outputs = Symbol[function_row.output_name for function_row in state.functions]
@@ -590,7 +590,7 @@ function _advance_control_system_owner!(
             "parsed control-system devices require the complete supplemental-device owner",
         ))
         advance_control_system_state!(state, step, time_s; execute_devices = false)
-        _advance_control_system_expressions!(control_expressions, state)
+        _advance_control_system_expressions!(control_expressions, state, step)
         return nothing
     end
     return _control_system_supplemental_step!(

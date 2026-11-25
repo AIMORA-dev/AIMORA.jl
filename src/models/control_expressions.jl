@@ -15,6 +15,12 @@ end
 mutable struct ControlExpressionRuntime
     program::ControlExpressionProgram
     stack::Vector{Float64}
+    random_draw_count::Int
+end
+
+function ControlExpressionRuntime(program::ControlExpressionProgram, stack::Vector{Float64})
+    return ControlExpressionRuntime(program, stack,
+        count(instruction -> instruction.operation == :bpa_uniform_random, program.instructions))
 end
 
 ControlExpressionRuntime(program::ControlExpressionProgram) =
@@ -327,7 +333,8 @@ function _parse_control_expression_primary!(compiler::_ControlExpressionCompiler
     elseif token.kind == :identifier
         compiler.index += 1
         if _control_expression_accept!(compiler, :open)
-            operation = get(_CONTROL_EXPRESSION_FUNCTIONS, token.text, nothing)
+            operation = compiler.bpa_factor_arithmetic && token.text == "RAN" ?
+                :bpa_uniform_random : get(_CONTROL_EXPRESSION_FUNCTIONS, token.text, nothing)
             operation === nothing &&
                 throw(ArgumentError("unknown control-expression function $(token.text)"))
             _parse_control_expression_or!(compiler)
@@ -534,9 +541,27 @@ function _control_expression_binary(operation::Symbol, left::Float64, right::Flo
     throw(ArgumentError("unknown binary control-expression operation $operation"))
 end
 
+const _BPA_CONTROL_RANDOM_MODULUS = Int64(2_147_483_647)
+const _BPA_CONTROL_RANDOM_MULTIPLIER = Int64(16_807)
+
+function _bpa_control_random_stream(step::Int, draws_per_step::Int)
+    period = _BPA_CONTROL_RANDOM_MODULUS - 1
+    previous_draws = Int64(mod(widemul(step - 1, draws_per_step), period))
+    return Ref(powermod(_BPA_CONTROL_RANDOM_MULTIPLIER, previous_draws,
+        _BPA_CONTROL_RANDOM_MODULUS))
+end
+
+function _next_bpa_control_random!(state::Ref{Int64})
+    next = mod(_BPA_CONTROL_RANDOM_MULTIPLIER * state[], _BPA_CONTROL_RANDOM_MODULUS)
+    state[] = next
+    # The compiled GNU RAN profile discards the low nine bits before scaling.
+    return ldexp(Float64((next - 1) & ~Int64(511)), -31)
+end
+
 function evaluate_control_expression!(
     runtime::ControlExpressionRuntime,
-    values::AbstractDict{Symbol,<:Real},
+    values::AbstractDict{Symbol,<:Real};
+    bpa_random_stream::Union{Nothing,Ref{Int64}} = nothing,
 )
     stack_index = 0
     for instruction in runtime.program.instructions
@@ -557,8 +582,15 @@ function evaluate_control_expression!(
             runtime.stack[stack_index] = _control_expression_binary(operation, left, right)
         else
             stack_index >= 1 || throw(ArgumentError("control-expression stack underflow"))
-            runtime.stack[stack_index] =
-                _control_expression_unary(operation, runtime.stack[stack_index])
+            if operation == :bpa_uniform_random
+                bpa_random_stream === nothing && throw(ArgumentError(
+                    "RAN requires a fixed-card BPA timestep random stream",
+                ))
+                runtime.stack[stack_index] = _next_bpa_control_random!(bpa_random_stream)
+            else
+                runtime.stack[stack_index] =
+                    _control_expression_unary(operation, runtime.stack[stack_index])
+            end
         end
     end
     stack_index == 1 || throw(ArgumentError("control expression did not produce one result"))

@@ -246,7 +246,8 @@ using ..TACS: AlgebraicControlAssignment,
               evaluate_control_expression!,
               initialize_control_function_steady_state!,
               initialize_control_system_utilities!,
-              _CONTROL_SYSTEM_UTILITY_VALUES
+              _CONTROL_SYSTEM_UTILITY_VALUES,
+              _bpa_control_random_stream
 using ..TACS: sinusoidal_control_signal_phasor,
               sinusoidal_control_signal_value
 using ..Sources: analytic_source_value
