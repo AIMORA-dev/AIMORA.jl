@@ -88,7 +88,8 @@ function _portable_emt_validate_hybrid_boundary(
     allow_reconstruction_candidate::Bool=false,
 )
     transaction = emt_step_transaction_status(integrator.transaction)
-    transaction.active && _portable_emt_fail(
+    (transaction.active || (integrator.global_transaction !== nothing &&
+        emt_step_transaction_status(integrator.global_transaction).active)) && _portable_emt_fail(
         :active_transaction,
         "portable hybrid capture requires an inactive EMT transaction",
     )
@@ -136,11 +137,12 @@ end
 
 function _portable_emt_hybrid_fields(
     integrator::EMTHybridStepIntegrator,
-    event_program_signature::String,
+    event_program_signature::String;
+    allow_reconstruction_candidate::Bool=false,
 )
-    transaction = _portable_emt_validate_hybrid_boundary(integrator)
+    transaction = _portable_emt_validate_hybrid_boundary(integrator; allow_reconstruction_candidate)
     context = integrator.workspace.runtime.context
-    return PortableSnapshotStateField[
+    fields = PortableSnapshotStateField[
         _portable_emt_state_field("hybrid.accepted_step", _PORTABLE_EMT_HYBRID_OWNER, :scheduler, "1", _portable_emt_hybrid_accepted_step(context)),
         _portable_emt_state_field("hybrid.accepted_interval_count", _PORTABLE_EMT_HYBRID_OWNER, :output, "1", integrator.accepted_interval_count),
         _portable_emt_state_field("hybrid.active_global_endpoint", _PORTABLE_EMT_HYBRID_OWNER, :scheduler, "s", _portable_emt_hybrid_endpoint_value(integrator)),
@@ -169,6 +171,13 @@ function _portable_emt_hybrid_fields(
         _portable_emt_state_field("hybrid.workspace_step_index", _PORTABLE_EMT_HYBRID_OWNER, :checkpoint, "1", context.step_index),
         _portable_emt_state_field("hybrid.workspace_time", _PORTABLE_EMT_HYBRID_OWNER, :checkpoint, "s", context.t_s),
     ]
+    if integrator.global_transaction !== nothing
+        push!(fields, _portable_emt_state_field("hybrid.certified_guard_kinds",
+            _PORTABLE_EMT_HYBRID_OWNER, :checkpoint, "1",
+            [surface.scheduled_only ? "clock" : "continuous" for surface in integrator.surfaces];
+            axes=["surface"]))
+    end
+    return fields
 end
 
 function _portable_emt_hybrid_scheduler(integrator::EMTHybridStepIntegrator)
@@ -352,6 +361,32 @@ function _restore_portable_emt_hybrid_state_inventory!(
     scheduler_inventory = PortableSnapshotStateInventory(PortableSnapshotStateField[
         field for field in inventory.fields if startswith(field.identity, "scheduler.")
     ])
+    backup_scheduler = PortableSnapshotStateInventory(
+        _portable_emt_scheduler_fields(scheduler, task_signature, adapter),
+    )
+    backup_fields = _portable_emt_hybrid_fields(
+        integrator, event_signature; allow_reconstruction_candidate=isolated_reconstruction,
+    )
+    backup_inventory = PortableSnapshotStateInventory(vcat(backup_scheduler.fields, backup_fields))
+    guard_identity = "hybrid.certified_guard_kinds"
+    expected = _portable_emt_scheduler_inventory_fields(backup_inventory)
+    actual_guard = get(fields, guard_identity, nothing)
+    expected_guard = get(expected, guard_identity, nothing)
+    if actual_guard !== nothing || expected_guard !== nothing
+        actual_guard !== nothing && expected_guard !== nothing &&
+            actual_guard.owner == expected_guard.owner &&
+            actual_guard.family == expected_guard.family &&
+            actual_guard.unit == expected_guard.unit &&
+            actual_guard.axes == expected_guard.axes &&
+            actual_guard.value == expected_guard.value || _portable_emt_fail(
+                :hybrid_event_program_mismatch,
+                "portable hybrid guard certification mode or surface kinds changed",
+            )
+    end
+    keys(fields) == keys(expected) || _portable_emt_fail(
+        :hybrid_state_reconstruction,
+        "portable hybrid inventory fields changed",
+    )
     if isolated_reconstruction
         _restore_portable_emt_scheduler_inventory!(
             scheduler,
@@ -375,14 +410,6 @@ function _restore_portable_emt_hybrid_state_inventory!(
         )
         return integrator
     end
-    backup_scheduler = PortableSnapshotStateInventory(
-        _portable_emt_scheduler_fields(scheduler, task_signature, adapter),
-    )
-    backup_fields = _portable_emt_hybrid_fields(integrator, event_signature)
-    backup_inventory = PortableSnapshotStateInventory(vcat(
-        backup_scheduler.fields,
-        backup_fields,
-    ))
     try
         _restore_portable_emt_scheduler_inventory!(
             scheduler,

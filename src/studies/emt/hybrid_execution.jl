@@ -1,4 +1,16 @@
 const EMTHybridEventSurface = HybridEventSurface
+
+struct EMTHybridGuardCertificationError <: Exception
+    surface::Symbol
+    left_time_s::Float64
+    right_time_s::Float64
+    reason::String
+end
+
+function Base.showerror(io::IO, error::EMTHybridGuardCertificationError)
+    print(io, "hybrid guard ", error.surface, " cannot certify (", error.left_time_s,
+        ", ", error.right_time_s, "] s: ", error.reason)
+end
 const EMTHybridEventPolicy = HybridEventPolicy
 const EMTHybridEventOccurrence = HybridEventOccurrence
 const EMTSampledTaskOccurrence = SampledTaskOccurrence
@@ -216,6 +228,7 @@ mutable struct EMTHybridStepIntegrator{W,O,T,S}
     workspace::W
     callback_owner::O
     transaction::T
+    global_transaction::Union{Nothing,T}
     surfaces::Vector{AbstractHybridEventSurface}
     scheduler::S
     surface_fired::BitVector
@@ -297,6 +310,7 @@ function _emt_hybrid_time_surface(
         name,
         _workspace -> nothing,
         (_workspace, _time_s) -> nothing;
+        scheduled_only = true,
         direction = HYBRID_EVENT_RISING,
         priority = priority,
         topology_invalidating = true,
@@ -407,6 +421,7 @@ function _emt_hybrid_device_surfaces(workspace::EMTStudyWorkspace)
                             time_s,
                         );
                         direction = HYBRID_EVENT_RISING,
+                        scheduled_only = true,
                         priority = -15,
                         topology_invalidating = true,
                         repeatable = true,
@@ -434,6 +449,7 @@ function _emt_hybrid_device_surfaces(workspace::EMTStudyWorkspace)
                         time_s,
                     );
                     direction = HYBRID_EVENT_RISING,
+                    scheduled_only = true,
                     priority = -15,
                     topology_invalidating = true,
                     repeatable = true,
@@ -466,6 +482,7 @@ function _emt_hybrid_device_surfaces(workspace::EMTStudyWorkspace)
                         time_s,
                     );
                     direction = HYBRID_EVENT_RISING,
+                    scheduled_only = true,
                     priority = -15,
                     topology_invalidating = true,
                     repeatable = true,
@@ -576,7 +593,14 @@ function _check_emt_hybrid_surfaces!(surfaces)
     return surfaces
 end
 
-"""Configure hybrid EMT execution; callbacks receive a runtime-only owner, surface reads must be pure, and successful transitions/tasks may mutate only that owner before returning."""
+"""
+Configure hybrid EMT execution. Endpoint-only guard detection is the default.
+
+Set `historical_endpoint_guards=false` to require owner-certified continuous
+guard roots. This mode refuses uncertified intervals and rolls back the global
+step. Callbacks receive a runtime-only owner. Read callbacks must be pure, and
+transitions and tasks may mutate only that owner.
+"""
 function configure_emt_hybrid_execution(
     workspace::EMTStudyWorkspace;
     event_surfaces::AbstractVector{<:AbstractHybridEventSurface} =
@@ -593,6 +617,7 @@ function configure_emt_hybrid_execution(
     scheduler_origin_s::Real = 0.0,
     policy::HybridEventPolicy = HybridEventPolicy(),
     include_device_events::Bool = true,
+    historical_endpoint_guards::Bool = true,
 )
     workspace.ready || throw(ArgumentError(
         "EMT study workspace must be ready before configuring hybrid execution",
@@ -630,6 +655,7 @@ function configure_emt_hybrid_execution(
         workspace,
         EMTHybridCallbackOwner(runtime),
         EMTStepTransaction(workspace),
+        historical_endpoint_guards || isempty(surfaces) ? nothing : EMTStepTransaction(workspace),
         surfaces,
         resolved_scheduler,
         falses(length(surfaces)),
@@ -701,9 +727,10 @@ function _emt_hybrid_advance_interval!(
     context.dt_s = delta
     context.t_s = target_time_s
     _apply_due_series_rlc_alterations!(context)
-    final_global_interval = abs(
-        target_time_s - integrator.active_global_endpoint_s,
-    ) <= integrator.policy.root_time_tolerance_s
+    final_global_interval = integrator.global_transaction === nothing ?
+        abs(target_time_s - integrator.active_global_endpoint_s) <=
+            integrator.policy.root_time_tolerance_s :
+        target_time_s == integrator.active_global_endpoint_s
     over16_kwargs = merge(
         _over16_step_kwargs(runtime.step_configs, context),
         (
@@ -779,7 +806,8 @@ function _emt_hybrid_provisional_surface_value!(
     integrator::EMTHybridStepIntegrator,
     surface_index::Int,
     left_time_s::Float64,
-    target_time_s::Float64,
+    target_time_s::Float64;
+    require_value::Bool=true,
 )
     workspace_ready = integrator.workspace.ready
     evaluation_count = integrator.workspace.evaluation_count
@@ -790,7 +818,7 @@ function _emt_hybrid_provisional_surface_value!(
             integrator.surfaces[surface_index],
             integrator.callback_owner,
         )
-        value === nothing && throw(ArgumentError(
+        require_value && value === nothing && throw(ArgumentError(
             "hybrid event surface became unavailable inside its root bracket",
         ))
         restore_emt_step_transaction!(integrator.transaction)
@@ -868,9 +896,10 @@ function _emt_hybrid_accept_interval!(
     left_time_s::Float64,
     target_time_s::Float64,
 )
-    final_global_interval = abs(
-        target_time_s - integrator.active_global_endpoint_s,
-    ) <= integrator.policy.root_time_tolerance_s
+    final_global_interval = integrator.global_transaction === nothing ?
+        abs(target_time_s - integrator.active_global_endpoint_s) <=
+            integrator.policy.root_time_tolerance_s :
+        target_time_s == integrator.active_global_endpoint_s
     source_snapshot =
         final_global_interval ? nothing : _emt_hybrid_source_snapshot(integrator)
     begin_emt_step_transaction!(integrator.transaction)
@@ -894,8 +923,12 @@ function _emt_hybrid_candidate_time(
     endpoint_time_s::Float64,
 )
     integrator.surface_fired[index] && return nothing
+    surface = integrator.surfaces[index]
+    if integrator.global_transaction !== nothing && !surface.scheduled_only
+        return nothing
+    end
     candidate = hybrid_event_candidate_time(
-        integrator.surfaces[index],
+        surface,
         integrator.callback_owner,
     )
     candidate === nothing && return nothing
@@ -1128,6 +1161,48 @@ function _emt_hybrid_localized_roots!(
     return roots, earliest
 end
 
+function _emt_hybrid_certified_roots!(integrator, left_time_s, right_time_s)
+    candidates = Dict{Int,Float64}()
+    earliest = Inf
+    for (index, surface) in pairs(integrator.surfaces)
+        (integrator.surface_fired[index] || surface.scheduled_only) && continue
+        invalid(reason) = EMTHybridGuardCertificationError(
+            surface.name, left_time_s, right_time_s, reason,
+        )
+        certify = surface.certified_roots
+        certify === nothing && throw(invalid("missing owner certificate"))
+        times = certify(integrator.callback_owner, left_time_s, right_time_s)
+        times isa Union{Tuple,AbstractVector} ||
+            throw(invalid("owner did not return a complete root sequence"))
+        previous = left_time_s
+        for time in times
+            time isa Real || throw(invalid("root times must be real numbers"))
+            time_s = Float64(time)
+            isfinite(time_s) && previous < time_s <= right_time_s ||
+                throw(invalid("root times must be finite, strictly increasing, and in the interval"))
+            previous = time_s
+        end
+        isempty(times) && continue
+        first_time_s = Float64(first(times))
+        candidates[index] = first_time_s
+        earliest = min(earliest, first_time_s)
+    end
+    roots = Dict{Int,Any}()
+    for index in eachindex(integrator.surfaces)
+        time_s = get(candidates, index, Inf)
+        time_s - earliest <= integrator.policy.simultaneity_tolerance_s || continue
+        value = _emt_hybrid_provisional_surface_value!(
+            integrator, index, left_time_s, time_s; require_value=false,
+        )
+        value !== nothing && abs(value) <= integrator.policy.root_value_tolerance ||
+            throw(EMTHybridGuardCertificationError(integrator.surfaces[index].name,
+                left_time_s, right_time_s,
+                "certified root does not satisfy the held guard value tolerance"))
+        roots[index] = HybridEventRoot(time_s, value, 0.0, 0, true)
+    end
+    return roots, earliest
+end
+
 function _emt_hybrid_root_indices(
     integrator::EMTHybridStepIntegrator,
     roots::Dict{Int,Any},
@@ -1178,7 +1253,9 @@ function _advance_emt_hybrid_step_impl!(integrator::EMTHybridStepIntegrator)
     integrator.last_global_step_event_count = 0
     candidate_indices = Int[]
     try
-        while left_time < endpoint_time - integrator.policy.root_time_tolerance_s
+        stop_time = integrator.global_transaction === nothing ?
+            endpoint_time - integrator.policy.root_time_tolerance_s : endpoint_time
+        while left_time < stop_time
             _emt_hybrid_candidate_indices_at!(
                 candidate_indices,
                 integrator,
@@ -1191,10 +1268,10 @@ function _advance_emt_hybrid_step_impl!(integrator::EMTHybridStepIntegrator)
                 left_time,
                 Dict{Int,Any}(),
             )
-            left_values = Any[
+            left_values = integrator.global_transaction === nothing ? Any[
                 hybrid_event_value(surface, integrator.callback_owner)
                 for surface in integrator.surfaces
-            ]
+            ] : nothing
             boundary = _emt_hybrid_next_boundary(
                 integrator,
                 left_time,
@@ -1234,18 +1311,14 @@ function _advance_emt_hybrid_step_impl!(integrator::EMTHybridStepIntegrator)
                 context.t_s = left_time
                 continue
             end
-            right_values = _emt_hybrid_provisional_values!(
-                integrator,
-                left_time,
-                boundary,
-            )
-            roots, earliest_root = _emt_hybrid_localized_roots!(
-                integrator,
-                left_time,
-                boundary,
-                left_values,
-                right_values,
-            )
+            roots, earliest_root = if integrator.global_transaction === nothing
+                right_values = _emt_hybrid_provisional_values!(integrator, left_time, boundary)
+                _emt_hybrid_localized_roots!(
+                    integrator, left_time, boundary, left_values, right_values,
+                )
+            else
+                _emt_hybrid_certified_roots!(integrator, left_time, boundary)
+            end
             target = isfinite(earliest_root) ? min(boundary, earliest_root) : boundary
             target - left_time >= integrator.policy.minimum_progress_s ||
                 throw(ArgumentError(
@@ -1283,11 +1356,44 @@ function advance_emt_hybrid_step!(integrator::EMTHybridStepIntegrator)
     integrator.last_failure === nothing || throw(ArgumentError(
         "EMT hybrid integrator is terminally failed and cannot be reused: $(integrator.last_failure)",
     ))
+    transaction = integrator.global_transaction
+    saved = if transaction !== nothing
+        runtime_state = (
+            initialized=integrator.initialized,
+            completed=integrator.completed,
+            active_global_endpoint_s=integrator.active_global_endpoint_s,
+            accepted_interval_count=integrator.accepted_interval_count,
+            provisional_interval_count=integrator.provisional_interval_count,
+            localized_root_count=integrator.localized_root_count,
+            topology_invalidation_count=integrator.topology_invalidation_count,
+            completed_global_step_count=integrator.completed_global_step_count,
+            last_global_step_event_count=integrator.last_global_step_event_count,
+        )
+        (runtime_state, copy(integrator.surface_fired), length(integrator.occurrences),
+            _emt_task_scheduler_checkpoint(integrator.scheduler), integrator.workspace.ready,
+            integrator.workspace.evaluation_count)
+    end
+    transaction === nothing || begin_emt_step_transaction!(transaction)
     try
-        return _advance_emt_hybrid_step_impl!(integrator)
+        result = _advance_emt_hybrid_step_impl!(integrator)
+        transaction === nothing || commit_emt_step_transaction!(transaction)
+        return result
     catch error
         integrator.last_failure = sprint(showerror, error)
         _emt_hybrid_restore_if_active!(integrator)
+        if transaction !== nothing
+            emt_step_transaction_status(transaction).active &&
+                restore_emt_step_transaction!(transaction)
+            state, fired, occurrences, scheduler, ready, evaluations = saved
+            for (field, value) in pairs(state)
+                setfield!(integrator, field, value)
+            end
+            copyto!(integrator.surface_fired, fired)
+            resize!(integrator.occurrences, occurrences)
+            _restore_emt_task_scheduler!(integrator.scheduler, scheduler)
+            integrator.workspace.ready = ready
+            integrator.workspace.evaluation_count = evaluations
+        end
         rethrow()
     end
 end
