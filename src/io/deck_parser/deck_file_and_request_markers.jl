@@ -794,7 +794,17 @@ function parse_deck_lines(
            fixed_miscellaneous_control_count == 2 &&
            isempty(result.elements) &&
            fixed_card_miscellaneous_control_candidate(tokens)
-            parse_fixed_card_miscellaneous_control!(result, tokens, line_no)
+            if deck_output_schedule_options(result).energization_count < 0
+                itest = fixed_int_or_default!(result, fixed_image(line), line_no, 9, 16, "SYSTEMATIC ITEST", 0)
+                if itest in (0, 1)
+                    record_control_card!(result, :systematic_switch_options, [string(itest)], line_no)
+                elseif itest !== nothing
+                    add_issue!(result.validation, invalid_value("line $line_no",
+                        "SYSTEMATIC ITEST must be 0 or 1"))
+                end
+            else
+                parse_fixed_card_miscellaneous_control!(result, tokens, line_no)
+            end
             fixed_miscellaneous_control_count += 1
             continue
         end

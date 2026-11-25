@@ -82,6 +82,8 @@ function push_bpa_fixed_switch_time_row!(
     output_code::Int=0,
     critical_current_a::Real=0.0,
     random_opening_standard_deviation_s::Real=0.0,
+    systematic_close_count::Int=0,
+    systematic_close_spacing_s::Float64=0.0,
 )::Bool
     if switch_type ∉ (0, 76)
         blocker = switch_type in (11, 12, 13) ?
@@ -126,7 +128,7 @@ function push_bpa_fixed_switch_time_row!(
         string(closed_marker, normalized_marker_text) == "MEASURING"
     initially_closed = measuring_marker || closed_marker == "CLOSED" || close_time < 0.0
     accepted_close_time = (measuring_marker || close_time < 0.0) ? 0.0 : close_time
-    accepted_open_time = measuring_marker ? Inf : open_time
+    accepted_open_time = measuring_marker || systematic_close_count > 0 ? Inf : open_time
     name = bpa_fixed_owner_name(result, "switch")
     element_count_before = length(result.elements)
     parse_time_switch!(
@@ -174,6 +176,8 @@ function push_bpa_fixed_switch_time_row!(
                     random_opening_standard_deviation,
                     switch.on_conductance,
                     switch.off_conductance,
+                    systematic_close_count,
+                    systematic_close_spacing_s,
                 ),
             )
         end
@@ -722,6 +726,27 @@ function parse_bpa_fixed_switch_card!(result::DeckParseResult, line::AbstractStr
                    missing_data("line $line_no", "expected OVER5 fixed-field switch bus names in columns 3-14"))
         return true
     end
+    systematic_count = 0
+    systematic_spacing_s = 0.0
+    if uppercase(closed_text * marker_text) == "SYSTEMATIC"
+        samples = fixed_float_field!(result, image, line_no, 35, 44, "SYSTEMATIC close count")
+        option = fixed_float_or_default!(result, image, line_no, 45, 54, "SYSTEMATIC open option", 0.0)
+        (samples === nothing || option === nothing) && return true
+        if switch_type != 0 || !iszero(option) || !isempty(fixed_field(image, 65, 76)) ||
+           deck_output_schedule_options(result).energization_count >= 0
+            add_issue!(result.validation, unknown_field("line $line_no",
+                "SYSTEMATIC input requires an independent type-0 switch close and negative energization count"))
+            return true
+        end
+        if !(isfinite(samples) && isinteger(samples) && 1 <= samples < typemax(Int) &&
+             isfinite(open_time) && open_time >= 0.0 && isfinite(close_time) && close_time >= 0.0)
+            add_issue!(result.validation, invalid_value("line $line_no",
+                "SYSTEMATIC close requires a positive integer count and finite nonnegative center and spacing"))
+            return true
+        end
+        systematic_count = Int(samples)
+        systematic_spacing_s = open_time
+    end
     return push_bpa_fixed_switch_time_row!(
         result,
         switch_type,
@@ -733,6 +758,8 @@ function parse_bpa_fixed_switch_card!(result::DeckParseResult, line::AbstractStr
         line_no,
         initial_issues,
         marker_text = marker_text,
+        systematic_close_count = systematic_count,
+        systematic_close_spacing_s = systematic_spacing_s,
         output_code = output_code,
         critical_current_a = critical_current,
         random_opening_standard_deviation_s =

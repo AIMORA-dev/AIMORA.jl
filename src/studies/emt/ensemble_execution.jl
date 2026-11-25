@@ -246,6 +246,41 @@ function _ensemble_rule_time(
     return max(time, 0.0)
 end
 
+function _deck_systematic_switch_schedules(parsed::DeckParser.DeckParseResult, run_count::Int)
+    rows = filter(row -> row.systematic_close_count > 0, DeckParser.deck_over5_switch_rows(parsed))
+    1 <= length(rows) <= 10 ||
+        throw(ArgumentError("SYSTEMATIC switching requires one to ten independent switches"))
+    count_product = foldl(Base.Checked.checked_mul, (row.systematic_close_count for row in rows); init=1)
+    run_count == count_product || throw(ArgumentError(
+        "SYSTEMATIC energization count $run_count differs from independent switch count product $count_product",
+    ))
+    options = filter(card -> card.kind == :systematic_switch_options, parsed.control_cards)
+    length(options) == 1 || throw(ArgumentError("SYSTEMATIC switching requires its statistics controls"))
+    starts_at_center = only(only(options).tokens) == "1"
+    origins = [row.close_time_s - (starts_at_center ? 0.0 :
+        0.5 * (row.systematic_close_count - 1) * row.systematic_close_spacing_s) for row in rows]
+    all(x -> x >= 0.0, origins) ||
+        throw(ArgumentError("SYSTEMATIC switch sweep contains a negative close time"))
+
+    # The first independent switch carries after all other counters. The
+    # remaining counters advance in card order, starting with switch two.
+    names = [row.name for row in rows]
+    events = fill(:close, length(rows))
+    axis_order = [collect(2:length(rows)); 1]
+    schedules = EMTSwitchEventSchedule[]
+    for run in 1:run_count
+        index = run - 1
+        times = copy(origins)
+        for axis in axis_order
+            count = rows[axis].systematic_close_count
+            index, offset = divrem(index, count)
+            times[axis] += offset * rows[axis].systematic_close_spacing_s
+        end
+        push!(schedules, EMTSwitchEventSchedule(run, copy(names), copy(events), times, true))
+    end
+    return schedules
+end
+
 function emt_switch_schedules(
     parsed::DeckParser.DeckParseResult;
     energization_count::Union{Nothing,Integer} = nothing,
@@ -257,6 +292,13 @@ function emt_switch_schedules(
     seed >= 0 ||
         throw(ArgumentError("EMT ensemble seed must be nonnegative"))
     deck_count = DeckParser.deck_output_schedule_options(parsed).energization_count
+    if deck_count < 0
+        isempty(timing_rules) || throw(ArgumentError("SYSTEMATIC deck timings cannot be overridden"))
+        run_count = Base.Checked.checked_neg(deck_count)
+        (energization_count === nothing || energization_count == run_count) ||
+            throw(ArgumentError("SYSTEMATIC energization count cannot override the deck count"))
+        return _deck_systematic_switch_schedules(parsed, run_count)
+    end
     run_count = energization_count === nothing ? deck_count : Int(energization_count)
     run_count > 0 ||
         throw(ArgumentError("EMT ensemble energization_count must be positive"))
