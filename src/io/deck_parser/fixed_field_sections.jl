@@ -85,6 +85,7 @@ function push_bpa_fixed_switch_time_row!(
     systematic_close_count::Int=0,
     systematic_close_spacing_s::Float64=0.0,
     systematic_reference_switch::Union{Nothing,Symbol}=nothing,
+    systematic_target::Bool=false,
 )::Bool
     if switch_type ∉ (0, 76)
         blocker = switch_type in (11, 12, 13) ?
@@ -183,6 +184,7 @@ function push_bpa_fixed_switch_time_row!(
                     systematic_close_count,
                     systematic_close_spacing_s,
                     systematic_reference_switch,
+                    systematic_target,
                 ),
             )
         end
@@ -734,6 +736,7 @@ function parse_bpa_fixed_switch_card!(result::DeckParseResult, line::AbstractStr
     systematic_count = 0
     systematic_spacing_s = 0.0
     systematic_reference = nothing
+    systematic_target = false
     if uppercase(closed_text * marker_text) == "SYSTEMATIC"
         option = fixed_float_or_default!(result, image, line_no, 45, 54, "SYSTEMATIC open option", 0.0)
         option === nothing && return true
@@ -745,7 +748,13 @@ function parse_bpa_fixed_switch_card!(result::DeckParseResult, line::AbstractStr
         end
         reference_from = fixed_field(image, 65, 70)
         reference_to = fixed_field(image, 71, 76)
-        if isempty(reference_from) && isempty(reference_to)
+        systematic_target = reference_from == "TARGET" && isempty(reference_to)
+        if systematic_target && any(row -> row.systematic_target, result.over5_switch_rows)
+            add_issue!(result.validation, invalid_value("line $line_no",
+                "SYSTEMATIC switching admits one TARGET reference"))
+            return true
+        end
+        if systematic_target || (isempty(reference_from) && isempty(reference_to))
             samples = fixed_float_field!(result, image, line_no, 35, 44, "SYSTEMATIC close count")
             samples === nothing && return true
             if !(isfinite(samples) && isinteger(samples) && 1 <= samples < typemax(Int) &&
@@ -789,6 +798,7 @@ function parse_bpa_fixed_switch_card!(result::DeckParseResult, line::AbstractStr
         systematic_close_count = systematic_count,
         systematic_close_spacing_s = systematic_spacing_s,
         systematic_reference_switch = systematic_reference,
+        systematic_target = systematic_target,
         output_code = output_code,
         critical_current_a = critical_current,
         random_opening_standard_deviation_s =

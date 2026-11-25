@@ -282,11 +282,20 @@ function _deck_systematic_switch_schedules(parsed::DeckParser.DeckParseResult, r
     references = [row.systematic_reference_switch === nothing ?
         0 : positions[row.systematic_reference_switch] for row in rows]
     dependent = findall(!iszero, references)
+    target = findfirst(row -> row.systematic_target, rows)
     origins = zeros(length(rows))
     for axis in independent
         row = rows[axis]
         origins[axis] = row.close_time_s - (starts_at_center ? 0.0 :
             0.5 * (row.systematic_close_count - 1) * row.systematic_close_spacing_s)
+    end
+    if target !== nothing
+        for axis in independent
+            axis == target && continue
+            row = rows[axis]
+            origins[axis] = origins[target] +
+                (0.5 - 0.5 * row.systematic_close_count) * row.systematic_close_spacing_s
+        end
     end
     for axis in dependent
         origins[axis] = origins[references[axis]] + rows[axis].raw_close_time_s
@@ -294,18 +303,29 @@ function _deck_systematic_switch_schedules(parsed::DeckParser.DeckParseResult, r
     all(x -> isfinite(x) && x >= 0.0, origins) ||
         throw(ArgumentError("SYSTEMATIC switch sweep contains an invalid close time"))
 
-    # The first independent switch carries after all other counters. The
-    # remaining counters advance in card order, starting with switch two.
+    # OVER12 advances the target counter last, or the first independent counter
+    # when there is no target. The other counters advance in card order.
     events = fill(:close, length(rows))
-    axis_order = [independent[2:end]; first(independent)]
+    slowest_axis = target === nothing ? first(independent) : target
+    axis_order = [[axis for axis in independent if axis != slowest_axis]; slowest_axis]
     schedules = EMTSwitchEventSchedule[]
     for run in 1:run_count
         index = run - 1
         times = copy(origins)
+        offsets = zeros(Int, length(rows))
         for axis in axis_order
             count = rows[axis].systematic_close_count
-            index, offset = divrem(index, count)
-            times[axis] += offset * rows[axis].systematic_close_spacing_s
+            index, offsets[axis] = divrem(index, count)
+            times[axis] += offsets[axis] * rows[axis].systematic_close_spacing_s
+        end
+        if target !== nothing
+            for axis in independent
+                axis == target && continue
+                row = rows[axis]
+                times[axis] = times[target] +
+                    (offsets[axis] + 0.5 - 0.5 * row.systematic_close_count) *
+                    row.systematic_close_spacing_s
+            end
         end
         for axis in dependent
             times[axis] = times[references[axis]] + rows[axis].raw_close_time_s

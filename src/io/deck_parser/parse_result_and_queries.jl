@@ -1644,6 +1644,7 @@ struct DeckOVER5SwitchRow
     systematic_close_count::Int
     systematic_close_spacing_s::Float64
     systematic_reference_switch::Union{Nothing,Symbol}
+    systematic_target::Bool
 end
 
 function DeckOVER5SwitchRow(
@@ -1656,7 +1657,7 @@ function DeckOVER5SwitchRow(
         name, from_node, to_node, from_node_value, to_node_value, line_no, switch_type,
         output_code, layout_kind, raw_close_time_s, raw_open_time_s, close_time_s, open_time_s,
         initially_closed, measuring, closed_marker, marker_text, critical_current_a,
-        random_opening_standard_deviation_s, on_conductance, off_conductance, 0, 0.0, nothing,
+        random_opening_standard_deviation_s, on_conductance, off_conductance, 0, 0.0, nothing, false,
     )
 end
 
