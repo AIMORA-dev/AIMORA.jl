@@ -7,6 +7,7 @@ export EMTSwitchTimingRule,
        EMTEnsembleRunResult,
        EMTEnsembleChannelStatistics,
        EMTEnsembleResult,
+       EMTPeakVoltageDistribution,
        emt_switch_schedules,
        run_deck_emt_ensemble
 
@@ -118,6 +119,19 @@ struct EMTEnsembleChannelStatistics
     preferred_distribution::Symbol
 end
 
+struct EMTPeakVoltageDistribution
+    nodes::Vector{Symbol}
+    base_voltage_v::Float64
+    signed_peak_samples_v::Vector{Float64}
+    lower_bin_edges_pu::Vector{Float64}
+    counts::Vector{Int}
+    cumulative_counts::Vector{Int}
+    ungrouped_mean_pu::Float64
+    ungrouped_sample_variance_pu2::Union{Nothing,Float64}
+    grouped_mean_pu::Float64
+    grouped_sample_variance_pu2::Union{Nothing,Float64}
+end
+
 struct EMTEnsembleResult
     source::String
     seed::UInt64
@@ -131,6 +145,7 @@ struct EMTEnsembleResult
     extrema_recomputed::Bool
     complete_emt_path::Bool
     physical_checks_passed::Bool
+    peak_voltage_distributions::Vector{EMTPeakVoltageDistribution}
 end
 
 function _ensemble_switch_rows_by_name(parsed::DeckParser.DeckParseResult)
@@ -511,6 +526,74 @@ function _ensemble_channel_statistics(
     )
 end
 
+function _peak_voltage_distribution(nodes, base, samples, increment, limit)
+    magnitudes = abs.(samples) ./ base
+    raw_indices = magnitudes ./ increment .+ 1.0
+    maximum(raw_indices) < limit + 1.0 ||
+        throw(ArgumentError("peak voltage is outside the statistics bin range"))
+    indices = trunc.(Int, raw_indices)
+    counts = zeros(Int, maximum(indices))
+    for index in indices
+        counts[index] += 1
+    end
+    edges = increment .* (0:(length(counts) - 1))
+    grouped = edges[indices]
+    has_variance = length(samples) > 1
+    return EMTPeakVoltageDistribution(
+        nodes, base, samples, edges, counts, cumsum(counts),
+        mean(magnitudes), has_variance ? var(magnitudes) : nothing,
+        mean(grouped), has_variance ? var(grouped) : nothing,
+    )
+end
+
+function _fixed_peak_voltage_distributions(parsed, node_names, runs)
+    distributions = EMTPeakVoltageDistribution[]
+    requests = filter(card -> card.kind == :fixed_voltage_statistics_request, parsed.control_cards)
+    isempty(requests) && return distributions
+    increment, maximum_voltage = 0.05, 2.0
+    for card in parsed.control_cards
+        card.kind == :fixed_statistics_bins || continue
+        increment_input, maximum_input = DeckParser.tryparse_deck_float.(card.tokens)
+        (increment_input === nothing || maximum_input === nothing) &&
+            throw(ArgumentError("invalid peak voltage bin options at line $(card.line_no)"))
+        iszero(increment_input) || (increment = increment_input)
+        iszero(maximum_input) || (maximum_voltage = abs(maximum_input))
+    end
+    increment >= 55.0 && (increment -= 55.0)
+    iszero(increment) && (increment = 0.05)
+    limit = 5.0 * maximum_voltage / increment + 1.0
+    isfinite(limit) && 1.0 <= limit < typemax(Int) && increment > 0.0 ||
+        throw(ArgumentError("peak voltage statistics require a positive fixed bin width and range"))
+    voltage_outputs = DeckParser.deck_over16_output_node_names(parsed)
+    for request in requests
+        base = parse(Float64, request.tokens[1])
+        nodes = Symbol.(request.tokens[2:end])
+        peaks = Vector{Float64}[]
+        for node in nodes
+            node in voltage_outputs || throw(ArgumentError("statistics voltage node $node requires a node voltage output request"))
+            index = findfirst(==(node), node_names)
+            index === nothing && throw(ArgumentError("unknown statistics voltage node $node"))
+            samples = map(runs) do run
+                upper = run.node_maximum_values[index]
+                lower = run.node_minimum_values[index]
+                abs(lower) > abs(upper) ? lower : upper
+            end
+            push!(peaks, samples)
+            push!(distributions, _peak_voltage_distribution(
+                [node], base, samples, increment, trunc(Int, limit),
+            ))
+        end
+        if length(nodes) > 1
+            aggregate = reduce((left, right) ->
+                map((x, y) -> abs(y) > abs(x) ? y : x, left, right), peaks)
+            push!(distributions, _peak_voltage_distribution(
+                nodes, base, aggregate, increment, trunc(Int, limit),
+            ))
+        end
+    end
+    return distributions
+end
+
 function _ensemble_replay_signature(
     schedules::Vector{EMTSwitchEventSchedule},
 )
@@ -638,5 +721,6 @@ function run_deck_emt_ensemble(
         extrema_checks,
         complete_path,
         dependency_checks && extrema_checks && complete_path,
+        _fixed_peak_voltage_distributions(parsed, node_names, runs),
     )
 end

@@ -723,9 +723,17 @@ function parse_deck_lines(
                 section_marker.kind == :fixed_card_source_section_end &&
                 fixed_source_load_flow_requested ?
                 :fixed_source_load_flow : section_marker.next_section
+            if section_marker.kind == :fixed_card_plot_section_end &&
+               deck_output_schedule_options(result).energization_count < 0
+                active_section = :blank_statistics
+            end
             fixed_saturated_transformer_intake_active = false
             fixed_branch_vintage_mode = 0
             fixed_card_kc_lee_transform_active = false
+            continue
+        end
+        if active_section == :blank_statistics
+            parse_fixed_voltage_statistics_request!(result, line, line_no)
             continue
         end
         if active_section == :fixed_source_load_flow
@@ -795,6 +803,7 @@ function parse_deck_lines(
            isempty(result.elements) &&
            fixed_card_miscellaneous_control_candidate(tokens)
             if deck_output_schedule_options(result).energization_count < 0
+                record_fixed_statistics_bins!(result, line, line_no)
                 itest = fixed_int_or_default!(result, fixed_image(line), line_no, 9, 16, "SYSTEMATIC ITEST", 0)
                 if itest in (0, 1)
                     record_control_card!(result, :systematic_switch_options, [string(itest)], line_no)
@@ -1515,12 +1524,37 @@ function fixed_card_section_marker(tokens)
         return (kind = :fixed_card_switch_section_end, next_section = :blank_source)
     elseif "source" in tail || "sources" in tail
         return (kind = :fixed_card_source_section_end, next_section = :blank_initial_condition_or_output)
+    elseif "statistics" in tail
+        return (kind = :fixed_card_statistics_section_end, next_section = nothing)
     elseif "output" in tail || "outputs" in tail || "requests" in tail
         return (kind = :fixed_card_output_section_end, next_section = :blank_plot)
     elseif "plot" in tail || "plots" in tail
         return (kind = :fixed_card_plot_section_end, next_section = nothing)
     end
     return nothing
+end
+
+function parse_fixed_voltage_statistics_request!(result, line, line_no)
+    image = fixed_image(line)
+    option = fixed_int_or_default!(result, image, line_no, 1, 2, "statistics output option", 0)
+    base = fixed_float_or_default!(result, image, line_no, 3, 14, "statistics voltage base", 0.0)
+    (option === nothing || base === nothing) && return
+    raw_base = fixed_field(image, 3, 14)
+    !occursin('.', raw_base) && (base *= 0.001) # OVER29 uses E12.3.
+    nodes = filter!(!isempty, [fixed_field(image, col, col + 5) for col in 15:6:75])
+    if option != 0 || !isfinite(base) || base <= 0.0 || isempty(nodes) || "CONT." in nodes
+        add_issue!(result.validation, invalid_value("line $line_no",
+            "statistics output requires option 0, an explicit positive voltage base, and named nodes"))
+        return
+    end
+    record_control_card!(result, :fixed_voltage_statistics_request, [string(base); nodes], line_no)
+end
+
+function record_fixed_statistics_bins!(result, line, line_no)
+    image = fixed_image(line)
+    fields = [fixed_field(image, 25, 32), fixed_field(image, 33, 40)]
+    return record_control_card!(result, :fixed_statistics_bins,
+        [isempty(field) ? "0" : field for field in fields], line_no)
 end
 
 function fixed_card_short_section_marker(current_section, tokens)
