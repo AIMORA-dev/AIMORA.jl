@@ -706,3 +706,84 @@ end
         end
     end
 end
+@testset "semiconductor work follows the admitted integration method" begin
+    for (method,expected_energy) in ((:BackwardEulerCompanion,0.4),(:TrapezoidalCompanion,0.65))
+        fidelity = AIMORA.Nonlinear.PowerSemiconductorExtendedFidelity(
+            thermal=AIMORA.Nonlinear.CauerThermalFidelity([1.0],[1.0]))
+        device = AIMORA.Nonlinear.DiodeValveSwitch(1,0;on_conductance=1.0,
+            off_conductance=1.0,extended_fidelity=fidelity)
+        # Unit conductance: v=i. A backward-Euler substep uses the right-limit
+        # endpoint power 2*2 W; trapezoidal retains both 3*3 and 2*2 W samples.
+        fidelity.previous_terminal_voltage_v = 3.0
+        fidelity.previous_terminal_current_a = 3.0
+        device.previous_semiconductor_loss_w = 9.0
+        device.last_semiconductor_loss_w = 9.0
+        step = 0.1
+        prepare_nonlinear_device_step!(device,step,step,method)
+        current,jacobian = zeros(2),zeros(2,2)
+        nonlinear_current_jacobian!(current,jacobian,device,[2.0,0.0],step)
+        @test current == [2.0,-2.0]
+        accept_nonlinear_device_state!(device,[2.0,0.0],current,jacobian,step)
+        @test device.semiconductor_dissipated_energy_j ≈ expected_energy atol=1e-15 rtol=0
+        @test fidelity.companion_energy_residual_j ≈ 0.0 atol=1e-15
+        @test device.last_semiconductor_loss_w == 4.0
+        @test fidelity.thermal.cumulative_input_energy_j ≈ 0.4 atol=1e-15
+        finish_nonlinear_device_step!(device)
+        # The baseline retains its established endpoint-average loss in both methods.
+        simple = AIMORA.Nonlinear.DiodeValveSwitch(1,0;on_conductance=1.0,off_conductance=1.0)
+        simple.last_conductance = 1.0
+        simple.previous_semiconductor_loss_w = 9.0
+        integration = method === :BackwardEulerCompanion ?
+            Val(AIMORA.Branches.BackwardEulerCompanion) : Val(AIMORA.Branches.TrapezoidalCompanion)
+        AIMORA.Branches.update!(simple,[2.0],step,integration)
+        @test simple.semiconductor_dissipated_energy_j ≈ 0.65 atol=1e-15 rtol=0
+    end
+end
+
+@testset "Backward-Euler signed channel work is separate from heat" begin
+    models = AIMORA.Nonlinear
+    fidelity = models.PowerSemiconductorExtendedFidelity(
+        thermal=models.CauerThermalFidelity([1.0], [1.0]),
+    )
+    device = models.DiodeValveSwitch(
+        1, 0; on_conductance=1.0, initially_closed=true,
+        forward_voltage_drop_v=3.0, extended_fidelity=fidelity,
+    )
+    models.power_semiconductor_event_localization!(device)
+    voltage = [2.0, 0.0]
+    current, jacobian = zeros(2), zeros(2, 2)
+    prepare_nonlinear_device_step!(device, 0.1, 0.1, :BackwardEulerCompanion)
+    nonlinear_current_jacobian!(current, jacobian, device, voltage, 0.1)
+    @test current == [-1.0, 1.0]
+    accept_nonlinear_device_state!(device, voltage, current, jacobian, 0.1)
+    @test fidelity.companion_energy_residual_j ≈ -0.2 atol=1e-15
+    @test device.semiconductor_dissipated_energy_j == 0.0
+    @test fidelity.thermal.cumulative_input_energy_j == 0.0
+    finish_nonlinear_device_step!(device)
+end
+
+@testset "Backward-Euler channel work excludes the owned RC snubber" begin
+    models = AIMORA.Nonlinear
+    snubber = models.SeriesRCSnubber(1.0, 1.0)
+    fidelity = models.PowerSemiconductorExtendedFidelity(
+        thermal=models.CauerThermalFidelity([1.0], [1.0]),
+    )
+    device = models.DiodeValveSwitch(
+        1, 0; off_conductance=1.0, snubber, extended_fidelity=fidelity,
+    )
+    voltage = [2.0, 0.0]
+    current, jacobian = zeros(2), zeros(2, 2)
+    prepare_nonlinear_device_step!(device, 0.1, 0.1, :BackwardEulerCompanion)
+    nonlinear_current_jacobian!(current, jacobian, device, voltage, 0.1)
+    snubber_current = 2.0 / 1.1
+    @test current[1] ≈ 2.0 + snubber_current atol=1e-15
+    accept_nonlinear_device_state!(device, voltage, current, jacobian, 0.1)
+    @test device.semiconductor_dissipated_energy_j ≈ 0.4 atol=1e-15
+    @test fidelity.thermal.cumulative_input_energy_j ≈ 0.4 atol=1e-15
+    @test snubber.capacitor_voltage_v ≈ 0.1 * snubber_current atol=1e-15
+    @test snubber.dissipated_energy_j ≈ 0.05 * snubber_current^2 atol=1e-15
+    expected_snubber_residual = 0.05 * 2.0 * snubber_current -
+        0.05 * snubber_current^2 - 0.5 * (0.1 * snubber_current)^2
+    @test fidelity.companion_energy_residual_j ≈ expected_snubber_residual atol=1e-15
+    finish_nonlinear_device_step!(device)
+end

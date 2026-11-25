@@ -1896,21 +1896,24 @@ function _accept_power_semiconductor_state!(
         instantaneous_loss_w,
         step_s,
     )
-    device.semiconductor_dissipated_energy_j += 0.5 * step_s * (
-        previous_semiconductor_loss_w + instantaneous_loss_w
-    ) + event_energy_j
-    previous_junction_current_a = junction === nothing ? 0.0 :
-        previous_displacement_current_a
-    channel_work_j = 0.5 * step_s * (
-        previous_terminal_voltage_v * (
-            previous_terminal_current_a - previous_junction_current_a -
-            previous_snubber_current_a
-        ) +
-        voltage_v * (channel_current_a + tail_current_a)
-    )
-    semiconductor_energy_increment_j = 0.5 * step_s * (
-        previous_semiconductor_loss_w + instantaneous_loss_w
-    ) + event_energy_j
+    right_channel_power_w = voltage_v * (channel_current_a + tail_current_a)
+    if fidelity.candidate_method === :backward_euler
+        channel_work_j = step_s * right_channel_power_w
+        semiconductor_energy_increment_j = step_s * instantaneous_loss_w + event_energy_j
+    else
+        previous_junction_current_a = junction === nothing ? 0.0 :
+            previous_displacement_current_a
+        channel_work_j = 0.5 * step_s * (
+            previous_terminal_voltage_v * (
+                previous_terminal_current_a - previous_junction_current_a -
+                previous_snubber_current_a
+            ) + right_channel_power_w
+        )
+        semiconductor_energy_increment_j = 0.5 * step_s * (
+            previous_semiconductor_loss_w + instantaneous_loss_w
+        ) + event_energy_j
+    end
+    device.semiconductor_dissipated_energy_j += semiconductor_energy_increment_j
     fidelity.companion_energy_residual_j +=
         channel_work_j - semiconductor_energy_increment_j
     if device.snubber !== nothing
