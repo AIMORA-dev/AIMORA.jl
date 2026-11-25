@@ -767,9 +767,18 @@ function power_semiconductor_gate_transition_residual(
     return transition_time_s - Float64(time_s)
 end
 
+struct _SemiconductorEventLookupCapture
+    device_indices::IdDict{PowerSemiconductorSwitch,Int}
+    interval_start_s::Float64
+    interval_end_s::Float64
+    maximum_records::Int
+    records::Vector{PowerSemiconductorEventLookup}
+end
+
 function _apply_power_semiconductor_gate_event!(
     device::PowerSemiconductorSwitch,
-    time_s::Real,
+    time_s::Real;
+    event_lookups::Union{Nothing,_SemiconductorEventLookupCapture}=nothing,
 )
     fidelity = something(device.extended_fidelity)
     fidelity.pending_event_current_a = abs(device.last_forward_current_a)
@@ -780,7 +789,9 @@ function _apply_power_semiconductor_gate_event!(
         device,
         device.last_voltage,
         device.last_forward_current_a,
-        Float64(time_s),
+        Float64(time_s);
+        event_lookups,
+        accepted_side=:localized_boundary,
     )
     device.semiconductor_dissipated_energy_j += event_energy_j
     return device
@@ -1662,7 +1673,9 @@ function _deposit_power_semiconductor_switching_energy!(
     device::PowerSemiconductorSwitch,
     voltage_v::Float64,
     current_a::Float64,
-    time_s::Float64,
+    time_s::Float64;
+    event_lookups::Union{Nothing,_SemiconductorEventLookupCapture}=nothing,
+    accepted_side::Symbol,
 )
     fidelity = something(device.extended_fidelity)
     energy_table = fidelity.switching_energy
@@ -1680,12 +1693,13 @@ function _deposit_power_semiconductor_switching_energy!(
         fidelity.pending_event_current_a : abs(current_a)
     interpolation_voltage_v = event_kind in (:turn_on, :turn_off) ?
         fidelity.pending_event_blocking_voltage_v : abs(voltage_v)
+    temperature_k = _power_semiconductor_switching_temperature_k(fidelity)
     event_energy_j = power_semiconductor_switching_energy(
         energy_table,
         event_kind,
         interpolation_current_a,
         interpolation_voltage_v,
-        _power_semiconductor_switching_temperature_k(fidelity),
+        temperature_k,
     )
     if event_kind === :turn_on
         energy_table.cumulative_turn_on_energy_j += event_energy_j
@@ -1701,6 +1715,18 @@ function _deposit_power_semiconductor_switching_energy!(
     energy_table.last_event_energy_j = event_energy_j
     fidelity.thermal === nothing ||
         _deposit_cauer_event_energy!(fidelity.thermal, event_energy_j)
+    if event_lookups !== nothing
+        records = event_lookups.records
+        length(records) < event_lookups.maximum_records || error(
+            "semiconductor lookup count exceeded the accepted interval bound",
+        )
+        push!(records, PowerSemiconductorEventLookup(
+            event_lookups.device_indices[device], event_kind, time_s, accepted_side,
+            event_lookups.interval_start_s, event_lookups.interval_end_s,
+            length(records) + 1, interpolation_current_a, interpolation_voltage_v,
+            temperature_k, event_energy_j,
+        ))
+    end
     return event_energy_j
 end
 
@@ -1711,6 +1737,7 @@ function _accept_power_semiconductor_state!(
     time_s::Float64,
     terminal_jacobian_s::Union{Nothing,AbstractMatrix{Float64}};
     event_probe::Bool=false,
+    event_lookups::Union{Nothing,_SemiconductorEventLookupCapture}=nothing,
 )
     fidelity = something(device.extended_fidelity)
     fidelity.candidate_prepared || throw(ArgumentError(
@@ -1882,7 +1909,9 @@ function _accept_power_semiconductor_state!(
        device.topology_transition_count > energy_table.last_event_transition_count &&
        device.last_transition_time_s < time_s
         left_event_energy_j = _deposit_power_semiconductor_switching_energy!(
-            device, voltage_v, channel_current_a, device.last_transition_time_s,
+            device, voltage_v, channel_current_a, device.last_transition_time_s;
+            event_lookups,
+            accepted_side=:interval_left,
         )
     end
     if !device.event_localization_enabled
@@ -1932,7 +1961,9 @@ function _accept_power_semiconductor_state!(
         device,
         voltage_v,
         channel_current_a,
-        time_s,
+        time_s;
+        event_lookups,
+        accepted_side=:interval_right,
     )
     semiconductor_energy_increment_j = continuous_heat_j + left_event_energy_j + event_energy_j
     device.semiconductor_dissipated_energy_j += semiconductor_energy_increment_j

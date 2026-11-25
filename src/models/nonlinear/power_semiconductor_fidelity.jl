@@ -1002,3 +1002,18 @@ end
 """View an existing version-1 physical result with provenance explicitly unavailable."""
 power_semiconductor_extended_result(state::PowerSemiconductorExtendedState) =
     PowerSemiconductorExtendedResult(2, state, nothing, nothing)
+
+"""One committed energy-map lookup in an accepted network interval, in SI units."""
+struct PowerSemiconductorEventLookup
+    device_index::Int
+    event_kind::Symbol
+    event_time_s::Float64
+    accepted_side::Symbol
+    interval_start_s::Float64
+    interval_end_s::Float64
+    order::Int
+    current_magnitude_a::Float64
+    blocking_voltage_magnitude_v::Float64
+    pre_impulse_temperature_k::Float64
+    energy_j::Float64
+end
