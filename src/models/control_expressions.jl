@@ -178,6 +178,7 @@ mutable struct _ControlExpressionCompiler
     instructions::Vector{ControlExpressionInstruction}
     input_names::Vector{Symbol}
     bpa_factor_arithmetic::Bool
+    bpa_random_sites::Int
 end
 
 _control_expression_current(compiler::_ControlExpressionCompiler) =
@@ -337,13 +338,19 @@ function _parse_control_expression_primary!(compiler::_ControlExpressionCompiler
                 :bpa_uniform_random : get(_CONTROL_EXPRESSION_FUNCTIONS, token.text, nothing)
             operation === nothing &&
                 throw(ArgumentError("unknown control-expression function $(token.text)"))
+            site = compiler.bpa_random_sites
+            if operation == :bpa_uniform_random
+                # CSUP scans function tokens from right to left, including nested arguments.
+                compiler.bpa_random_sites += 1
+            end
             _parse_control_expression_or!(compiler)
             _control_expression_accept!(compiler, :close) ||
                 throw(ArgumentError("control-expression function $(token.text) lacks a closing parenthesis"))
             if compiler.bpa_factor_arithmetic
                 operation = get(_BPA_CONTROL_EXPRESSION_INTRINSICS, operation, operation)
             end
-            _control_expression_emit!(compiler, operation)
+            _control_expression_emit!(compiler, operation;
+                value = operation == :bpa_uniform_random ? Float64(site) : 0.0)
         else
             name = Symbol(token.text)
             name in compiler.input_names || push!(compiler.input_names, name)
@@ -401,6 +408,7 @@ function compile_control_expression(
         ControlExpressionInstruction[],
         Symbol[],
         bpa_factor_arithmetic,
+        0,
     )
     _parse_control_expression_or!(compiler)
     trailing = _control_expression_current(compiler)
@@ -563,6 +571,12 @@ function evaluate_control_expression!(
     values::AbstractDict{Symbol,<:Real};
     bpa_random_stream::Union{Nothing,Ref{Int64}} = nothing,
 )
+    draw_count = runtime.random_draw_count
+    if draw_count > 0 && bpa_random_stream === nothing
+        throw(ArgumentError("RAN requires a fixed-card BPA timestep random stream"))
+    end
+    indexed_draws = draw_count > 1 ?
+        [_next_bpa_control_random!(bpa_random_stream) for _ in 1:draw_count] : nothing
     stack_index = 0
     for instruction in runtime.program.instructions
         operation = instruction.operation
@@ -583,10 +597,9 @@ function evaluate_control_expression!(
         else
             stack_index >= 1 || throw(ArgumentError("control-expression stack underflow"))
             if operation == :bpa_uniform_random
-                bpa_random_stream === nothing && throw(ArgumentError(
-                    "RAN requires a fixed-card BPA timestep random stream",
-                ))
-                runtime.stack[stack_index] = _next_bpa_control_random!(bpa_random_stream)
+                runtime.stack[stack_index] = indexed_draws === nothing ?
+                    _next_bpa_control_random!(bpa_random_stream) :
+                    indexed_draws[draw_count - Int(instruction.value)]
             else
                 runtime.stack[stack_index] =
                     _control_expression_unary(operation, runtime.stack[stack_index])

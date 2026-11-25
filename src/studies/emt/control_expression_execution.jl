@@ -2,27 +2,36 @@ function _deck_control_system_expression_runtimes(
     parsed::DeckParser.DeckParseResult,
     state::ControlSystemExecutionState,
 )
-    runtimes = ControlExpressionRuntime[]
-    for row in DeckParser.deck_control_system_expression_rows(parsed)
+    rows = DeckParser.deck_control_system_expression_rows(parsed)
+    runtimes = map(rows) do row
         program = compile_control_expression(
             row.name, row.expression; bpa_factor_arithmetic = true,
         )
-        for input_name in program.input_names
-            haskey(state.values, input_name) ||
-                throw(ArgumentError(
-                    "control expression $(row.name) on line $(row.line_no) references unknown signal $input_name",
-                ))
-        end
-        runtime = ControlExpressionRuntime(program)
-        runtime.random_draw_count <= 1 || throw(ArgumentError(
-            "multiple RAN calls in one BPA expression require legacy operand evaluation order",
-        ))
-        if runtime.random_draw_count > 0 &&
-           DeckParser.deck_output_schedule_options(parsed).energization_count != 0
+        return ControlExpressionRuntime(program)
+    end
+    if any(runtime -> runtime.random_draw_count > 0, runtimes)
+        DeckParser.deck_output_schedule_options(parsed).energization_count == 0 ||
             throw(ArgumentError("TACS RAN with statistical energization requires a shared switching stream"))
+        # An output's reserved initial slot does not make its producing expression ready.
+        pending_outputs = Set(runtime.program.output_name for runtime in runtimes)
+        for runtime in runtimes
+            program = runtime.program
+            for name in program.input_names
+                name in pending_outputs || continue
+                throw(ArgumentError(
+                    "TACS RAN requires producers before consumers: $(program.output_name) depends on $name",
+                ))
+            end
+            delete!(pending_outputs, program.output_name)
+        end
+    end
+    for (row, runtime) in zip(rows, runtimes)
+        for input_name in runtime.program.input_names
+            haskey(state.values, input_name) || throw(ArgumentError(
+                "control expression $(row.name) on line $(row.line_no) references unknown signal $input_name",
+            ))
         end
         state.values[row.name] = 0.0
-        push!(runtimes, runtime)
     end
     return runtimes
 end

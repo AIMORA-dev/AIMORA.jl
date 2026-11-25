@@ -614,6 +614,13 @@ function run_deck_case_sequence_emt(
     initializations::AbstractDict{<:Integer,<:DeckCaseInitialization}=
         Dict{Int,DeckCaseInitialization}(),
 )
+    if length(sequence.cases) > 1
+        for data_case in sequence.cases
+            rows = DeckParser.deck_control_system_expression_rows(data_case.parsed)
+            any(row -> occursin(r"\bRAN\s*\("i, row.expression), rows) || continue
+            throw(ArgumentError("TACS RAN across BPA data cases requires a shared case-sequence stream"))
+        end
+    end
     runs = DeckCaseRun[]
     accepted_initialization_reports = Dict{Int,EMTInitializationReport}()
     known_case_indices = Set(data_case.case_index for data_case in sequence.cases)
