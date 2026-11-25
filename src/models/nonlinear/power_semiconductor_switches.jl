@@ -774,6 +774,7 @@ struct _SemiconductorEventLookupCapture
     maximum_records::Int
     records::Vector{PowerSemiconductorEventLookup}
     margins::Union{Nothing,Vector{PowerSemiconductorEventMargins}}
+    resolutions::Union{Nothing,Vector{PowerSemiconductorTimestepResolution}}
 end
 
 function _apply_power_semiconductor_gate_event!(
@@ -1747,6 +1748,30 @@ function _deposit_power_semiconductor_switching_energy!(
     return event_energy_j
 end
 
+function _record_semiconductor_timestep_resolution!(
+    capture, device, component, time_s, step_s, method, evaluated, participation,
+    scale_source, scale_s,
+)
+    participating = participation ∉ (:inactive_zero_clamp, :inactive_tail)
+    # A fused comparison preserves the sign of the stored-input difference at the boundary.
+    meets = scale_s === nothing ? nothing : fma(20.0, step_s, -scale_s) <= 0.0
+    ratio = scale_s === nothing ? nothing : scale_s / step_s
+    push!(capture.resolutions, PowerSemiconductorTimestepResolution(
+        capture.device_indices[device], component, time_s - step_s, time_s, step_s, method,
+        capture.interval_start_s, capture.interval_end_s, evaluated, participating, participation,
+        scale_source, scale_s, ratio, meets,
+    ))
+    return nothing
+end
+
+function _recovered_charge_participation(left_c, right_c, channel_current_a)
+    left_c == 0.0 && right_c == 0.0 && return :inactive_zero_clamp
+    right_c == 0.0 && return :exhausting
+    right_c > left_c && return :charging
+    right_c == left_c && return :stored_charge_balance
+    return channel_current_a < 0.0 ? :reverse_depletion : :relaxing
+end
+
 function _accept_power_semiconductor_state!(
     device::PowerSemiconductorSwitch,
     terminal_voltage_v::AbstractVector{Float64},
@@ -1792,7 +1817,8 @@ function _accept_power_semiconductor_state!(
     channel_current_a, channel_jacobian_s =
         _power_semiconductor_channel_current_jacobian(device, voltage_v)
     tail = fidelity.turn_off_tail
-    evaluated_tail_current_a = if tail !== nothing && tail.active
+    tail_was_active = tail !== nothing && tail.active
+    evaluated_tail_current_a = if tail_was_active
         duration_s = max(0.0, time_s - tail.turn_off_time_s)
         tail.initial_current_a * exp(-duration_s / tail.decay_time_s)
     else
@@ -2007,6 +2033,32 @@ function _accept_power_semiconductor_state!(
     fidelity.previous_terminal_voltage_v = voltage_v
     fidelity.previous_terminal_current_a = current_a
     fidelity.accepted_topology_transition_count = device.topology_transition_count
+    if event_lookups !== nothing && event_lookups.resolutions !== nothing
+        method = fidelity.candidate_method
+        if recovery !== nothing
+            participation = _recovered_charge_participation(
+                recovery.previous_stored_charge_c, recovery.stored_charge_c, channel_current_a,
+            )
+            _record_semiconductor_timestep_resolution!(
+                event_lookups, device, :recovered_charge, time_s, step_s, method,
+                true, participation, :declared_recovery_lifetime, recovery.lifetime_s,
+            )
+        end
+        if tail !== nothing
+            participation = !tail_was_active ? :inactive_tail :
+                evaluated_tail_current_a <= tail.cutoff_current_a ? :active_to_cutoff : :active_decay
+            _record_semiconductor_timestep_resolution!(
+                event_lookups, device, :turn_off_tail, time_s, step_s, method,
+                tail_was_active, participation, :declared_tail_decay_time, tail.decay_time_s,
+            )
+        end
+        if junction !== nothing
+            _record_semiconductor_timestep_resolution!(
+                event_lookups, device, :nonlinear_junction_charge, time_s, step_s, method,
+                true, :junction_companion, :undeclared_circuit_charge_scale, nothing,
+            )
+        end
+    end
     return nothing
 end
 

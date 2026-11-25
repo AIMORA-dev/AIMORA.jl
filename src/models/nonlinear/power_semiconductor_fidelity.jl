@@ -1067,3 +1067,22 @@ struct SemiconductorTerminalCurrentMargins
     lower_a::Float64
     upper_a::Float64
 end
+
+"""Current-step resolution of one installed device component, without a solver admission decision."""
+struct PowerSemiconductorTimestepResolution
+    device_index::Int
+    component::Symbol
+    interval_start_s::Float64
+    interval_end_s::Float64
+    step_s::Float64
+    interval_method::Symbol
+    publication_start_s::Float64
+    publication_end_s::Float64
+    law_evaluated::Bool
+    participating::Bool
+    participation::Symbol
+    scale_source::Symbol
+    scale_s::Union{Nothing,Float64}
+    scale_over_step::Union{Nothing,Float64}
+    meets_twenty_points::Union{Nothing,Bool}
+end
