@@ -1467,6 +1467,12 @@ end
 
 nonlinear_terminal_nodes(device::PowerSemiconductorSwitch) = (device.a, device.b)
 
+_semiconductor_terminal_current_domain(device) = nothing
+function _semiconductor_terminal_current_domain(device::PowerSemiconductorSwitch)
+    fidelity = device.extended_fidelity
+    return fidelity === nothing ? nothing : fidelity.terminal_current_domain
+end
+
 function _power_semiconductor_candidate_method(method::Symbol)
     if method === :TrapezoidalCompanion || method === :trapezoidal
         return :trapezoidal
@@ -1601,6 +1607,23 @@ function _power_semiconductor_snubber_current_jacobian(
     return conductance * voltage_v + history_current, conductance
 end
 
+function _power_semiconductor_port_current_jacobian(
+    device::PowerSemiconductorSwitch,
+    voltage_v::Float64,
+    time_s::Float64,
+)
+    channel_current_a, channel_jacobian_s =
+        _power_semiconductor_channel_current_jacobian(device, voltage_v)
+    fidelity = something(device.extended_fidelity)
+    dynamic_current_a, dynamic_jacobian_s =
+        _power_semiconductor_dynamic_current_jacobian(fidelity, voltage_v, time_s)
+    snubber_current_a, snubber_jacobian_s =
+        _power_semiconductor_snubber_current_jacobian(device, voltage_v)
+    current_a = channel_current_a + dynamic_current_a + snubber_current_a
+    jacobian_s = channel_jacobian_s + dynamic_jacobian_s + snubber_jacobian_s
+    return current_a, jacobian_s
+end
+
 function nonlinear_current_jacobian!(
     terminal_current_a::AbstractVector{Float64},
     terminal_jacobian_s::AbstractMatrix{Float64},
@@ -1615,15 +1638,7 @@ function nonlinear_current_jacobian!(
         "power semiconductor requires a two-by-two terminal Jacobian",
     ))
     voltage_v = _power_semiconductor_terminal_voltage(terminal_voltage_v)
-    channel_current_a, channel_jacobian_s =
-        _power_semiconductor_channel_current_jacobian(device, voltage_v)
-    fidelity = something(device.extended_fidelity)
-    dynamic_current_a, dynamic_jacobian_s =
-        _power_semiconductor_dynamic_current_jacobian(fidelity, voltage_v, time_s)
-    snubber_current_a, snubber_jacobian_s =
-        _power_semiconductor_snubber_current_jacobian(device, voltage_v)
-    current_a = channel_current_a + dynamic_current_a + snubber_current_a
-    jacobian_s = channel_jacobian_s + dynamic_jacobian_s + snubber_jacobian_s
+    current_a, jacobian_s = _power_semiconductor_port_current_jacobian(device, voltage_v, time_s)
     terminal_current_a[1] = current_a
     terminal_current_a[2] = -current_a
     terminal_jacobian_s[1, 1] = jacobian_s
@@ -1692,7 +1707,8 @@ function _accept_power_semiconductor_state!(
     terminal_voltage_v::AbstractVector{Float64},
     terminal_current_a::AbstractVector{Float64},
     time_s::Float64,
-    terminal_jacobian_s::Union{Nothing,AbstractMatrix{Float64}},
+    terminal_jacobian_s::Union{Nothing,AbstractMatrix{Float64}};
+    event_probe::Bool=false,
 )
     fidelity = something(device.extended_fidelity)
     fidelity.candidate_prepared || throw(ArgumentError(
@@ -1706,6 +1722,17 @@ function _accept_power_semiconductor_state!(
     isfinite(current_a) && isfinite(time_s) || throw(ArgumentError(
         "accepted power-semiconductor current and time must be finite",
     ))
+    domain = fidelity.terminal_current_domain
+    if !event_probe && domain !== nothing
+        composed_current_a, _ = _power_semiconductor_port_current_jacobian(device, voltage_v, time_s)
+        domain.minimum_a <= composed_current_a <= domain.maximum_a || throw(DomainError(
+            composed_current_a,
+            "terminal current from node $(device.a) to $(device.b) for $(typeof(device)) " *
+            "at $(time_s) s is outside [$(domain.minimum_a), $(domain.maximum_a)] A",
+        ))
+        current_a == composed_current_a && terminal_current_a[2] == -composed_current_a ||
+            throw(ArgumentError("accepted semiconductor current must match the composed terminal stamp"))
+    end
     step_s = fidelity.candidate_step_s
     previous_terminal_voltage_v = fidelity.previous_terminal_voltage_v
     previous_terminal_current_a = fidelity.previous_terminal_current_a
@@ -1935,6 +1962,20 @@ function accept_nonlinear_device_state!(
         terminal_current_a,
         time_s,
         terminal_jacobian_s,
+    )
+end
+
+# The private event localizer restores its enclosing transaction after every probe.
+function _accept_power_semiconductor_event_probe!(
+    device::PowerSemiconductorSwitch,
+    terminal_voltage_v::AbstractVector{Float64},
+    terminal_current_a::AbstractVector{Float64},
+    terminal_jacobian_s::AbstractMatrix{Float64},
+    time_s::Float64,
+)
+    return _accept_power_semiconductor_state!(
+        device, terminal_voltage_v, terminal_current_a, time_s, terminal_jacobian_s;
+        event_probe=true,
     )
 end
 

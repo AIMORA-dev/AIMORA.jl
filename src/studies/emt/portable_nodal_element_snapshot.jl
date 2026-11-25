@@ -999,6 +999,13 @@ function _portable_semiconductor_extended_fields(fidelity, prefix::AbstractStrin
             model.provenance, "$prefix.declared_model.provenance", owner,
         ))
     end
+    domain = fidelity.terminal_current_domain
+    if domain !== nothing
+        push!(fields,
+            _portable_emt_state_field("$prefix.terminal_current_domain.minimum", owner, :checkpoint, "A", domain.minimum_a),
+            _portable_emt_state_field("$prefix.terminal_current_domain.maximum", owner, :checkpoint, "A", domain.maximum_a),
+        )
+    end
     append!(fields, PortableSnapshotStateField[
         _portable_emt_time_field("$prefix.candidate_time", owner, :reconstruction, fidelity.candidate_time_s),
         _portable_emt_state_field("$prefix.candidate_step", owner, :reconstruction, "s", fidelity.candidate_step_s),
@@ -1116,7 +1123,37 @@ function _portable_power_semiconductor_switch_fields(switch, prefix::AbstractStr
     return fields
 end
 
+function _validate_portable_semiconductor_current_domain(switch, fields, prefix)
+    minimum_id = "$prefix.extended_fidelity.terminal_current_domain.minimum"
+    maximum_id = "$prefix.extended_fidelity.terminal_current_domain.maximum"
+    has_minimum = haskey(fields, minimum_id)
+    has_maximum = haskey(fields, maximum_id)
+    has_minimum == has_maximum || _portable_emt_fail(
+        :model_mismatch, "portable semiconductor terminal-current domain is incomplete",
+    )
+    authored = Nonlinear._semiconductor_terminal_current_domain(switch)
+    if has_minimum
+        for field in (fields[minimum_id], fields[maximum_id])
+            field.owner == "emt.power_semiconductor_extended" && isempty(field.axes) ||
+                _portable_emt_fail(:model_mismatch, "portable semiconductor terminal-current bounds have invalid field metadata")
+        end
+        minimum_a = _portable_emt_scalar(fields, minimum_id, :checkpoint, "A", Float64)
+        maximum_a = _portable_emt_scalar(fields, maximum_id, :checkpoint, "A", Float64)
+        isfinite(minimum_a) && isfinite(maximum_a) && minimum_a <= maximum_a ||
+            _portable_emt_fail(:model_mismatch, "portable semiconductor terminal-current bounds are invalid")
+        authored !== nothing &&
+            authored.minimum_a == minimum_a && authored.maximum_a == maximum_a ||
+            _portable_emt_fail(:model_mismatch, "portable semiconductor terminal-current bounds changed")
+    else
+        authored === nothing || _portable_emt_fail(
+            :model_mismatch, "portable semiconductor terminal-current domain is undeclared",
+        )
+    end
+    return nothing
+end
+
 function _restore_portable_power_semiconductor_switch!(switch, fields, prefix)
+    _validate_portable_semiconductor_current_domain(switch, fields, prefix)
     _portable_semiconductor_require_presence(fields, prefix, "gate_driver", switch.gate_driver)
     _portable_semiconductor_require_presence(fields, prefix, "antiparallel_diode", switch.antiparallel_diode)
     _portable_semiconductor_require_presence(fields, prefix, "snubber", switch.snubber)

@@ -500,3 +500,209 @@ end
     @test_throws ArgumentError identity(v"1.1.0")
     @test_throws ArgumentError identity(v"9.0.0")
 end
+
+@testset "Inclusive signed terminal current at accepted endpoints" begin
+    models = AIMORA.Nonlinear
+    domain = models.SemiconductorTerminalCurrentDomain
+    @test_throws ArgumentError domain(-Inf, 3)
+    @test_throws ArgumentError domain(-2, NaN)
+    @test_throws ArgumentError domain(3, -2)
+
+    function prepared_device(minimum_a, maximum_a; snubber=nothing, nodes=(1, 0))
+        fidelity = models.PowerSemiconductorExtendedFidelity(
+            recovered_charge=models.RecoveredChargeFidelity(1e-3),
+            terminal_current_domain=domain(minimum_a, maximum_a),
+        )
+        device = models.DiodeValveSwitch(
+            nodes...; on_conductance=1.0, off_conductance=1.0, snubber,
+            extended_fidelity=fidelity,
+        )
+        prepare_nonlinear_device_step!(device, 1.0, 1.0, :BackwardEulerCompanion)
+        return device
+    end
+
+    for i in (-2.0, 0.0, 3.0, prevfloat(-2.0), nextfloat(3.0))
+        device = prepared_device(-2, 3)
+        voltages = [i, 0.0]
+        currents = zeros(2)
+        jacobian = zeros(2, 2)
+        nonlinear_current_jacobian!(currents, jacobian, device, voltages, 1.0)
+        @test currents == [i, -i]
+        if -2 <= i <= 3
+            accept_nonlinear_device_state!(device, voltages, currents, jacobian, 1.0)
+            @test device.last_current == i
+        else
+            @test_throws DomainError accept_nonlinear_device_state!(device, voltages, currents, 1.0)
+            @test device.last_current == 0.0
+            @test device.extended_fidelity.previous_terminal_current_a == 0.0
+            @test device.extended_fidelity.candidate_prepared
+        end
+    end
+
+    snubber = models.SeriesRCSnubber(1, 1; initial_capacitor_voltage_v=-3)
+    cancelling = prepared_device(0, 0; snubber, nodes=(0, 1))
+    currents, jacobian = zeros(2), zeros(2, 2)
+    nonlinear_current_jacobian!(currents, jacobian, cancelling, [0.0, 1.0], 1.0)
+    @test currents == [0.0, 0.0]
+    accept_nonlinear_device_state!(cancelling, [0.0, 1.0], currents, jacobian, 1.0)
+    @test cancelling.last_snubber_current_a ≈ 1.0
+    @test cancelling.last_current == 0.0
+
+    adding = prepared_device(-1.25, 1.25; snubber=models.SeriesRCSnubber(1, 1))
+    nonlinear_current_jacobian!(currents, jacobian, adding, [-1.0, 0.0], 1.0)
+    @test currents[1] ≈ -1.5
+    @test_throws DomainError accept_nonlinear_device_state!(adding, [-1.0, 0.0], currents, 1.0)
+    @test adding.snubber.last_current_a == 0.0
+    @test_throws DomainError accept_nonlinear_device_state!(adding, [-1.0, 0.0], zeros(2), 1.0)
+    @test adding.last_current == 0.0
+end
+
+@testset "Recovery event probes and transactional terminal-current refusal" begin
+    models, branches, solver = AIMORA.Nonlinear, AIMORA.Branches, AIMORA.NonlinearNodal
+
+    function recovery_network(minimum_a, off_conductance_s)
+        stored_charge = models.RecoveredChargeFidelity(1e-3; initial_charge_c=0.5e-3)
+        fidelity = models.PowerSemiconductorExtendedFidelity(
+            recovered_charge=stored_charge,
+            terminal_current_domain=models.SemiconductorTerminalCurrentDomain(minimum_a, 0.1),
+        )
+        valve = models.DiodeValveSwitch(
+            1, 0; on_conductance=1.0, off_conductance=off_conductance_s,
+            extended_fidelity=fidelity,
+        )
+        upstream_valve = models.DiodeValveSwitch(
+            2, 0; off_conductance=0.25,
+            extended_fidelity=models.PowerSemiconductorExtendedFidelity(
+                recovered_charge=models.RecoveredChargeFidelity(1e-3),
+            ),
+        )
+        series_branch = branches.SeriesRLCBranch(2, 0, 1.0, 1e-3, 1e-3)
+        circuit = AIMORA.Nodal.NodalSystem(2, [
+            branches.CurrentInjection(1, t -> -4000t),
+            branches.ConductanceBranch(1, 0, 1.0),
+            branches.CurrentInjection(2, _ -> 1.0),
+            series_branch,
+        ])
+        circuit_owner = solver.NonlinearNodalSystem(
+            circuit, [upstream_valve, valve];
+            scales=NonlinearNetworkScales([1.0, 1.0], [1.0, 1.0], Float64[], Float64[]),
+        )
+        return circuit_owner, valve, stored_charge, upstream_valve, series_branch
+    end
+
+    network, diode, recovery, _, _ = recovery_network(-1.2, 0.1)
+    observations = Tuple{Float64,Float64}[]
+    observe = (_, time, _step, _method, _index) -> push!(observations, (time, diode.last_current))
+    pending = solver._pending_nonlinear_device_events(network, 0.0)
+    _, probe = solver._probe_right_nonlinear_device_event_values!(
+        network, pending, 0.0, 1e-3, network.topology_signature, network.previous_topology_signature,
+    )
+    @test probe.accepted
+    @test probe.voltage_v[1] ≈ -2.0 atol=1e-9
+    @test probe.voltage_v[1] * diode.on_conductance < -1.2
+    @test diode.last_current == 0.0
+    @test recovery.stored_charge_c == 0.5e-3
+    result = solver.advance_nonlinear_step!(
+        network, 1e-3, 1e-3; accepted_substep_observer=observe,
+    )
+    # The uncommitted right-hand probe in recovery sees -4 A divided equally
+    # by the 1 S diode and external 1 S shunt. The event side is -1 A.
+    @test result.accepted
+    @test length(observations) == 2
+    @test recovery.recovery_zero_event_count == 1
+    @test observations[1][1] ≈ 0.5e-3 atol=1e-8
+    @test observations[1][2] ≈ -1.0 atol=1e-5
+    @test diode.last_current ≈ -4 / 11 atol=1e-9
+    @test observations[end][2] == diode.last_current
+
+    rejected_network, rejected_diode, rejected_recovery, earlier, storage = recovery_network(-1.2, 0.9)
+    before = (
+        voltage=copy(solver.nonlinear_linear_system(rejected_network).v),
+        charge=rejected_recovery.stored_charge_c,
+        current=rejected_diode.last_current,
+        work=rejected_diode.semiconductor_dissipated_energy_j,
+        events=rejected_recovery.recovery_zero_event_count,
+        earlier=(earlier.last_current, earlier.semiconductor_dissipated_energy_j),
+        storage=(storage.i_prev, storage.v_prev, storage.i_last),
+    )
+    observed = Ref(0)
+    rejected = solver.advance_nonlinear_step!(
+        rejected_network, 1e-3, 1e-3;
+        accepted_substep_observer=(_system, _time, _step, _method, _index) -> (observed[] += 1),
+    )
+    @test !rejected.accepted
+    @test occursin("terminal current from node 1 to 0", sprint(showerror, rejected.failure))
+    @test observed[] == 0
+    @test solver.nonlinear_linear_system(rejected_network).v == before.voltage
+    @test rejected_recovery.stored_charge_c == before.charge
+    @test rejected_diode.last_current == before.current
+    @test rejected_diode.semiconductor_dissipated_energy_j == before.work
+    @test rejected_recovery.recovery_zero_event_count == before.events
+    @test !rejected_diode.extended_fidelity.candidate_prepared
+    @test (earlier.last_current, earlier.semiconductor_dissipated_energy_j) == before.earlier
+    @test (storage.i_prev, storage.v_prev, storage.i_last) == before.storage
+    @test solver.advance_nonlinear_step!(rejected_network, 0.4e-3, 0.4e-3).accepted
+    @test rejected_recovery.recovery_zero_event_count == 0
+    @test earlier.last_current != before.earlier[1]
+    @test storage.i_last != before.storage[3]
+
+    checkpoint = solver.nonlinear_nodal_checkpoint(network)
+    saved_current = diode.last_current
+    @test saved_current ≈ -4 / 11 atol=1e-9
+    @test solver.advance_nonlinear_step!(network, 1.05e-3, 0.05e-3).accepted
+    continued_current = diode.last_current
+    solver.restore_nonlinear_nodal_checkpoint!(network, checkpoint)
+    @test diode.last_current == saved_current
+    @test solver.advance_nonlinear_step!(network, 1.05e-3, 0.05e-3).accepted
+    @test diode.last_current == continued_current
+    diode.extended_fidelity.terminal_current_domain = nothing
+    @test_throws ArgumentError solver.restore_nonlinear_nodal_checkpoint!(network, checkpoint)
+    @test diode.extended_fidelity.terminal_current_domain === nothing
+    @test diode.last_current == continued_current
+    @info "Terminal-current domain recovery probe" held_probe_a=probe.voltage_v[1] * diode.on_conductance event_time_s=observations[1][1] event_a=observations[1][2] accepted_endpoint_a=saved_current refused=sprint(showerror, rejected.failure)
+end
+
+@testset "Signed depletion current limits preserve admitted charge history" begin
+    models = AIMORA.Nonlinear
+
+    function depletion_endpoint(path, domain)
+        junction = models.NonlinearJunctionChargeFidelity(
+            40e-6, 50, 0.45; initial_voltage_v=first(path), voltage_domain_v=(-50, -10),
+        )
+        fidelity = models.PowerSemiconductorExtendedFidelity(
+            junction_charge=junction, terminal_current_domain=domain,
+        )
+        device = models.DiodeValveSwitch(1, 0; off_conductance=0, extended_fidelity=fidelity)
+        currents, jacobian = zeros(2), zeros(2, 2)
+        old_charge = junction.previous_charge_c
+        prepare_nonlinear_device_step!(device, 1e-9, 1e-9, :BackwardEulerCompanion)
+        voltage = [last(path), 0.0]
+        nonlinear_current_jacobian!(currents, jacobian, device, voltage, 1e-9)
+        return device, junction, old_charge, voltage, currents, jacobian
+    end
+
+    bounds = models.SemiconductorTerminalCurrentDomain(-10_000, 10_000)
+    for sign in (-1, 1)
+        path = sign > 0 ? (-10.2, -10.0) : (-10.0, -10.2)
+        switch, charge, initial_q, voltage, currents, jacobian = depletion_endpoint(path, bounds)
+        @test sign * currents[1] ≈ 7364.327728395467 atol=1e-6
+        @test abs(currents[1]) < 10_000
+        accept_nonlinear_device_state!(switch, voltage, currents, jacobian, 1e-9)
+        finish_nonlinear_device_step!(switch)
+        @test sign * (charge.previous_charge_c - initial_q) > 0
+    end
+    for sign in (-1, 1), domain in (nothing, bounds)
+        path = sign > 0 ? (-10.4, -10.0) : (-10.0, -10.4)
+        switch, charge, initial_q, voltage, currents, jacobian = depletion_endpoint(path, domain)
+        @test sign * currents[1] ≈ 14717.65386554496 atol=1e-6
+        @test abs(currents[1]) > 10_000
+        if domain === nothing
+            accept_nonlinear_device_state!(switch, voltage, currents, jacobian, 1e-9)
+            @test sign * (charge.previous_charge_c - initial_q) > 0
+        else
+            @test_throws DomainError accept_nonlinear_device_state!(switch, voltage, currents, jacobian, 1e-9)
+            @test charge.previous_charge_c == initial_q
+            @test switch.last_current == 0.0
+        end
+    end
+end

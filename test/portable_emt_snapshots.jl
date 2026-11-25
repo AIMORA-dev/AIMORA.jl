@@ -979,8 +979,9 @@ if AIMORA.solver_available()
         )
     end
 
-    function portable_extended_semiconductor_switch(a::Int=1, b::Int=0)
-        fidelity = AIMORA.Nonlinear.PowerSemiconductorExtendedFidelity(
+    function portable_extended_semiconductor_switch(a::Int=1, b::Int=0; terminal_current_domain=nothing)
+        fidelity = AIMORA.Nonlinear.PowerSemiconductorExtendedFidelity(;
+            terminal_current_domain,
             recovered_charge=AIMORA.Nonlinear.RecoveredChargeFidelity(
                 2.0e-6;
                 initial_charge_c=1.0e-6,
@@ -1278,6 +1279,45 @@ if AIMORA.solver_available()
             Dict(field.identity => field for field in captured.fields),
             1,
         )
+    end
+
+    @testset "portable signed semiconductor terminal-current domain" begin
+        domain = AIMORA.Nonlinear.SemiconductorTerminalCurrentDomain(-4, 7)
+        original = seed_portable_semiconductor_state!(
+            portable_extended_semiconductor_switch(; terminal_current_domain=domain),
+        )
+        receiver = portable_extended_semiconductor_switch(; terminal_current_domain=domain)
+        captured, restored = portable_element_owner_roundtrip(original, receiver, :extended_semiconductor)
+        @test captured.signature_sha256 == restored.signature_sha256
+        fields = Dict(field.identity => field for field in captured.fields)
+        minimum_id = "model.i00000001.extended_fidelity.terminal_current_domain.minimum"
+        maximum_id = "model.i00000001.extended_fidelity.terminal_current_domain.maximum"
+        @test haskey(fields, minimum_id)
+        @test haskey(fields, maximum_id)
+
+        restore_element! = AIMORA.EMTStudy._restore_portable_emt_element_state!
+        for candidate in (
+            portable_extended_semiconductor_switch(),
+            portable_extended_semiconductor_switch(; terminal_current_domain=
+                AIMORA.Nonlinear.SemiconductorTerminalCurrentDomain(-4, 8)),
+        )
+            before = candidate.last_current
+            @test_throws AIMORA.PortableSnapshots.PortableSnapshotFailure restore_element!(candidate, fields, 1)
+            @test candidate.last_current == before
+        end
+        incomplete = delete!(copy(fields), maximum_id)
+        @test_throws AIMORA.PortableSnapshots.PortableSnapshotFailure restore_element!(receiver, incomplete, 1)
+
+        legacy, legacy_restored = portable_element_owner_roundtrip(
+            portable_extended_semiconductor_switch(),
+            portable_extended_semiconductor_switch(),
+            :extended_semiconductor,
+        )
+        @test legacy.signature_sha256 == legacy_restored.signature_sha256
+        legacy_fields = Dict(field.identity => field for field in legacy.fields)
+        @test !haskey(legacy_fields, minimum_id)
+        @test !haskey(legacy_fields, maximum_id)
+        @test_throws AIMORA.PortableSnapshots.PortableSnapshotFailure restore_element!(receiver, legacy_fields, 1)
     end
 
     @testset "portable full-workspace semiconductor continuation" begin

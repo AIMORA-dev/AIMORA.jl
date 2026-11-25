@@ -860,6 +860,23 @@ struct DeclaredSemiconductorModelIdentity
     end
 end
 
+"""
+Inclusive terminal-current validity interval in amperes for an extended switch.
+Positive current flows from terminal `a` to `b`, including the switch's own
+snubber. This checks accepted companion endpoints and does not limit current.
+"""
+struct SemiconductorTerminalCurrentDomain
+    minimum_a::Float64
+    maximum_a::Float64
+
+    function SemiconductorTerminalCurrentDomain(minimum_a::Real, maximum_a::Real)
+        lower, upper = Float64(minimum_a), Float64(maximum_a)
+        isfinite(lower) && isfinite(upper) && lower <= upper ||
+            throw(ArgumentError("terminal current bounds must be finite and ordered"))
+        return new(lower, upper)
+    end
+end
+
 """Compositional extended fidelity attached to one accepted semiconductor owner."""
 mutable struct PowerSemiconductorExtendedFidelity
     recovered_charge::Union{Nothing,RecoveredChargeFidelity}
@@ -869,6 +886,7 @@ mutable struct PowerSemiconductorExtendedFidelity
     thermal::Union{Nothing,CauerThermalFidelity}
     declared_model::Union{Nothing,DeclaredSemiconductorModelIdentity}
     provenance::NonlinearParameterProvenance
+    terminal_current_domain::Union{Nothing,SemiconductorTerminalCurrentDomain}
     candidate_time_s::Float64
     candidate_step_s::Float64
     candidate_method::Symbol
@@ -889,6 +907,7 @@ function PowerSemiconductorExtendedFidelity(;
     switching_energy::Union{Nothing,SwitchingEnergyTable}=nothing,
     thermal::Union{Nothing,CauerThermalFidelity}=nothing,
     declared_model::Union{Nothing,DeclaredSemiconductorModelIdentity}=nothing,
+    terminal_current_domain::Union{Nothing,SemiconductorTerminalCurrentDomain}=nothing,
     provenance::NonlinearParameterProvenance=_generic_semiconductor_provenance(
         "component-specific SI units",
         "composition of explicitly selected generic semiconductor fidelity components",
@@ -913,6 +932,7 @@ function PowerSemiconductorExtendedFidelity(;
         thermal,
         declared_model,
         provenance,
+        terminal_current_domain,
         0.0,
         0.0,
         :unprepared,
