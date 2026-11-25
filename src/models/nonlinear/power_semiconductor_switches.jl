@@ -773,6 +773,7 @@ struct _SemiconductorEventLookupCapture
     interval_end_s::Float64
     maximum_records::Int
     records::Vector{PowerSemiconductorEventLookup}
+    margins::Union{Nothing,Vector{PowerSemiconductorEventMargins}}
 end
 
 function _apply_power_semiconductor_gate_event!(
@@ -1486,6 +1487,16 @@ function _semiconductor_terminal_current_domain(device::PowerSemiconductorSwitch
     return fidelity === nothing ? nothing : fidelity.terminal_current_domain
 end
 
+"""Read inclusive signed-current margins at the accepted endpoint, or nothing if undeclared."""
+function power_semiconductor_terminal_current_margins(device::PowerSemiconductorSwitch)
+    domain = _semiconductor_terminal_current_domain(device)
+    domain === nothing && return nothing
+    current = power_semiconductor_terminal_state(device).terminal_current_a
+    return SemiconductorTerminalCurrentMargins(
+        current, current - domain.minimum_a, domain.maximum_a - current,
+    )
+end
+
 function _power_semiconductor_candidate_method(method::Symbol)
     if method === :TrapezoidalCompanion || method === :trapezoidal
         return :trapezoidal
@@ -1694,13 +1705,15 @@ function _deposit_power_semiconductor_switching_energy!(
     interpolation_voltage_v = event_kind in (:turn_on, :turn_off) ?
         fidelity.pending_event_blocking_voltage_v : abs(voltage_v)
     temperature_k = _power_semiconductor_switching_temperature_k(fidelity)
-    event_energy_j = power_semiconductor_switching_energy(
-        energy_table,
-        event_kind,
-        interpolation_current_a,
-        interpolation_voltage_v,
-        temperature_k,
-    )
+    capture_margins = event_lookups !== nothing && event_lookups.margins !== nothing
+    coordinates = (interpolation_current_a, interpolation_voltage_v, temperature_k)
+    if capture_margins
+        event_energy_j, axis_margins = _power_semiconductor_switching_energy(
+            energy_table, event_kind, coordinates..., Val(true),
+        )
+    else
+        event_energy_j = power_semiconductor_switching_energy(energy_table, event_kind, coordinates...)
+    end
     if event_kind === :turn_on
         energy_table.cumulative_turn_on_energy_j += event_energy_j
         energy_table.last_event_transition_count = device.topology_transition_count
@@ -1720,11 +1733,15 @@ function _deposit_power_semiconductor_switching_energy!(
         length(records) < event_lookups.maximum_records || error(
             "semiconductor lookup count exceeded the accepted interval bound",
         )
-        push!(records, PowerSemiconductorEventLookup(
+        lookup = PowerSemiconductorEventLookup(
             event_lookups.device_indices[device], event_kind, time_s, accepted_side,
             event_lookups.interval_start_s, event_lookups.interval_end_s,
             length(records) + 1, interpolation_current_a, interpolation_voltage_v,
             temperature_k, event_energy_j,
+        )
+        push!(records, lookup)
+        capture_margins && push!(event_lookups.margins, PowerSemiconductorEventMargins(
+            lookup, axis_margins...,
         ))
     end
     return event_energy_j

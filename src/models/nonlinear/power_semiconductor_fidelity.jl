@@ -460,6 +460,21 @@ function _energy_axis_cell(axis::Vector{Float64}, coordinate::Float64, name::Abs
     return lower, fraction
 end
 
+"""Distances to the declared axis limits and to the selected interpolation cell."""
+struct SemiconductorEnergyAxisMargins
+    domain_lower::Float64
+    domain_upper::Float64
+    cell_lower::Float64
+    cell_upper::Float64
+end
+
+function _energy_axis_margins(axis, coordinate, index)
+    return SemiconductorEnergyAxisMargins(
+        coordinate - first(axis), last(axis) - coordinate,
+        coordinate - axis[index], axis[index + 1] - coordinate,
+    )
+end
+
 function _trilinear_energy(
     table::Array{Float64,3},
     current_axis::Vector{Float64},
@@ -468,7 +483,8 @@ function _trilinear_energy(
     current_a::Float64,
     voltage_v::Float64,
     temperature_k::Float64,
-)
+    ::Val{Margins},
+) where {Margins}
     current_index, current_fraction = _energy_axis_cell(current_axis, current_a, "current")
     voltage_index, voltage_fraction = _energy_axis_cell(voltage_axis, voltage_v, "blocking voltage")
     temperature_index, temperature_fraction = _energy_axis_cell(
@@ -487,7 +503,12 @@ function _trilinear_energy(
             temperature_index + temperature_offset,
         ]
     end
-    return energy
+    Margins || return energy
+    return energy, (
+        _energy_axis_margins(current_axis, current_a, current_index),
+        _energy_axis_margins(voltage_axis, voltage_v, voltage_index),
+        _energy_axis_margins(temperature_axis, temperature_k, temperature_index),
+    )
 end
 
 function power_semiconductor_switching_energy(
@@ -496,6 +517,19 @@ function power_semiconductor_switching_energy(
     current_a::Real,
     blocking_voltage_v::Real,
     junction_temperature_k::Real,
+)
+    return _power_semiconductor_switching_energy(
+        table, event_kind, current_a, blocking_voltage_v, junction_temperature_k, Val(false),
+    )
+end
+
+function _power_semiconductor_switching_energy(
+    table::SwitchingEnergyTable,
+    event_kind::Symbol,
+    current_a::Real,
+    blocking_voltage_v::Real,
+    junction_temperature_k::Real,
+    margins::Val,
 )
     current = Float64(current_a)
     voltage = Float64(blocking_voltage_v)
@@ -523,6 +557,7 @@ function power_semiconductor_switching_energy(
         current,
         voltage,
         temperature,
+        margins,
     )
 end
 
@@ -1016,4 +1051,19 @@ struct PowerSemiconductorEventLookup
     blocking_voltage_magnitude_v::Float64
     pre_impulse_temperature_k::Float64
     energy_j::Float64
+end
+
+"""Distances in A, V, and K, bound to the committed energy lookup that selected the cell."""
+struct PowerSemiconductorEventMargins
+    lookup::PowerSemiconductorEventLookup
+    current_a::SemiconductorEnergyAxisMargins
+    blocking_voltage_v::SemiconductorEnergyAxisMargins
+    temperature_k::SemiconductorEnergyAxisMargins
+end
+
+"""Signed total terminal current and inclusive bound distances, all in amperes."""
+struct SemiconductorTerminalCurrentMargins
+    current_a::Float64
+    lower_a::Float64
+    upper_a::Float64
 end

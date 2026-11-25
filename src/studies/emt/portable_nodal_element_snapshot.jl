@@ -1165,6 +1165,31 @@ function _validate_portable_semiconductor_provenance(switch, fields, prefix)
     return nothing
 end
 
+function _validate_portable_semiconductor_energy_axes(switch, fields, prefix)
+    fidelity = switch.extended_fidelity
+    fidelity === nothing && return nothing
+    energy = fidelity.switching_energy
+    energy = _portable_semiconductor_require_presence(
+        fields, "$prefix.extended_fidelity", "switching_energy", energy,
+    )
+    energy === nothing && return nothing
+    for (name, axis, unit, values) in (
+        ("current_axis", "current", "A", energy.current_axis_a),
+        ("blocking_voltage_axis", "voltage", "V", energy.blocking_voltage_axis_v),
+        ("junction_temperature_axis", "temperature", "K", energy.junction_temperature_axis_k),
+    )
+        field = _portable_emt_inventory_field(
+            fields, "$prefix.extended_fidelity.switching_energy.$name", :checkpoint, unit,
+        )
+        field.owner == "emt.power_semiconductor_switching_energy" &&
+            field.axes == [axis] && field.value isa PortableSnapshotArray &&
+            isequal(portable_snapshot_array_values(field.value), values) || _portable_emt_fail(
+                :model_mismatch, "portable semiconductor switching-energy axis changed",
+            )
+    end
+    return nothing
+end
+
 function _restore_portable_power_semiconductor_switch!(switch, fields, prefix)
     _validate_portable_semiconductor_current_domain(switch, fields, prefix)
     _portable_semiconductor_require_presence(fields, prefix, "gate_driver", switch.gate_driver)
@@ -1172,6 +1197,7 @@ function _restore_portable_power_semiconductor_switch!(switch, fields, prefix)
     _portable_semiconductor_require_presence(fields, prefix, "snubber", switch.snubber)
     _portable_semiconductor_require_presence(fields, prefix, "extended_fidelity", switch.extended_fidelity)
     _validate_portable_semiconductor_provenance(switch, fields, prefix)
+    _validate_portable_semiconductor_energy_axes(switch, fields, prefix)
     switch.gate_driver === nothing || _restore_portable_semiconductor_gate_driver!(
         switch.gate_driver, fields, "$prefix.gate_driver",
     )
