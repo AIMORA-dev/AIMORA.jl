@@ -832,6 +832,9 @@ struct DeclaredSemiconductorModelIdentity
         schema in (:aimora_generic_semiconductor_v1,) || throw(ArgumentError(
             "unsupported declared semiconductor equation schema $schema",
         ))
+        version == v"1.0.0" || throw(ArgumentError(
+            "unsupported declared semiconductor equation schema version $version for $schema",
+        ))
         isempty(strip(source_identity)) && throw(ArgumentError(
             "declared semiconductor source identity must not be empty",
         ))

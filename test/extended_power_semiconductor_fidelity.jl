@@ -480,3 +480,23 @@ end
     @test isfinite(fidelity.thermal.node_temperature_k[1])
     @test fidelity.thermal.node_temperature_k[1] != baseline_temperature_k[1]
 end
+
+
+@testset "Declared semiconductor schema version" begin
+    device_models = AIMORA.Nonlinear
+    provenance = device_models.NonlinearJunctionChargeFidelity(200e-9, 50.0, 0.45).provenance
+    source_hash = repeat("a", 64)
+    function identity(version)
+        return device_models.DeclaredSemiconductorModelIdentity(
+            :aimora_generic_semiconductor_v1, version, "synthetic schema fixture",
+            source_hash, "CC0-1.0", :public, provenance,
+        )
+    end
+    fidelity = device_models.PowerSemiconductorExtendedFidelity(declared_model=identity(v"1.0.0"))
+    diode = device_models.DiodeValveSwitch(1, 0; extended_fidelity=fidelity)
+    @test :declared_compact_model in device_models.power_semiconductor_extended_state(diode).fidelity_components
+    @test fidelity.declared_model.version == v"1.0.0"
+    @test_throws ArgumentError identity(v"0.9.0")
+    @test_throws ArgumentError identity(v"1.1.0")
+    @test_throws ArgumentError identity(v"9.0.0")
+end
