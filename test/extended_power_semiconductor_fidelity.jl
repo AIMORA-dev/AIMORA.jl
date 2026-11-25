@@ -727,7 +727,7 @@ end
         @test device.semiconductor_dissipated_energy_j ≈ expected_energy atol=1e-15 rtol=0
         @test fidelity.companion_energy_residual_j ≈ 0.0 atol=1e-15
         @test device.last_semiconductor_loss_w == 4.0
-        @test fidelity.thermal.cumulative_input_energy_j ≈ 0.4 atol=1e-15
+        @test fidelity.thermal.cumulative_input_energy_j ≈ expected_energy atol=1e-15
         finish_nonlinear_device_step!(device)
         # The baseline retains its established endpoint-average loss in both methods.
         simple = AIMORA.Nonlinear.DiodeValveSwitch(1,0;on_conductance=1.0,off_conductance=1.0)
@@ -893,4 +893,119 @@ end
     result, rows = snubber_step!(smooth, smooth_device, 2e-6; split=false)
     @test result.accepted && only(rows).method === AIMORA.Branches.TrapezoidalCompanion
     @test only(rows).loss ≈ 1e-6 * only(rows).current^2 atol=tolerance
+end
+
+@testset "Accepted heat survives rounding of cumulative energy" begin
+    models = AIMORA.Nonlinear
+    thermal = models.CauerThermalFidelity([1e-6], [1.0])
+    fidelity = models.PowerSemiconductorExtendedFidelity(; thermal)
+    device = models.DiodeValveSwitch(1, 0; on_conductance=1.0, initially_closed=true, extended_fidelity=fidelity)
+    models.power_semiconductor_event_localization!(device)
+    fidelity.previous_terminal_voltage_v = 3.0
+    fidelity.previous_terminal_current_a = 3.0
+    device.previous_semiconductor_loss_w = 9.0
+    device.semiconductor_dissipated_energy_j = 1e20
+    thermal.cumulative_input_energy_j = 1e20
+    h = 1e-6
+    v, i, j = [2.0, 0.0], zeros(2), zeros(2, 2)
+    prepare_nonlinear_device_step!(device, h, h, :TrapezoidalCompanion)
+    nonlinear_current_jacobian!(i, j, device, v, h)
+    accept_nonlinear_device_state!(device, v, i, j, h)
+    @test device.semiconductor_dissipated_energy_j == thermal.cumulative_input_energy_j == 1e20
+    @test thermal.last_loss_power_w == device.last_semiconductor_loss_w == 4.0
+    @test only(thermal.node_temperature_k) ≈ thermal.ambient_temperature_k + 3.25 atol=1e-12
+    @test thermal.last_stored_energy_j ≈ 3.25e-6 atol=1e-15
+    @test thermal.cumulative_ambient_energy_j ≈ 3.25e-6 atol=1e-15
+    finish_nonlinear_device_step!(device)
+
+    standalone = models.CauerThermalFidelity([1e-6], [1.0])
+    models.accept_power_semiconductor_thermal_step!(standalone, 4.0, h)
+    @test standalone.last_loss_power_w == 4.0
+    @test standalone.cumulative_input_energy_j == 4e-6
+    @test only(standalone.node_temperature_k) ≈ standalone.ambient_temperature_k + 2 atol=1e-12
+end
+
+@testset "Sampled right and scheduled left impulses use their physical sides" begin
+    models, branches, solver = AIMORA.Nonlinear, AIMORA.Branches, AIMORA.NonlinearNodal
+    h, ambient = 1e-6, 293.15
+    scales = NonlinearNetworkScales([1.0], [1.0], Float64[], Float64[])
+
+    function impulse_circuit(; sampled, leakage=0.0, maximum_k=600.0)
+        thermal = models.CauerThermalFidelity([1e-6], [1.0];
+            temperature_domain_k=(200.0, maximum_k))
+        energy = [4e-6 + 10e-6 * (k-1) for _ in 1:2, _ in 1:2, k in 1:2]
+        table = models.SwitchingEnergyTable([0.0,1.0], [0.0,2.0], [ambient,ambient+10];
+            turn_on_energy_j=energy,turn_off_energy_j=energy,reverse_recovery_energy_j=energy)
+        fidelity = models.PowerSemiconductorExtendedFidelity(;thermal,switching_energy=table)
+        if sampled
+            valve = models.DiodeValveSwitch(1,0;on_conductance=1.0,off_conductance=leakage,
+                threshold_v=0.5,extended_fidelity=fidelity)
+        else
+            valve = models.IGBTSwitch(1,0;
+                gate_driver=models.PowerSemiconductorGateDriver(initially_on=true),
+                initially_closed=true,on_conductance=1.0,off_conductance=leakage,
+                extended_fidelity=fidelity)
+            models.power_semiconductor_event_localization!(valve)
+            models.request_power_semiconductor_gate!(valve,false,0.0;earliest_transition_time_s=h)
+        end
+        circuit = AIMORA.Nodal.NodalSystem(1, [
+            branches.ConductanceBranch(1,0,1.0),
+            branches.CurrentInjection(1,t->sampled && t>1.5h ? 1.0+leakage : 0.0),
+        ])
+        return solver.NonlinearNodalSystem(circuit,[valve];scales),valve
+    end
+
+    function accepted_impulse_step(network; sampled=true)
+        sampled || return solver.advance_nonlinear_step!(network,2h,2h)
+        return solver.advance_nonlinear_step!(network,2h,2h;
+            discontinuity_treatment=:two_backward_euler_half_steps,
+            discontinuity_reason=:topology_change)
+    end
+    function measure_heat(valve)
+        fidelity = valve.extended_fidelity
+        thermal, table = fidelity.thermal, fidelity.switching_energy
+        return (temperature=only(thermal.node_temperature_k),
+            heat=thermal.cumulative_input_energy_j, ambient=thermal.cumulative_ambient_energy_j,
+            storage=thermal.last_stored_energy_j, on=table.cumulative_turn_on_energy_j,
+            off=table.cumulative_turn_off_energy_j, electrical=valve.semiconductor_dissipated_energy_j,
+            transitions=valve.topology_transition_count)
+    end
+    for sampled in (true,false)
+        network, valve = impulse_circuit(;sampled)
+        @test accepted_impulse_step(network; sampled).accepted
+        heat = measure_heat(valve)
+        @test heat.temperature ≈ ambient+(sampled ? 4.0 : 2.0) atol=1e-12
+        @test heat.heat ≈ 4e-6 atol=1e-15
+        @test heat.ambient ≈ (sampled ? 0.0 : 2e-6) atol=1e-15
+        @test heat.heat ≈ heat.ambient+heat.storage atol=1e-15
+        @test (sampled ? heat.on : heat.off) ≈ 4e-6 atol=1e-15
+        @test heat.transitions==1
+    end
+
+    network, valve = impulse_circuit(;sampled=true,leakage=0.2,maximum_k=297.0)
+    initial = measure_heat(valve)
+    initial_voltage = copy(solver.nonlinear_linear_system(network).v)
+    refused = accepted_impulse_step(network)
+    @test !refused.accepted
+    @test occursin("event energy leaves the thermal domain", sprint(showerror,refused.failure))
+    @test measure_heat(valve)==initial
+    @test solver.nonlinear_linear_system(network).v==initial_voltage
+    @test !valve.closed
+    valve.extended_fidelity.thermal.maximum_temperature_k = 600.0
+    @test accepted_impulse_step(network).accepted
+    heat = measure_heat(valve)
+    @test heat.on ≈ 4.1e-6 atol=1e-15
+    @test heat.temperature ≈ ambient+0.1+4.1 atol=1e-12
+    @test heat.ambient ≈ 0.1e-6 atol=1e-15
+    @test heat.heat ≈ 4.3e-6 atol=1e-15
+    @test heat.electrical≈heat.heat atol=1e-15
+    checkpoint = solver.nonlinear_nodal_checkpoint(network)
+    fresh, fresh_valve = impulse_circuit(;sampled=true,leakage=0.2)
+    @test accepted_impulse_step(fresh).accepted
+    solver.restore_nonlinear_nodal_checkpoint!(fresh,checkpoint)
+    @test measure_heat(fresh_valve)==heat
+    @test solver.advance_nonlinear_step!(network,3h,h).accepted
+    @test solver.advance_nonlinear_step!(fresh,3h,h).accepted
+    @test measure_heat(fresh_valve)==measure_heat(valve)
+    @test measure_heat(valve).on==heat.on
 end

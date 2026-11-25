@@ -1874,6 +1874,17 @@ function _accept_power_semiconductor_state!(
         end
         device.last_snubber_current_a = device.snubber.last_current_a
     end
+    # A transition already applied at the interval's left boundary carries its
+    # impulse before continuous integration. Sampled changes below are right-side.
+    energy_table = fidelity.switching_energy
+    left_event_energy_j = 0.0
+    if energy_table !== nothing &&
+       device.topology_transition_count > energy_table.last_event_transition_count &&
+       device.last_transition_time_s < time_s
+        left_event_energy_j = _deposit_power_semiconductor_switching_energy!(
+            device, voltage_v, channel_current_a, device.last_transition_time_s,
+        )
+    end
     if !device.event_localization_enabled
         previous_forward = device.closed
         previous_reverse = device.reverse_diode_conducting
@@ -1889,21 +1900,11 @@ function _accept_power_semiconductor_state!(
             time_s,
         )
     end
-    event_energy_j = _deposit_power_semiconductor_switching_energy!(
-        device,
-        voltage_v,
-        channel_current_a,
-        time_s,
-    )
-    thermal === nothing || _accept_cauer_thermal_step!(
-        thermal,
-        instantaneous_loss_w,
-        step_s,
-    )
     right_channel_power_w = voltage_v * (channel_current_a + tail_current_a)
     if fidelity.candidate_method === :backward_euler
         channel_work_j = step_s * right_channel_power_w
-        semiconductor_energy_increment_j = step_s * instantaneous_loss_w + event_energy_j
+        continuous_heat_j = step_s * instantaneous_loss_w
+        thermal_forcing_w = instantaneous_loss_w
     else
         previous_junction_current_a = junction === nothing ? 0.0 :
             previous_displacement_current_a
@@ -1913,10 +1914,27 @@ function _accept_power_semiconductor_state!(
                 previous_snubber_current_a
             ) + right_channel_power_w
         )
-        semiconductor_energy_increment_j = 0.5 * step_s * (
+        continuous_heat_j = 0.5 * step_s * (
             previous_semiconductor_loss_w + instantaneous_loss_w
-        ) + event_energy_j
+        )
+        thermal_forcing_w = continuous_heat_j / step_s
     end
+    thermal === nothing || _accept_cauer_thermal_step!(
+        thermal,
+        thermal_forcing_w,
+        step_s;
+        delivered_energy_j=continuous_heat_j,
+        endpoint_loss_power_w=instantaneous_loss_w,
+    )
+    # A sampled endpoint event uses the temperature after continuous integration.
+    # An explicitly localized gate deposits on its own accepted event boundary.
+    event_energy_j = _deposit_power_semiconductor_switching_energy!(
+        device,
+        voltage_v,
+        channel_current_a,
+        time_s,
+    )
+    semiconductor_energy_increment_j = continuous_heat_j + left_event_energy_j + event_energy_j
     device.semiconductor_dissipated_energy_j += semiconductor_energy_increment_j
     fidelity.companion_energy_residual_j +=
         channel_work_j - semiconductor_energy_increment_j

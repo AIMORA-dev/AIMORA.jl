@@ -765,7 +765,9 @@ end
 function _accept_cauer_thermal_step!(
     thermal::CauerThermalFidelity,
     loss_power_w::Float64,
-    step_s::Float64,
+    step_s::Float64;
+    delivered_energy_j::Float64=step_s * loss_power_w,
+    endpoint_loss_power_w::Float64=loss_power_w,
 )
     ambient_heat_flow, stored_energy = _cauer_thermal_trial(
         thermal,
@@ -773,10 +775,10 @@ function _accept_cauer_thermal_step!(
         step_s,
     )
     copyto!(thermal.node_temperature_k, thermal.trial_temperature_k)
-    thermal.last_loss_power_w = loss_power_w
+    thermal.last_loss_power_w = endpoint_loss_power_w
     thermal.last_ambient_heat_flow_w = ambient_heat_flow
     thermal.last_stored_energy_j = stored_energy
-    thermal.cumulative_input_energy_j += step_s * loss_power_w
+    thermal.cumulative_input_energy_j += delivered_energy_j
     thermal.cumulative_ambient_energy_j += step_s * ambient_heat_flow
     return thermal
 end
