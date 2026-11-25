@@ -2197,6 +2197,23 @@ function power_semiconductor_extended_state(device::PowerSemiconductorSwitch)
     )
 end
 
+"""
+Read extended physical state and declared provenance from a device after an accepted solve.
+The component records identify their own sources and do not inherit composite provenance.
+"""
+function power_semiconductor_extended_result(device::PowerSemiconductorSwitch)
+    state = power_semiconductor_extended_state(device)
+    fidelity = device.extended_fidelity
+    components = SemiconductorComponentProvenance(map(
+        component -> component === nothing ? nothing : component.provenance,
+        (fidelity.recovered_charge, fidelity.junction_charge, fidelity.turn_off_tail,
+            fidelity.switching_energy, fidelity.thermal, fidelity.declared_model),
+    ))
+    return PowerSemiconductorExtendedResult(
+        2, state, nonlinear_device_provenance(device), components,
+    )
+end
+
 trace_output_channel_count(::PowerSemiconductorSwitch) = 10
 trace_output_is_public(::PowerSemiconductorSwitch) = true
 

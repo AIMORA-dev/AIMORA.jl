@@ -1152,12 +1152,26 @@ function _validate_portable_semiconductor_current_domain(switch, fields, prefix)
     return nothing
 end
 
+function _validate_portable_semiconductor_provenance(switch, fields, prefix)
+    fidelity = switch.extended_fidelity
+    fidelity === nothing && return nothing
+    for field in _portable_semiconductor_extended_fields(fidelity, "$prefix.extended_fidelity")
+        occursin(".provenance.", field.identity) || continue
+        _portable_emt_scalar(fields, field.identity, :checkpoint, "1", String) ==
+            field.value || _portable_emt_fail(
+                :model_mismatch, "portable semiconductor parameter provenance changed",
+            )
+    end
+    return nothing
+end
+
 function _restore_portable_power_semiconductor_switch!(switch, fields, prefix)
     _validate_portable_semiconductor_current_domain(switch, fields, prefix)
     _portable_semiconductor_require_presence(fields, prefix, "gate_driver", switch.gate_driver)
     _portable_semiconductor_require_presence(fields, prefix, "antiparallel_diode", switch.antiparallel_diode)
     _portable_semiconductor_require_presence(fields, prefix, "snubber", switch.snubber)
     _portable_semiconductor_require_presence(fields, prefix, "extended_fidelity", switch.extended_fidelity)
+    _validate_portable_semiconductor_provenance(switch, fields, prefix)
     switch.gate_driver === nothing || _restore_portable_semiconductor_gate_driver!(
         switch.gate_driver, fields, "$prefix.gate_driver",
     )

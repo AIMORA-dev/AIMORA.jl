@@ -1281,6 +1281,36 @@ if AIMORA.solver_available()
         )
     end
 
+    @testset "extended semiconductor result provenance across portable restore" begin
+        devices = AIMORA.Nonlinear
+        original = seed_portable_semiconductor_state!(portable_extended_semiconductor_switch())
+        receiver = portable_extended_semiconductor_switch()
+        captured, restored = portable_element_owner_roundtrip(original, receiver, :semiconductor)
+        result = devices.power_semiconductor_extended_result(receiver)
+        @test captured.signature_sha256 == restored.signature_sha256
+        @test result.schema_version == 2
+        @test result.state.schema_version == 1
+        @test result.device_provenance === receiver.extended_fidelity.provenance
+        @test result.component_provenance.switching_energy ===
+            receiver.extended_fidelity.switching_energy.provenance
+        @test devices.power_semiconductor_extended_result(result.state).device_provenance === nothing
+        @test devices.power_semiconductor_extended_result(result.state).component_provenance === nothing
+
+        provenance = receiver.extended_fidelity.provenance
+        receiver.extended_fidelity.provenance = typeof(provenance)(
+            provenance.source, provenance.units, provenance.transformation, "unknown",
+            provenance.validity_domain, provenance.nature,
+        )
+        before = devices.power_semiconductor_extended_result(receiver)
+        fields = Dict(field.identity => field for field in captured.fields)
+        @test_throws AIMORA.PortableSnapshots.PortableSnapshotFailure AIMORA.EMTStudy._restore_portable_emt_element_state!(
+            receiver, fields, 1,
+        )
+        @test devices.power_semiconductor_extended_result(receiver).device_provenance ===
+            before.device_provenance
+        @test receiver.last_current == original.last_current
+    end
+
     @testset "portable signed semiconductor terminal-current domain" begin
         domain = AIMORA.Nonlinear.SemiconductorTerminalCurrentDomain(-4, 7)
         original = seed_portable_semiconductor_state!(

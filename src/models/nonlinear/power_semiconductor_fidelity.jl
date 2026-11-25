@@ -981,3 +981,24 @@ struct PowerSemiconductorExtendedState
     ambient_heat_flow_w::Float64
     thermal_stored_energy_j::Float64
 end
+
+const SemiconductorComponentProvenance = NamedTuple{
+    (:recovered_charge, :junction_charge, :turn_off_tail, :switching_energy, :thermal,
+        :declared_model),
+    NTuple{6,Union{Nothing,ParameterProvenance}},
+}
+
+"""
+Version-2 extended semiconductor result. The physical state retains its version-1 schema.
+Provenance records are declarations from the device and each selected component.
+"""
+struct PowerSemiconductorExtendedResult
+    schema_version::Int
+    state::PowerSemiconductorExtendedState
+    device_provenance::Union{Nothing,ParameterProvenance}
+    component_provenance::Union{Nothing,SemiconductorComponentProvenance}
+end
+
+"""View an existing version-1 physical result with provenance explicitly unavailable."""
+power_semiconductor_extended_result(state::PowerSemiconductorExtendedState) =
+    PowerSemiconductorExtendedResult(2, state, nothing, nothing)
